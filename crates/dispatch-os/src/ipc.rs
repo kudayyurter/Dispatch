@@ -430,17 +430,25 @@ struct Spawned {
     pid: Arc<Mutex<Option<u32>>>,
 }
 
-/// Terminates a command transport's whole process tree, then reaps its
+/// Terminates a command transport's whole process tree, reaping its
 /// immediate child.
 ///
 /// `ssh` and `sh -c` both fork; killing only the process this crate spawned
 /// would leave those orphaned and holding the pipes this `Connection` reads
 /// and writes, which is what [`process::spawn_contained`](crate::process::spawn_contained)
 /// and [`process::terminate_tree`](crate::process::terminate_tree) are for.
+///
+/// The tree is signalled, then the child waited for, and only then the rest
+/// of the tree. On Linux a leader nobody has waited for is still a member of
+/// its group, so waiting for the group first sat out the whole kill timeout
+/// on this transport's own zombie: on every drop, and before a dial whose
+/// command had already failed could say so.
 fn reap(spawned: &mut Spawned) {
+    let pid = spawned.child.id();
     spawned.pid.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let _ = crate::process::terminate_tree(spawned.child.id(), TEARDOWN_GRACE);
+    let _ = crate::process::signal_tree(pid, TEARDOWN_GRACE);
     let _ = spawned.child.wait();
+    crate::process::wait_for_tree(pid);
 }
 
 /// A reader that reaps its process when it is dropped.
@@ -2342,6 +2350,79 @@ mod tests {
             parked.recv_timeout(PATIENCE),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
             "the read on a closed command's stdout is still parked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_connection_whose_command_has_exited_is_quick() {
+        // A dial whose command fails at once is dropped, and its error
+        // reported, only once the reap is done. The reap used to wait for the
+        // group to vanish before it waited for the leader -- and on Linux a
+        // leader nobody has waited for is still a member of its group, so it
+        // sat out the whole kill timeout on its own zombie.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("exit 0"),
+            ],
+        )
+        .expect("sh exists");
+        // End of file: the command has exited, and nobody has waited for it.
+        let mut rest = Vec::new();
+        connection
+            .read_to_end(&mut rest)
+            .expect("reading to the end succeeds");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping an exited command's connection took {took:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_live_command_connection_is_quick_and_ends_its_tree() {
+        // Every client dropped and every connection given up on reaps its
+        // transport, which is still running: its leader dies of the signal
+        // and is a zombie, like the exited one above, until it is waited for.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30 & echo forked; wait"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        // Said once the background `sleep` exists, so there is a tree to end.
+        let mut said = [0u8; 7];
+        connection
+            .read_exact(&mut said)
+            .expect("the command says it has forked");
+        assert_eq!(&said, b"forked\n");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping a live command's connection took {took:?}"
+        );
+
+        // Quick is not leaving it running: the leader is reaped, and what it
+        // started is gone once its new parent has reaped that too.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "the command's tree outlived its connection"
         );
     }
 
