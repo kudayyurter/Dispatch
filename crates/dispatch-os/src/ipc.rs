@@ -95,6 +95,23 @@ pub(crate) fn trust_owner(endpoint: &str, owner: &str, me: &str) -> Result<(), I
     })
 }
 
+/// What binding reports when the endpoint is already held, from what
+/// opening it as a client found.
+///
+/// A pipe another account created under the daemon's name first is not a
+/// daemon already running, and saying it was sends the user looking for one
+/// that is not there. The owner check a client makes tells the two apart,
+/// as far as it can: an endpoint that would not open at all says nothing
+/// about whose it is, and is reported as a daemon, as it always was. Kept
+/// out of the platform code so every platform's tests exercise it.
+#[cfg(any(windows, test))]
+pub(crate) fn held(endpoint: &str, opened: Result<(), IpcError>) -> IpcError {
+    match opened {
+        Err(foreign @ IpcError::ForeignOwner { .. }) => foreign,
+        _ => IpcError::AlreadyRunning(endpoint.to_string()),
+    }
+}
+
 /// Where the daemon listens.
 ///
 /// Under the configuration directory, so `DISPATCH_CONFIG_DIR` gives a
@@ -1092,12 +1109,16 @@ mod imp {
             OwnerOnly::new().map_err(|e| IpcError::io("building the pipe's access list", e))?;
 
         // Unlike a Unix socket there is no file to go stale: a pipe exists
-        // only while its server holds it, so a refusal here means a daemon is
-        // genuinely running.
+        // only while its server holds it, so a refusal here means someone
+        // holds it -- this user's daemon, or another account that took the
+        // name first. Opening it as a client runs the owner check that tells
+        // the two apart.
         let pending =
             create_instance(&name, true, &security).map_err(|e| match e.raw_os_error() {
-                Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
-                    IpcError::AlreadyRunning(name.clone())
+                Some(code)
+                    if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_PIPE_BUSY as i32 =>
+                {
+                    super::held(&name, connect(path).map(drop))
                 }
                 _ => IpcError::io(format!("listening on {name}"), e),
             })?;
@@ -2320,6 +2341,38 @@ mod tests {
     }
 
     #[test]
+    fn a_held_endpoint_is_reported_as_whoever_holds_it() {
+        // A daemon that cannot bind because the pipe is someone else's must
+        // say so, not send the user looking for a daemon of their own.
+        let pipe = r"\\.\pipe\dispatchd-0123456789abcdef";
+
+        let foreign = held(
+            pipe,
+            Err(IpcError::ForeignOwner {
+                endpoint: pipe.to_string(),
+                owner: "S-1-5-18".to_string(),
+            }),
+        );
+        assert!(
+            matches!(&foreign, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-18"),
+            "another owner's pipe is reported as theirs, got {foreign:?}"
+        );
+
+        let ours = held(pipe, Ok(()));
+        assert!(
+            matches!(&ours, IpcError::AlreadyRunning(endpoint) if endpoint == pipe),
+            "this user's own pipe is a daemon already running, got {ours:?}"
+        );
+
+        // Could not be opened, so could not be asked: as before.
+        let unopened = held(pipe, Err(IpcError::NotRunning(pipe.to_string())));
+        assert!(
+            matches!(&unopened, IpcError::AlreadyRunning(_)),
+            "a pipe that would not open is reported as it always was, got {unopened:?}"
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn the_pipe_admits_its_owner_and_nobody_else() {
         // The null descriptor this replaces took the default DACL, which
@@ -2470,6 +2523,52 @@ mod tests {
             imp::owner_of(&stream).expect("the owner reads back"),
             crate::owner_only::current_user_sid().expect("this process has a user"),
             "the pipe is owned by someone other than the user who created it"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_daemon_finding_its_pipe_held_by_another_owner_says_whose_it_is() {
+        // Pipe names are machine-wide, so another account can create the
+        // daemon's before it starts. That is not a daemon already running,
+        // and saying it was sends the user looking for one that is not
+        // there.
+        use windows_sys::Win32::Foundation::ERROR_INVALID_OWNER;
+
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("squatted");
+        let name = imp::pipe_name(&endpoint().expect("resolves"));
+
+        // A second account is not to be had on CI. The Administrators group
+        // stands in for one: an elevated process, as CI's is, may name it as
+        // an object's owner, and it is not this user. The access list still
+        // admits this user, as a squatter's would, or there would be nothing
+        // to connect to and ask.
+        let me = crate::owner_only::current_user_sid().expect("this process has a user");
+        let squatter = crate::owner_only::OwnerOnly::from_sddl(&format!("O:BAD:P(A;;GA;;;{me})"))
+            .expect("the descriptor builds");
+        let held = match imp::create_instance(&name, true, &squatter) {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_OWNER as i32) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "CI runs elevated, so the Administrators group can own a pipe: {error}"
+                );
+                eprintln!("skipped: not elevated, so no pipe here can be owned by anyone else");
+                return;
+            }
+            Err(error) => panic!("the squatter's pipe could not be created: {error}"),
+        };
+
+        let bound = Listener::bind();
+        // SAFETY: created just above, closed nowhere else, and nothing uses
+        // it after this.
+        unsafe { imp::close_for_test(held) };
+
+        let error = bound.expect_err("a pipe someone else holds is not this daemon's to serve");
+        assert!(
+            matches!(&error, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-32-544"),
+            "expected ForeignOwner naming the Administrators group, got {error:?}"
         );
     }
 }
