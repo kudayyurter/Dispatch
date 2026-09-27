@@ -25,6 +25,8 @@ pub struct Approval<'a> {
     pub waiting: usize,
     /// First line of the task to show, for scrolling a long one.
     pub scroll: u16,
+    /// The frame's colour.
+    pub border: Style,
 }
 
 impl<'a> Approval<'a> {
@@ -119,7 +121,8 @@ impl Widget for Approval<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(title(self.asking, area.width));
+            .title(title(self.asking, area.width))
+            .border_style(self.border);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -170,6 +173,7 @@ mod tests {
             task,
             waiting: 0,
             scroll: 0,
+            border: Style::default(),
         }
     }
 

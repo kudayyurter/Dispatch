@@ -40,6 +40,12 @@ pub enum PaneStatus {
     Running,
     /// The agent is waiting on the user.
     Idle,
+    /// The agent is waiting on a decision only the user can make — a
+    /// permission prompt, a question.
+    ///
+    /// Only a client sets this, from what it reads on the pane's screen; a
+    /// daemon never sends it, so no older client meets it on the wire.
+    Blocked,
     /// The process exited with this status code.
     Exited(i32),
 }
@@ -94,6 +100,13 @@ pub struct Pane {
     /// Whether this pane is closed but kept as a row for live children.
     #[serde(default)]
     pub closed: bool,
+    /// The git branch the pane's foreground program is working on, while it
+    /// is inside a repository.
+    ///
+    /// Reported by whichever machine runs the pane; `None` from a daemon too
+    /// old to say.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 impl Pane {
@@ -111,6 +124,7 @@ impl Pane {
             parent: None,
             durable: false,
             closed: false,
+            branch: None,
         }
     }
 }
@@ -137,6 +151,7 @@ mod tests {
         assert!(PaneStatus::Starting.is_live());
         assert!(PaneStatus::Running.is_live());
         assert!(PaneStatus::Idle.is_live());
+        assert!(PaneStatus::Blocked.is_live());
         assert!(!PaneStatus::Exited(0).is_live());
         assert!(!PaneStatus::Exited(1).is_live());
     }

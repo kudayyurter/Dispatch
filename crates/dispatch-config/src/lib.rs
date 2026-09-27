@@ -5,6 +5,7 @@ pub mod defaults;
 pub mod harness;
 pub mod machines;
 pub mod projects;
+pub mod status;
 mod store;
 
 /// Shared by this crate's test modules, so there is one temporary-directory
@@ -15,11 +16,18 @@ mod testing;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use config::{Config, DelegationLimits, LoadedConfig};
+pub use config::{
+    Config, DelegationLimits, InterfaceConfig, KeyTable, KeyValue, KeysConfig, LoadedConfig,
+    LoginShell, ShellConfig,
+};
 pub use harness::{
     HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput, TaskLaunch,
     TaskRun,
 };
+pub use status::{RuleState, StatusInput, StatusRules};
+
+/// The id of the harness that runs the user's own shell.
+pub const SHELL: &str = "shell";
 
 /// Failures while loading configuration.
 ///
@@ -76,6 +84,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default)]
 pub struct HarnessRegistry {
     harnesses: BTreeMap<String, HarnessDef>,
+    /// Each harness's status rules, compiled once as it is registered.
+    rules: BTreeMap<String, std::sync::Arc<status::StatusRules>>,
+    /// The shell this registry was given, so reloading the directory can
+    /// give it back.
+    shell: Option<ShellConfig>,
 }
 
 impl FromIterator<HarnessDef> for HarnessRegistry {
@@ -84,13 +97,45 @@ impl FromIterator<HarnessDef> for HarnessRegistry {
     /// A later id wins, as it does when two files declare one: the registry is
     /// keyed by id and cannot hold both.
     fn from_iter<I: IntoIterator<Item = HarnessDef>>(defs: I) -> Self {
-        Self {
-            harnesses: defs.into_iter().map(|def| (def.id.clone(), def)).collect(),
-        }
+        Self::with(defs.into_iter().map(|def| (def.id.clone(), def)).collect())
     }
 }
 
 impl HarnessRegistry {
+    /// A registry over `harnesses`, with each one's status rules compiled.
+    fn with(harnesses: BTreeMap<String, HarnessDef>) -> Self {
+        let rules = harnesses
+            .values()
+            .map(|def| {
+                (
+                    def.id.clone(),
+                    std::sync::Arc::new(status::StatusRules::for_harness(
+                        &def.id,
+                        def.status.as_ref(),
+                    )),
+                )
+            })
+            .collect();
+
+        Self {
+            harnesses,
+            rules,
+            shell: None,
+        }
+    }
+
+    /// The status rules for harness `id`.
+    ///
+    /// A pane can name a harness this client has no file for — one adopted
+    /// from a daemon — and still gets the built-in rules for that id.
+    #[must_use]
+    pub fn status_rules(&self, id: &str) -> std::sync::Arc<status::StatusRules> {
+        self.rules
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(status::StatusRules::for_harness(id, None)))
+    }
+
     /// Loads every `*.toml` in `dir`.
     ///
     /// A file that fails to parse is reported rather than skipped: silently
@@ -102,7 +147,7 @@ impl HarnessRegistry {
             Ok(entries) => entries,
             // No directory yet means no harnesses yet, which is not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self { harnesses });
+                return Ok(Self::with(harnesses));
             }
             Err(source) => {
                 return Err(ConfigError::Io {
@@ -128,7 +173,7 @@ impl HarnessRegistry {
             harnesses.insert(def.id.clone(), def);
         }
 
-        Ok(Self { harnesses })
+        Ok(Self::with(harnesses))
     }
 
     /// Loads and validates one harness file.
@@ -181,6 +226,40 @@ impl HarnessRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.harnesses.is_empty()
+    }
+
+    /// This registry plus the user's own shell, as the `shell` harness.
+    ///
+    /// Built in code rather than written to the harnesses directory: what it
+    /// runs depends on the machine and on `[shell]`, and a file written once
+    /// would go stale the day either changed. A harness file with the id
+    /// `shell` wins, as a user's file always does.
+    #[must_use]
+    pub fn with_shell(mut self, shell: &ShellConfig) -> Self {
+        self.shell = Some(shell.clone());
+        if !self.harnesses.contains_key(SHELL) {
+            let def = HarnessDef {
+                id: SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                launch: shell.launch(),
+                ..HarnessDef::default()
+            };
+            self.rules.insert(
+                SHELL.to_string(),
+                std::sync::Arc::new(status::StatusRules::for_harness(SHELL, None)),
+            );
+            self.harnesses.insert(SHELL.to_string(), def);
+        }
+        self
+    }
+
+    /// Loads `dir` again, keeping the shell this registry was given.
+    pub fn reloaded(&self, dir: &Path) -> Result<Self, ConfigError> {
+        let fresh = Self::load_from_dir(dir)?;
+        Ok(match &self.shell {
+            Some(shell) => fresh.with_shell(shell),
+            None => fresh,
+        })
     }
 }
 

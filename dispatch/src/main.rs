@@ -6,6 +6,7 @@ mod approval;
 mod backend;
 mod delegate;
 mod machine;
+mod tabs;
 mod terminal;
 
 use std::path::PathBuf;
@@ -159,6 +160,22 @@ fn main() -> Result<ExitCode> {
 
     let config_dir = dispatch_os::paths::config_dir().context("failed to locate the config dir")?;
 
+    // Only `[interface]` is the client's; the daemon reads the rest. Unknown
+    // keys are logged rather than fatal, as the daemon does. Read before
+    // anything is attached to or started, so a malformed file fails here
+    // rather than after a daemon has been spawned and machines dialled.
+    let config_path =
+        dispatch_os::paths::config_file().context("failed to locate the configuration file")?;
+    let loaded = dispatch_config::Config::load_reporting(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    if !loaded.unknown.is_empty() {
+        tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
+    }
+
+    // The `shell` harness runs whatever this machine and `[shell]` resolve to,
+    // built in rather than written to the harnesses directory.
+    let harnesses = harnesses.with_shell(&loaded.config.shell);
+
     // Read before deciding how to run: any registered machine means the
     // agents belong to daemons, this machine's included.
     let machines = dispatch_config::machines::load(&config_dir)
@@ -267,10 +284,21 @@ fn main() -> Result<ExitCode> {
         app.add_project(root);
     }
 
+    app.set_motion(loaded.config.interface.motion);
+
+    // Keys are the interface's alone; the daemon never reads `[keys]`. What
+    // could not be used is logged by name, and the rest still applies.
+    let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&loaded.config.keys);
+    for warning in &warnings {
+        tracing::warn!(%warning, path = %config_path.display(), "ignoring a key binding");
+    }
+    app.set_keymap(keymap);
+
     // From here on the terminal belongs to Dispatch, so nothing may write to
     // stdout and every exit path has to restore it.
     install_panic_hook();
     let mut guard = TerminalGuard::acquire()?;
+    app.set_theme(guard.theme());
 
     run(&mut app, &mut guard)?;
     Ok(ExitCode::SUCCESS)
@@ -367,7 +395,7 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
             needs_draw = false;
         }
 
-        let timeout = App::poll_timeout(last_draw);
+        let timeout = App::poll_timeout(last_draw, Instant::now());
 
         if event::poll(timeout).context("failed to poll for input")? {
             let event = event::read().context("failed to read input")?;
@@ -386,6 +414,15 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
 
         // A daemon's panes arrive as messages rather than from a pseudoterminal.
         if app.poll_daemon() {
+            needs_draw = true;
+        }
+
+        // Something on screen is moving: draw its next frame once it is due,
+        // input or not.
+        if app
+            .next_frame(Instant::now())
+            .is_some_and(|every| last_draw.elapsed() >= every)
+        {
             needs_draw = true;
         }
     }

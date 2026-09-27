@@ -9,11 +9,13 @@
 //! whenever a machine is mid-upgrade — but a typo must not be silent either, so
 //! unknown keys are reported by name for the caller to log.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ConfigError;
+use crate::harness::Launch;
 
 /// Limits on delegation, which starts processes on this machine.
 ///
@@ -46,12 +48,204 @@ impl Default for DelegationLimits {
     }
 }
 
-/// Everything `config.toml` can say.
+/// How the interface draws itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InterfaceConfig {
+    /// Whether things move: spinners, pulses, easing, transitions. Off, every
+    /// change is shown at once and nothing animates.
+    pub motion: bool,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self { motion: true }
+    }
+}
+
+/// Whether the user's shell starts as a login shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoginShell {
+    /// As this platform's terminals do: a login shell on macOS, not
+    /// elsewhere.
+    #[default]
+    Auto,
+    /// Always pass `-l`.
+    Always,
+    /// Never pass `-l`.
+    Never,
+}
+
+/// The shell a `shell` pane runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// The program. `None` means the machine's own: `$SHELL`, then the
+    /// login record, then `/bin/sh`.
+    pub command: Option<String>,
+    /// Arguments, after any `-l`.
+    pub args: Vec<String>,
+    /// Whether it starts as a login shell.
+    pub login: LoginShell,
+}
+
+impl ShellConfig {
+    /// How to start the shell on this machine.
+    #[must_use]
+    pub fn launch(&self) -> Launch {
+        self.launch_with(
+            dispatch_os::shell::user_shell,
+            dispatch_os::shell::login_by_default(),
+            dispatch_os::shell::takes_login_flag(),
+        )
+    }
+
+    /// [`Self::launch`], with what it would ask the machine handed in, so
+    /// every platform's rules can be tested on any one of them.
+    pub(crate) fn launch_with(
+        &self,
+        user_shell: impl FnOnce() -> String,
+        login_by_default: bool,
+        takes_login_flag: bool,
+    ) -> Launch {
+        let command = self
+            .command
+            .clone()
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(user_shell);
+
+        let login = match self.login {
+            LoginShell::Auto => login_by_default,
+            LoginShell::Always => true,
+            LoginShell::Never => false,
+        };
+
+        let mut args = Vec::new();
+        if login && takes_login_flag {
+            args.push("-l".to_string());
+        }
+        args.extend(self.args.iter().cloned());
+
+        Launch {
+            command,
+            args,
+            env: BTreeMap::new(),
+            ..Launch::default()
+        }
+    }
+}
+
+/// One value in a `[keys.<mode>]` table, as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum KeyValue {
+    /// A command's name, or `none`.
+    Command(String),
+    /// A flag, as `clear = true` is.
+    Flag(bool),
+    /// Anything else, named by its TOML type, so it is reported rather than
+    /// failing the file.
+    Other(String),
+}
+
+impl From<toml::Value> for KeyValue {
+    fn from(value: toml::Value) -> Self {
+        match value {
+            toml::Value::String(name) => KeyValue::Command(name),
+            toml::Value::Boolean(flag) => KeyValue::Flag(flag),
+            other => KeyValue::Other(other.type_str().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(toml::Value::deserialize(deserializer)?.into())
+    }
+}
+
+/// One entry under `[keys]`, as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum KeyTable {
+    /// A mode's table: each key's text and what it is bound to.
+    Table(BTreeMap<String, KeyValue>),
+    /// Anything else, named by its TOML type, so a binding written straight
+    /// under `[keys]` is reported rather than failing the file.
+    Other(String),
+}
+
+impl From<toml::Value> for KeyTable {
+    fn from(value: toml::Value) -> Self {
+        match value {
+            toml::Value::Table(table) => KeyTable::Table(
+                table
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into()))
+                    .collect(),
+            ),
+            other => KeyTable::Other(other.type_str().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyTable {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(toml::Value::deserialize(deserializer)?.into())
+    }
+}
+
+/// What `[keys]` says: per mode, each key's text and what it is bound to,
+/// as written.
+///
+/// Kept as text, and read leniently at every level: which modes, keys and
+/// commands exist is the interface's business, and it reports what it cannot
+/// use, so a mistake costs one binding rather than the whole file — and with
+/// it the daemon, which never reads `[keys]` at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(transparent)]
+pub struct KeysConfig {
+    /// Each entry under `[keys]`, by the name it is written under.
+    pub modes: BTreeMap<String, KeyTable>,
+    /// Whether `keys` was something other than a table, such as
+    /// `keys = "vim"`. It then binds nothing, and says so through the
+    /// interface.
+    #[serde(skip)]
+    pub not_a_table: bool,
+}
+
+impl<'de> Deserialize<'de> for KeysConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match toml::Value::deserialize(deserializer)? {
+            toml::Value::Table(table) => KeysConfig {
+                modes: table
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into()))
+                    .collect(),
+                not_a_table: false,
+            },
+            _ => KeysConfig {
+                modes: BTreeMap::new(),
+                not_a_table: true,
+            },
+        })
+    }
+}
+
+/// Everything `config.toml` can say.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Limits on delegation.
     pub delegation: DelegationLimits,
+    /// How the interface draws itself. The daemon ignores it.
+    pub interface: InterfaceConfig,
+    /// The shell a `shell` pane runs. Read by whichever side starts panes:
+    /// the daemon, or a standalone client.
+    pub shell: ShellConfig,
+    /// Keys the interface binds, over its defaults. The daemon ignores it.
+    pub keys: KeysConfig,
 }
 
 /// A loaded configuration, plus the keys this build did not understand.
@@ -110,6 +304,7 @@ impl Config {
 /// Dotted paths of keys Dispatch does not know.
 fn unknown_keys(raw: &toml::Table) -> Vec<String> {
     const DELEGATION: [&str; 3] = ["max_depth", "max_live_per_parent", "request_timeout_secs"];
+    const SHELL: [&str; 3] = ["command", "args", "login"];
 
     let mut unknown = Vec::new();
 
@@ -122,6 +317,23 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
                     }
                 }
             }
+            ("interface", toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if key != "motion" {
+                        unknown.push(format!("interface.{key}"));
+                    }
+                }
+            }
+            ("shell", toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if !SHELL.contains(&key.as_str()) {
+                        unknown.push(format!("shell.{key}"));
+                    }
+                }
+            }
+            // The interface judges `[keys]` itself: it alone knows which
+            // modes, keys and commands exist, and it says what it skips.
+            ("keys", _) => {}
             _ => unknown.push(section.clone()),
         }
     }

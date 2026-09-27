@@ -46,6 +46,9 @@ pub struct DaemonPane {
     /// The file its task was delivered in, while the process may still read
     /// it.
     pub task_file: Option<crate::task_file::TaskFile>,
+    /// The branch last reported to clients, so a look that finds the same
+    /// one says nothing.
+    pub branch: Option<String>,
 }
 
 impl DaemonPane {

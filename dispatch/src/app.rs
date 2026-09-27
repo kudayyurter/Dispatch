@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dispatch_client::Client;
-use dispatch_config::{HarnessRegistry, Launch};
+use dispatch_config::{HarnessRegistry, Launch, SHELL};
 use dispatch_core::{
-    AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project,
-    ProjectId, ProjectSource, RequestId,
+    AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Placement,
+    Project, ProjectId, ProjectSource, ProjectTabs, RequestId, TabId,
 };
 use dispatch_layout::{tile, tile_zoomed};
-use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ServerMessage};
+use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
+use dispatch_pty::Signals;
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size, TitleScanner,
@@ -21,41 +22,84 @@ use dispatch_pty::{
 use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
+use crate::tabs::{self, TabHit, TabView};
 use dispatch_config::machines::{self, Machine};
+use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
-    Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyMode, KeyModifiers,
     MouseEventKind,
 };
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, sidebar};
+use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
+use dispatch_tui::theme::Role;
+use dispatch_tui::{
+    Command, Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate,
+};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
-/// How many panes are tiled at once.
-///
-/// Four is the most that stays readable in a terminal: past it every pane is
-/// too narrow for a wrapped line of code and too short for a prompt plus its
-/// answer. Panes beyond the fourth are not hidden — they go on the next tab,
-/// and all of them are always listed in the sidebar.
-const PANES_PER_TAB: usize = 4;
+/// The program's name as the top-left corner spells it, letter-spaced the
+/// way a label rather than a heading is.
+const APP_NAME: &str = "D I S P A T C H";
 
-/// The border drawn around one pane.
+/// How many columns of a tab's name it shows: the one it was given, else its
+/// first pane's title.
+const TAB_TITLE: usize = 16;
+
+/// What a tab command says on a project whose daemon keeps no tabs.
+const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
+
+/// The border drawn around one pane, in `colour`, its title bold when
+/// `focused`.
 ///
-/// A plain thin line, brighter on the focused pane. Rounded corners read as
-/// softer than the square ones the sidebar and status row use, which is enough
-/// to tell a pane's edge from the frame of the interface around it.
-fn pane_block(focused: bool) -> Block<'static> {
-    let colour = if focused {
-        Color::White
+/// Square, like every other edge in the interface. The colour is worked out
+/// by the caller, which knows whether the border is easing between faded and
+/// the accent.
+fn pane_block(colour: Color, focused: bool) -> Block<'static> {
+    let title = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
     } else {
-        Color::DarkGray
+        Style::default()
     };
 
     Block::bordered()
-        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(colour))
+        .title_style(title)
+}
+
+/// The cells around `rect`'s edge, clockwise from its top-left corner.
+fn perimeter(rect: Rect) -> Vec<(u16, u16)> {
+    if rect.width == 0 || rect.height == 0 {
+        return Vec::new();
+    }
+    let (left, top) = (rect.x, rect.y);
+    let (right, bottom) = (rect.x + rect.width - 1, rect.y + rect.height - 1);
+
+    let mut path: Vec<(u16, u16)> = (left..=right).map(|x| (x, top)).collect();
+    path.extend((top + 1..=bottom).map(|y| (right, y)));
+    if bottom > top {
+        path.extend((left..right).rev().map(|x| (x, bottom)));
+    }
+    if right > left {
+        path.extend((top + 1..bottom).rev().map(|y| (left, y)));
+    }
+    path
+}
+
+/// Blanks the part of `rect`'s border past `shown` (0.0–1.0) of the way
+/// round, so a border can be drawn in or retract.
+fn mask_border(buf: &mut Buffer, rect: Rect, shown: f32) {
+    let path = perimeter(rect);
+    let kept = (path.len() as f32 * shown.clamp(0.0, 1.0)).ceil() as usize;
+    for &(x, y) in path.iter().skip(kept) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.reset();
+        }
+    }
 }
 
 /// What to write on a pane's border.
@@ -67,6 +111,15 @@ fn pane_title(state: &AppState, id: PaneId) -> String {
         .pane(id)
         .map(|pane| format!(" {} ", pane.title))
         .unwrap_or_default()
+}
+
+/// The picker's name for the user's shell, after its program: `Shell · zsh`.
+fn shell_label(command: &str) -> String {
+    let program = Path::new(command).file_stem().map_or_else(
+        || command.to_string(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    format!("Shell · {program}")
 }
 
 /// Which picker is open, decoupled from the picker itself so a selection can
@@ -125,12 +178,40 @@ fn strip_mark(title: &str) -> &str {
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
 
+/// How soon after output a pane's state is looked at again.
+const EVALUATE_AFTER_OUTPUT: Duration = Duration::from_millis(100);
+
+/// How often every pane's state is looked at, output or not: an idle verdict
+/// needs time to pass, not bytes, to be confirmed.
+const EVALUATE_EVERY: Duration = Duration::from_millis(250);
+
+/// How long a new pane is kept from being marked done. A client attaching is
+/// replayed every pane's recent output at once, and without this every pane
+/// would come back "finished while you were away".
+const GRACE: Duration = Duration::from_secs(3);
+
+/// How long focus takes to move: the borders easing between faded and the
+/// accent, and the sidebar's tint on its way to the focused row.
+const EASE: Duration = Duration::from_millis(150);
+
+/// How long a row pulses for attention, all three times.
+const PULSE: Duration = Duration::from_millis(1200);
+
+/// How long a new pane's border takes to draw in.
+const OPEN: Duration = Duration::from_millis(200);
+/// How long a closed pane's tile takes to retract, holding the grid.
+const CLOSE: Duration = Duration::from_millis(150);
+/// How long the active tab's tint takes to slide.
+const SLIDE: Duration = Duration::from_millis(150);
+
 /// How much of a task's opening words becomes a subagent's first title.
 ///
-/// The sidebar is [`sidebar::WIDTH`] columns wide and a child row is indented
-/// four into it, so anything much longer than this could not be read there in
-/// full anyway.
-const TITLE_BUDGET: usize = 22;
+/// All a subagent's row has room for: in a [`sidebar::WIDTH`]-column sidebar,
+/// its title starts ten columns inside the frame, after the indent, the
+/// twisty, the icon and the blank after each, and stops a blank short of the
+/// state glyph two in from the far side. Any longer and the sidebar would cut
+/// again, mid-word, what was cut here between words.
+const TITLE_BUDGET: usize = 19;
 
 /// The opening words of a task, for the row of the subagent running it.
 ///
@@ -197,6 +278,14 @@ struct Pane {
     screen: Screen,
     /// Watches the output for the title the child sets for itself.
     titles: TitleScanner,
+    /// What the pane is doing, from its output, screen and title.
+    activity: Tracker,
+    /// When this client took the pane on, for the grace before done marks.
+    adopted: Instant,
+    /// When its state was last worked out.
+    evaluated: Option<Instant>,
+    /// Whether it printed since then.
+    dirty: bool,
 }
 
 /// What has the keyboard, so a keystroke meant for an agent — or an approval
@@ -221,6 +310,20 @@ enum Overlay {
         /// What has been typed.
         prompt: Prompt,
     },
+    /// A new name for a tab being typed.
+    RenameTab {
+        /// The tab being renamed.
+        tab: TabId,
+        /// What has been typed.
+        prompt: Prompt,
+    },
+    /// Closing a tab, and every pane on it, waiting on a yes.
+    CloseTab {
+        /// The tab to close.
+        tab: TabId,
+        /// The question, as a prompt with nothing to type.
+        prompt: Prompt,
+    },
     /// A delegation request, shown from the front of `App::pending`.
     Approval {
         /// First line of the task text on screen, for a long one.
@@ -239,6 +342,8 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
         }
     }
@@ -253,6 +358,8 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
         }
     }
@@ -268,7 +375,27 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
+        }
+    }
+
+    /// Draws the overlay's frame in `style`.
+    fn set_border(&mut self, style: Style) {
+        match self {
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker) => picker.set_border(style),
+            Overlay::Browse(browser) => browser.set_border(style),
+            Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
+            Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
+                prompt.set_border(style)
+            }
+            Overlay::AddMachine(add) => add.prompt_mut().set_border(style),
+            // Built fresh each frame, with the theme's border already on it.
+            Overlay::Approval { .. } => {}
         }
     }
 }
@@ -339,6 +466,25 @@ enum Mode {
     Attached(Vec<Attachment>),
 }
 
+/// What an animation animates, so a new one on the same thing replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Target {
+    /// A pane's border easing toward the accent: it has just been focused.
+    Focus(PaneId),
+    /// A pane's border easing back to faded: focus has just left it.
+    Blur(PaneId),
+    /// The sidebar's focus tint moving to the newly focused row.
+    Glide,
+    /// A pane's sidebar row pulsing for attention.
+    Pulse(PaneId),
+    /// A new pane's border being drawn in.
+    Open(PaneId),
+    /// A closed pane's tile retracting.
+    Close(PaneId),
+    /// The active tab's tint sliding to the newly active tab.
+    Tab,
+}
+
 /// The application.
 pub struct App {
     mode: Mode,
@@ -369,6 +515,13 @@ pub struct App {
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
     router: InputRouter,
+    /// The pane scroll mode reads, while it is on: the one focused when it
+    /// began.
+    ///
+    /// Kept rather than read from the focus each time, so that whenever the
+    /// mode ends — however it ends — this pane, and no other, goes back to
+    /// live output. A pane left scrolled back is never marked blocked.
+    scrolling: Option<PaneId>,
     /// Each pane's content rectangle last frame — inside its border.
     ///
     /// This is what a pointer is resolved against and what a pane is resized
@@ -379,6 +532,17 @@ pub struct App {
     ///
     /// Only drawing wants this; everything else means [`App::layout`].
     frames: Vec<(PaneId, Rect)>,
+    /// The area [`App::frames`] was laid out for.
+    ///
+    /// What a hold is stamped with, rather than the area of the frame that
+    /// starts it: a terminal that shrank since the last frame would otherwise
+    /// hold tiles that no longer fit on screen.
+    frames_area: Rect,
+    /// The project whose panes [`App::frames`] holds.
+    ///
+    /// Switching to another project swaps the whole grid; its panes going
+    /// off screen is not them closing.
+    frames_project: Option<ProjectId>,
 
     /// Where the sidebar was drawn last frame.
     ///
@@ -386,6 +550,17 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// How far each machine's section of the sidebar is scrolled.
+    sidebar_scroll: sidebar::Scroll,
+    /// The row the sidebar was last scrolled to follow, and the area it was
+    /// drawn in then.
+    ///
+    /// Compared against the focus, the selection and the sidebar's area each
+    /// frame: only a change nudges the scroll, so a wheel scroll — which
+    /// changes none of them — is not undone by the very next frame drawn
+    /// after it, while a resize that would push the row out of view is not
+    /// left to.
+    anchored: (Option<sidebar::Anchor>, Rect),
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -409,6 +584,11 @@ pub struct App {
     /// title is known one message before there is a row to put it on.
     child_titles: HashMap<PaneId, String>,
     status: String,
+    /// When this client last looked at its own panes' and projects' branches.
+    branches_checked: Option<Instant>,
+    /// How often it looks: [`dispatch_os::git::RECHECK`], or every poll in a
+    /// test that cannot wait two seconds per step.
+    branch_every: Duration,
     quit: bool,
     /// A project to reselect once its `ProjectOpened` comes back, keyed by
     /// the device it belongs to, because a reconnect forgot it out from
@@ -436,6 +616,49 @@ pub struct App {
     /// can tell `a` and `A` apart without a real daemon to send it to.
     #[cfg(test)]
     sent: Vec<ClientMessage>,
+    /// The colours Dispatch draws its own chrome in.
+    theme: Theme,
+    /// Where the time comes from: the real clock in the binary, one moved by
+    /// hand in tests, so every timing here can be tested without sleeping.
+    clock: Box<dyn Fn() -> Instant>,
+    /// Whether the interface animates spinners, pulses, easing and transitions.
+    motion: bool,
+    /// When this run started, so every spinner on screen derives its frame
+    /// from the clock rather than keeping one of its own.
+    started: Instant,
+    /// Running tweens, one per thing on screen that is moving.
+    animations: Animations<Target>,
+    /// The pane focused when the last frame was drawn, so the next one can
+    /// tell focus has moved and ease the borders it moved between.
+    last_focus: Option<PaneId>,
+    /// The row the sidebar's focus tint stood on in the last frame.
+    last_anchor: Option<sidebar::Anchor>,
+    /// Where the sidebar's focus tint is gliding from, while it glides.
+    glide_from: Option<sidebar::Anchor>,
+    /// The grid as it was when a pane began leaving it, and the area it was
+    /// laid out for, kept until every leaving tile has retracted.
+    held: Option<(Rect, Vec<(PaneId, Rect)>)>,
+    /// Tiles of panes that have left the grid, still retracting.
+    closing: Vec<(PaneId, Rect)>,
+    /// The tab on screen when the last frame was drawn, so the next one can
+    /// tell the tab has changed and slide its tint.
+    last_tab: usize,
+    /// Where the active tab's tint is sliding from, while it slides.
+    tab_from: usize,
+    /// Where the next pane chosen in the picker goes, set by whatever opened
+    /// the picker.
+    placing: Placement,
+    /// The pane this client last focused on each tab, so coming back to a
+    /// tab lands where the user left it.
+    tab_focus: HashMap<TabId, PaneId>,
+    /// The tab on screen at the last frame, and the one before it, for
+    /// going back to the tab the user came from.
+    tab_shown: Option<TabId>,
+    tab_back: Option<TabId>,
+    /// Where the tab row was drawn last frame, and what each stretch of it
+    /// is, for a click to be matched against.
+    tab_row: Rect,
+    tab_hits: Vec<(u16, u16, TabHit)>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -471,18 +694,43 @@ impl App {
             panes: HashMap::new(),
             harnesses,
             router: InputRouter::new(),
+            scrolling: None,
             frames: Vec::new(),
+            frames_area: Rect::default(),
+            frames_project: None,
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            sidebar_scroll: sidebar::Scroll::new(),
+            anchored: (None, Rect::default()),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
             child_titles: HashMap::new(),
             status: String::new(),
+            branches_checked: None,
+            branch_every: dispatch_os::git::RECHECK,
             quit: false,
             reopening_selection: None,
             #[cfg(test)]
             sent: Vec::new(),
+            theme: Theme::fallback(),
+            clock: Box::new(Instant::now),
+            motion: true,
+            started: Instant::now(),
+            animations: Animations::new(true),
+            last_focus: None,
+            last_anchor: None,
+            glide_from: None,
+            held: None,
+            closing: Vec::new(),
+            last_tab: 0,
+            tab_from: 0,
+            placing: Placement::Auto,
+            tab_focus: HashMap::new(),
+            tab_shown: None,
+            tab_back: None,
+            tab_row: Rect::default(),
+            tab_hits: Vec::new(),
         }
     }
 
@@ -499,8 +747,8 @@ impl App {
     /// Adds a daemon to the fleet, registering the machine it names itself as.
     ///
     /// The device is registered here, before the connection has said anything,
-    /// so every project this daemon announces has a machine's row to be drawn
-    /// under. A project stamped with a device the sidebar does not know is
+    /// so every project this daemon announces has a machine's section to be
+    /// drawn in. A project stamped with a device the sidebar does not know is
     /// drawn nowhere at all.
     pub fn attach(&mut self, client: Client) {
         let device = Device::new(client.device());
@@ -574,6 +822,23 @@ impl App {
         self.status = status.into();
     }
 
+    /// Draws the interface in `theme` from the next frame on.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Turns motion on or off: spinners, pulses, easing and transitions.
+    pub fn set_motion(&mut self, on: bool) {
+        self.motion = on;
+        self.animations.set_enabled(on);
+    }
+
+    /// Reads keys through `keymap`: the defaults with the user's `[keys]`
+    /// laid over them.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.router = InputRouter::with_keymap(keymap);
+    }
+
     /// The daemons this client is holding, or nothing when it holds none.
     fn attachments(&self) -> &[Attachment] {
         match &self.mode {
@@ -600,6 +865,18 @@ impl App {
         self.attachments()
             .iter()
             .find(|attachment| attachment.device == device)
+    }
+
+    /// Whether the selected project's panes run on this machine.
+    fn project_is_local(&self) -> bool {
+        match &self.mode {
+            Mode::Standalone => true,
+            Mode::Attached(_) => self
+                .state
+                .selected_project()
+                .and_then(|project| self.attachment_for_project(project))
+                .is_some_and(|attachment| !attachment.remote),
+        }
     }
 
     /// The daemon a project is on, or `None` with the reason said out loud.
@@ -697,9 +974,9 @@ impl App {
     /// only ever proceeds project-then-machine and unfolding always drops
     /// both at once -- there is no third shape a press has to remember its
     /// way through. A remembered direction would be one more thing that has
-    /// to agree with what a click on the project or machine row just did
-    /// behind this key's back; reading the flags fresh each press means
-    /// there is nothing to fall out of sync.
+    /// to agree with what a click on the project row or the machine's name
+    /// line just did behind this key's back; reading the flags fresh each
+    /// press means there is nothing to fall out of sync.
     fn toggle_project_and_device_fold(&mut self, project: ProjectId) {
         let device = self
             .state
@@ -708,7 +985,7 @@ impl App {
             .find(|candidate| candidate.id == project)
             .map(|candidate| candidate.device);
 
-        // On one machine the sidebar draws no device row, so a folded device
+        // On one machine the sidebar draws no name line, so a folded device
         // is invisible: stepping that rung anyway would spend a press on
         // nothing, leaving the second press of `^a f` looking like a no-op
         // and a third one needed to unfold. Dropping the device out of the
@@ -825,7 +1102,7 @@ impl App {
         };
 
         // Stamped with this machine, like any other project: the sidebar draws
-        // a project under its machine's row, so one naming a device that was
+        // a project in its machine's section, so one naming a device that was
         // never registered is drawn nowhere at all — open, invisible and
         // unreachable.
         //
@@ -838,8 +1115,17 @@ impl App {
             .local
             .expect("a standalone client registers its own machine in `App::new`");
 
-        self.state
-            .add_project(Project::new(root, source).with_device(device));
+        let branch = dispatch_os::git::head(&root);
+        let id = self.state.add_project(
+            Project::new(root, source)
+                .with_branch(branch)
+                .with_device(device),
+        );
+        // This client runs a standalone project's panes, so it keeps their
+        // tabs as well.
+        if self.state.project_tabs(id).is_none() {
+            self.state.set_project_tabs(id, ProjectTabs::new());
+        }
     }
 
     /// Which kept list a root opened on `device` belongs on.
@@ -919,6 +1205,10 @@ impl App {
     /// Attached, this asks and returns: the pane appears when the daemon says it
     /// has started one, which is also how the other clients hear about it.
     pub fn spawn_pane(&mut self, harness: &str, area: Size) -> Result<()> {
+        // Taken whatever happens next, so a placement meant for this pane
+        // can never land a later one somewhere the user did not ask.
+        let place = std::mem::take(&mut self.placing);
+
         let Some(project_id) = self.state.selected_project() else {
             self.status = "no project selected".into();
             return Ok(());
@@ -954,6 +1244,7 @@ impl App {
                 project: project_id,
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
+                place,
             });
             self.status = format!("starting {display_name}…");
             return Ok(());
@@ -967,15 +1258,123 @@ impl App {
             .map(|p| p.root.clone())
             .context("the selected project is registered")?;
 
-        let session = PtySession::spawn(&launch, &cwd, area)
-            .with_context(|| format!("failed to start {display_name}"))?;
+        // Told on the status row, as a daemon tells an attached client, rather
+        // than returned: an error here ends Dispatch, and every standalone
+        // agent with it, over what may be one mistyped `[shell] command`.
+        let session = match PtySession::spawn(&launch, &cwd, area) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = format!("failed to start {harness}: {error:#}");
+                return Ok(());
+            }
+        };
 
         let id = self
             .state
             .spawn_pane(project_id, HarnessId::new(harness))
             .context("the selected project is registered")?;
+        self.state.place_pane(id, place);
 
         self.adopt(id, Backend::Local(session), &display_name)
+    }
+
+    /// The time, read through the clock the app was given: the real one in
+    /// the binary, one moved by hand in tests, so every timing here can be
+    /// tested without sleeping.
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    /// Which spinner frame a working pane shows now, from the clock, so every
+    /// spinner on screen turns in step; `None` with motion off.
+    fn spinner_frame(&self) -> Option<usize> {
+        self.motion.then(|| {
+            let elapsed = self.now().saturating_duration_since(self.started);
+            usize::try_from(elapsed.as_millis() / 100).unwrap_or(0) % sidebar::SPINNER.len()
+        })
+    }
+
+    /// How far toward the accent `id`'s border is at `now`: 1.0 focused and
+    /// at rest, 0.0 unfocused and at rest, between while easing.
+    ///
+    /// At rest, focused means as of the last frame drawn rather than as the
+    /// state says now: a change of focus is only noticed when the next frame
+    /// is drawn, and the ease it starts has to start from what was on screen.
+    fn border_level(&self, id: PaneId, now: Instant) -> f32 {
+        if let Some(value) = self.animations.value(Target::Focus(id), now) {
+            return value;
+        }
+        if let Some(value) = self.animations.value(Target::Blur(id), now) {
+            return 1.0 - value;
+        }
+        if self.last_focus == Some(id) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Starts the easing a change of focus sets off: the new pane's border
+    /// toward the accent, the old one's back to faded, and the sidebar tint
+    /// from the old row to the new — each from wherever it had got to.
+    fn notice_focus(&mut self, now: Instant) {
+        let focus = self.state.focused_pane();
+        let anchor = focus
+            .map(sidebar::Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
+
+        if focus != self.last_focus {
+            if let Some(new) = focus {
+                let from = self.border_level(new, now);
+                self.animations.stop(Target::Blur(new));
+                self.animations.start(Target::Focus(new), now, EASE, from);
+                // Looked at, it has what it was pulsing for; left running, the
+                // pulse would paint over the focus tint arriving on its row.
+                self.animations.stop(Target::Pulse(new));
+            }
+            if let Some(old) = self.last_focus {
+                let from = 1.0 - self.border_level(old, now);
+                self.animations.stop(Target::Focus(old));
+                self.animations.start(Target::Blur(old), now, EASE, from);
+            }
+        }
+
+        if anchor != self.last_anchor {
+            // A glide replaced mid-way starts from the row the old one was
+            // heading to: within 150 ms that reads as continuous.
+            self.glide_from = self.last_anchor;
+            if self.glide_from.is_some() {
+                self.animations.start(Target::Glide, now, EASE, 0.0);
+            }
+        }
+
+        self.last_focus = focus;
+        self.last_anchor = anchor;
+    }
+
+    /// How long until the next frame something on screen needs: a tween
+    /// running needs about thirty a second, a spinner ten, and nothing
+    /// moving needs none — a still Dispatch draws only when something
+    /// changes.
+    ///
+    /// A tween that has finished but not been swept up still asks: the frame
+    /// that sweeps it is the one that shows its end, and a closed pane's tile
+    /// holds the grid until that frame is drawn.
+    #[must_use]
+    pub fn next_frame(&self, _now: Instant) -> Option<Duration> {
+        if !self.animations.is_empty() {
+            return Some(TWEEN_FRAME);
+        }
+
+        let spinning = self.motion
+            && self
+                .state
+                .projects()
+                .iter()
+                .flat_map(|project| self.state.panes_for(project.id))
+                .any(|pane| !pane.closed && pane.status == PaneStatus::Running);
+
+        spinning.then_some(SPIN_FRAME)
     }
 
     /// Takes on a pane that now exists, wherever its process is.
@@ -991,6 +1390,13 @@ impl App {
 
         let _ = self.state.set_pane_title(id, display_name);
 
+        let rules = self
+            .state
+            .pane(id)
+            .map(|pane| self.harnesses.status_rules(pane.harness.as_str()))
+            .unwrap_or_default();
+        let now = self.now();
+
         self.panes.insert(
             id,
             Pane {
@@ -1001,10 +1407,54 @@ impl App {
                 reader,
                 screen,
                 titles: TitleScanner::new(),
+                activity: Tracker::new(rules),
+                adopted: now,
+                evaluated: None,
+                dirty: false,
             },
         );
+        self.animations.start(Target::Open(id), now, OPEN, 0.0);
+
+        // A subagent runs its harness's one-shot `[task]` form, and nothing
+        // it prints says whether it is still at it: `claude -p` is silent
+        // until its answer, `codex exec` goes quiet between model calls. It
+        // is working from the start until it exits, unless its rules say it
+        // is blocked; see `refresh_activity`.
+        if self
+            .state
+            .pane(id)
+            .is_some_and(|pane| pane.parent.is_some() && pane.status.is_live())
+        {
+            let _ = self.state.set_pane_status(id, PaneStatus::Running);
+        }
 
         Ok(())
+    }
+
+    /// Takes in what one burst of a pane's output said besides its text.
+    ///
+    /// Returns the new title, for the caller to rename the pane with, and
+    /// marks the pane unseen on a bell when the user is looking elsewhere.
+    fn take_output(&mut self, id: PaneId, bytes: &[u8]) -> Option<String> {
+        let now = self.now();
+        let focused = self.state.focused_pane();
+        let pane = self.panes.get_mut(&id)?;
+
+        let signals: Signals = pane.titles.scan_signals(bytes);
+        pane.activity.output(now);
+        pane.activity.signals(&signals);
+        pane.dirty = true;
+
+        let graced = now.saturating_duration_since(pane.adopted) < GRACE;
+        if signals.bell && focused != Some(id) && !graced {
+            let was_unseen = self.state.is_unseen(id);
+            self.state.mark_unseen(id);
+            if !was_unseen {
+                self.animations.start(Target::Pulse(id), now, PULSE, 0.0);
+            }
+        }
+
+        signals.title
     }
 
     /// Acts on whatever the daemon has said since the last call.
@@ -1012,6 +1462,13 @@ impl App {
     /// Returns whether anything needs redrawing. Standalone, there is nothing
     /// to hear and this does nothing.
     pub fn poll_daemon(&mut self) -> bool {
+        let changed = self.take_in_daemon();
+        // A pane the daemon closed may be the one scroll mode was reading.
+        self.settle_scroll_mode() || changed
+    }
+
+    /// [`App::poll_daemon`]'s messages, before scroll mode is settled.
+    fn take_in_daemon(&mut self) -> bool {
         let added = self.poll_add_machine();
 
         let Mode::Attached(attachments) = &self.mode else {
@@ -1300,6 +1757,16 @@ impl App {
                 self.state.remove_project(project).is_ok()
             }
 
+            ServerMessage::ProjectChanged { project, update } => match update {
+                ProjectUpdate::Branch { branch } => self
+                    .state
+                    .set_project_branch(project, branch)
+                    .unwrap_or(false),
+                // A newer daemon's change this build has no name for: ignored,
+                // as the protocol promises, rather than failing the frame.
+                ProjectUpdate::Unknown => false,
+            },
+
             ServerMessage::PaneSpawned {
                 pane,
                 project,
@@ -1320,12 +1787,11 @@ impl App {
                     target.screen = screen;
                 }
 
-                // Read here as well as for a local pane: the same bytes carry
-                // the title whichever side the process is on, and a client that
-                // has just been replayed a pane's output learns its name from
-                // it.
-                let title = target.titles.scan(&bytes);
-                if let Some(title) = title {
+                // The borrow above ends here, so `take_output` can borrow
+                // `self.panes` again: it reads the same bytes for the title,
+                // whichever side the process is on, so a client that has just
+                // been replayed a pane's output learns its name from it.
+                if let Some(title) = self.take_output(pane, &bytes) {
                     self.rename(pane, &title);
                 }
 
@@ -1346,6 +1812,9 @@ impl App {
                 PaneUpdate::Title { title } => {
                     self.rename(pane, &title);
                     true
+                }
+                PaneUpdate::Branch { branch } => {
+                    self.state.set_pane_branch(pane, branch).unwrap_or(false)
                 }
                 // A newer daemon's update this build has no name for. The
                 // protocol's promise is that it lands somewhere ignorable
@@ -1510,6 +1979,12 @@ impl App {
                 false
             }
 
+            // The daemon's word on its own project's tabs, whole: whatever
+            // this client held before is replaced rather than merged.
+            ServerMessage::Tabs { project, tabs } => self
+                .state
+                .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
             // clients. Unknown messages from newer peers are ignored.
@@ -1615,7 +2090,7 @@ impl App {
     pub fn poll_panes(&mut self) -> bool {
         let mut changed = false;
         let mut exited = Vec::new();
-        let mut renamed = Vec::new();
+        let mut outputs = Vec::new();
 
         for (id, pane) in &mut self.panes {
             let output = pane.backend.drain();
@@ -1623,13 +2098,10 @@ impl App {
             if !output.is_empty() {
                 changed = true;
 
-                if let Some(title) = pane.titles.scan(&output) {
-                    renamed.push((*id, title));
-                }
-
                 if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                     pane.screen = screen;
                 }
+                outputs.push((*id, output));
             }
 
             if let RunState::Exited(code) = pane.backend.state() {
@@ -1637,8 +2109,10 @@ impl App {
             }
         }
 
-        for (id, title) in renamed {
-            self.rename(id, &title);
+        for (id, output) in outputs {
+            if let Some(title) = self.take_output(id, &output) {
+                self.rename(id, &title);
+            }
         }
 
         for (id, code) in exited {
@@ -1666,15 +2140,251 @@ impl App {
             let _ = self.state.set_pane_status(id, status);
         }
 
+        if self.refresh_local_branches() {
+            changed = true;
+        }
+
+        if self.refresh_activity() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Looks again at which branch this process's own panes and projects are
+    /// on, at most every `branch_every`. Returns whether any row moved.
+    ///
+    /// Standalone only: attached, every pane and project is a daemon's, and
+    /// the daemon looks from the machine they are on. A pane whose directory
+    /// cannot be read keeps the branch it had, as the daemon's do.
+    fn refresh_local_branches(&mut self) -> bool {
+        let Some(local) = self.local else {
+            return false;
+        };
+        if self
+            .branches_checked
+            .is_some_and(|checked| checked.elapsed() < self.branch_every)
+        {
+            return false;
+        }
+        self.branches_checked = Some(Instant::now());
+
+        let mut changed = false;
+
+        let dirs: Vec<(PaneId, PathBuf)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| match &pane.backend {
+                // Live panes only, as the daemon's: an exited pane still holds
+                // the pid it was spawned with, and once that number is handed
+                // to some unrelated process, looking there would move the
+                // finished pane onto that process's branch.
+                Backend::Local(session) if session.state() == RunState::Running => session
+                    .pid()
+                    .and_then(dispatch_os::process::working_dir)
+                    .map(|dir| (*id, dir)),
+                Backend::Local(_) | Backend::Remote(_) => None,
+            })
+            .collect();
+        for (id, dir) in dirs {
+            let branch = dispatch_os::git::head(&dir);
+            changed |= self.state.set_pane_branch(id, branch).unwrap_or(false);
+        }
+
+        let roots: Vec<(ProjectId, PathBuf)> = self
+            .state
+            .projects()
+            .iter()
+            .filter(|project| project.device == local)
+            .map(|project| (project.id, project.root.clone()))
+            .collect();
+        for (id, root) in roots {
+            let branch = dispatch_os::git::head(&root);
+            changed |= self.state.set_project_branch(id, branch).unwrap_or(false);
+        }
+
+        changed
+    }
+
+    /// Works out what every pane is doing, and records what changed.
+    ///
+    /// A pane is looked at soon after it prints, and every pane on a slower
+    /// tick so a quiet one can settle to idle. A pane scrolled back is left
+    /// alone: its screen is history, not the live one. Returns whether any
+    /// status changed, or a done mark was cleared.
+    fn refresh_activity(&mut self) -> bool {
+        let now = self.now();
+        let focused = self.state.focused_pane();
+        let mut changed = false;
+
+        // Said as a change because focus can move with no input to draw the
+        // frame that shows it — the focused pane closing hands it on — and
+        // with motion off nothing else is drawing.
+        if let Some(focused) = focused
+            && self.state.is_unseen(focused)
+        {
+            self.state.mark_seen(focused);
+            changed = true;
+        }
+
+        let mut verdicts = Vec::new();
+        for (id, pane) in &mut self.panes {
+            if pane.scrolled_back {
+                continue;
+            }
+
+            let due = pane.evaluated.is_none_or(|at| {
+                let since = now.saturating_duration_since(at);
+                (pane.dirty && since >= EVALUATE_AFTER_OUTPUT) || since >= EVALUATE_EVERY
+            });
+            if !due {
+                continue;
+            }
+
+            pane.evaluated = Some(now);
+            pane.dirty = false;
+
+            if let Some(verdict) = pane.activity.evaluate(now, &pane.screen.text_lines()) {
+                verdicts.push((*id, verdict, pane.adopted));
+            }
+        }
+
+        for (id, verdict, adopted) in verdicts {
+            let Some((before, delegated)) = self
+                .state
+                .pane(id)
+                .map(|pane| (pane.status, pane.parent.is_some()))
+            else {
+                continue;
+            };
+            // An exited pane's last word is its exit; nothing read off its
+            // final screen may overwrite that.
+            if !before.is_live() {
+                continue;
+            }
+
+            let status = match verdict {
+                Verdict::Blocked => PaneStatus::Blocked,
+                // A subagent's quiet is it thinking, not waiting on the
+                // user: nobody types into a one-shot task, and it is done
+                // only when it exits. So it never goes idle, and is never
+                // marked done for going quiet.
+                Verdict::Working | Verdict::Idle if delegated => PaneStatus::Running,
+                Verdict::Working => PaneStatus::Running,
+                Verdict::Idle => PaneStatus::Idle,
+            };
+            if status == before {
+                continue;
+            }
+
+            let _ = self.state.set_pane_status(id, status);
+            changed = true;
+
+            let was_unseen = self.state.is_unseen(id);
+            let graced = now.saturating_duration_since(adopted) < GRACE;
+            if before == PaneStatus::Running
+                && status == PaneStatus::Idle
+                && focused != Some(id)
+                && !graced
+            {
+                self.state.mark_unseen(id);
+            }
+
+            // A pane that now wants the user — blocked, or finished out of
+            // sight — pulses its row so the eye finds it.
+            if (status == PaneStatus::Blocked && focused != Some(id))
+                || self.state.is_unseen(id) && !was_unseen
+            {
+                self.animations.start(Target::Pulse(id), now, PULSE, 0.0);
+            }
+        }
+
         changed
     }
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        let handled = self.act_on(event, area);
+        // Settled after the event, whichever way it went: a click, a paste
+        // or a key can end scroll mode, or close or move focus off the pane
+        // it reads, and a key can start it.
+        self.settle_scroll_mode();
+        handled
+    }
+
+    /// Keeps scroll mode and the pane it reads in step. Returns whether the
+    /// mode ended.
+    ///
+    /// The mode takes the focused pane when it starts, and needs one: with
+    /// nothing focused it has nothing to read, and would only hold keys. It
+    /// ends when focus leaves that pane — the pane closing hands focus on —
+    /// since its keys would otherwise scroll a pane it was never entered on.
+    /// However it ends, the pane goes back to live output.
+    fn settle_scroll_mode(&mut self) -> bool {
+        let focused = self
+            .state
+            .focused_pane()
+            .filter(|id| self.panes.contains_key(id));
+
+        if self.router.key_mode() == KeyMode::Scroll {
+            match self.scrolling {
+                None if focused.is_some() => {
+                    self.scrolling = focused;
+                    return false;
+                }
+                Some(target) if focused == Some(target) => return false,
+                _ => self.router.leave_mode(),
+            }
+        } else if self.scrolling.is_none() {
+            return false;
+        }
+
+        if let Some(target) = self.scrolling.take() {
+            self.scroll_to_bottom(target);
+        }
+        true
+    }
+
+    /// [`App::handle`]'s work, before scroll mode is settled.
+    fn act_on(&mut self, event: &Event, area: Size) -> Result<()> {
+        // A click ends tab mode whatever it lands on. The sidebar and the tab
+        // row are resolved here, before the router sees the event, so the
+        // router cannot end it for them.
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+        {
+            self.router.leave_mode();
+        }
+
         // An overlay takes the keyboard while it is open, so arrow keys choose
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
             return self.handle_overlay(event, area);
+        }
+
+        // The tab row is not part of input routing either: a click on it is
+        // resolved against what was drawn there last frame. Reversed, so an
+        // overlap (there should be none, but a narrow row leaves little
+        // room for error) favours whatever was drawn last, which is what is
+        // actually on top.
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+            && self.tab_row.height > 0
+            && mouse.row == self.tab_row.y
+            && let Some(hit) = self
+                .tab_hits
+                .iter()
+                .rev()
+                .find(|(x, width, _)| mouse.column >= *x && mouse.column < x.saturating_add(*width))
+                .map(|(_, _, hit)| *hit)
+        {
+            match hit {
+                TabHit::Tab(index) => self.select_tab(index),
+                TabHit::New => self.open_new_tab_picker(),
+                TabHit::Previous => self.select_previous_tab(),
+                TabHit::Next => self.select_tab(self.current_tab() + 1),
+            }
+            return Ok(());
         }
 
         // The sidebar is not otherwise part of input routing — `layout` below
@@ -1682,8 +2392,13 @@ impl App {
         // resolved here rather than through the router.
         if let Event::Mouse(mouse) = event
             && matches!(mouse.kind, MouseEventKind::Down(_))
-            && let Some(hit) =
-                sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
+            && let Some(hit) = sidebar::hit_test(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
         {
             match hit {
                 sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
@@ -1700,9 +2415,40 @@ impl App {
             return Ok(());
         }
 
+        // The wheel over the sidebar scrolls the section under it; the grid
+        // never sees it, since no pane is under the pointer.
+        if let Event::Mouse(mouse) = event
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && let Some(device) = sidebar::section_at(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
+        {
+            let offset = self.sidebar_scroll.entry(device).or_insert(0);
+            *offset = if mouse.kind == MouseEventKind::ScrollUp {
+                offset.saturating_sub(1)
+            } else {
+                offset.saturating_add(1)
+            };
+            return Ok(());
+        }
+
         let layout = std::mem::take(&mut self.layout);
+        let mode = self.router.key_mode();
         let action = self.router.handle(event, &layout);
         self.layout = layout;
+
+        // Entering a mode wipes a stale message, so what the mode's row shows
+        // between its name and its keys is about this mode.
+        if !mode.is_modal() && self.router.key_mode().is_modal() {
+            self.status.clear();
+        }
 
         match action {
             Action::None => {}
@@ -1712,7 +2458,7 @@ impl App {
             Action::FocusPane(id) => self.focus_pane(id),
             Action::FocusDirection(direction) => self.focus_direction(direction),
             Action::SendMouse(id, input) => self.send_mouse(id, input),
-            Action::Scroll(rows) => self.scroll_focused(rows),
+            Action::Scroll(rows) => self.scroll_view(ScrollTo::Delta(rows)),
             Action::ToggleZoom => self.state.toggle_zoom(),
             Action::ClosePane => self.close_focused(),
             Action::NewPane => self.open_harness_picker(),
@@ -1720,34 +2466,55 @@ impl App {
             Action::HarnessManager => self.open_harness_manager(),
             Action::SelectTab(index) => self.select_tab(index),
             Action::NextTab => self.select_tab(self.current_tab() + 1),
-            Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
             Action::OpenProject => self.start_open(),
             Action::AddMachine => self.open_add_machine(),
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
+            Action::NewTab => self.open_new_tab_picker(),
+            Action::RenameTab => self.open_rename_tab(),
+            Action::CloseTab => self.open_close_tab(),
+            Action::PreviousTab => self.select_previous_tab(),
+            Action::LastTab => self.select_last_tab(),
+            Action::MovePaneLeft => self.move_focused_pane(-1),
+            Action::MovePaneRight => self.move_focused_pane(1),
+            Action::MoveTabLeft => self.move_current_tab(-1),
+            Action::MoveTabRight => self.move_current_tab(1),
+            Action::FocusOrTab(direction) => self.focus_or_tab(direction),
+            Action::FocusNext => self.focus_next(),
+            Action::ScrollHalfPages(pages) => self.scroll_pages(pages, true),
+            Action::ScrollPages(pages) => self.scroll_pages(pages, false),
+            Action::ScrollToTop => self.scroll_view(ScrollTo::Top),
+            Action::ScrollToBottom => {
+                if let Some(id) = self.scroll_target() {
+                    self.scroll_to_bottom(id);
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Shows a tab by focusing its first pane.
+    /// Shows a tab by focusing a pane on it: the one this client last used
+    /// there, else its first.
     ///
-    /// Focusing is how a tab is shown at all, since the view follows the focus.
-    /// Out of range wraps to the first, so `^a 9` on a two-tab fleet lands
-    /// somewhere real rather than doing nothing.
+    /// Focusing is how a tab is shown at all, since the view follows the
+    /// focus. Out of range wraps to the first, so `^a 9` on a two-tab fleet
+    /// lands somewhere real rather than doing nothing.
     fn select_tab(&mut self, index: usize) {
-        let index = if index < self.tab_count() { index } else { 0 };
+        let views = self.tab_views();
+        let index = if index < views.len() { index } else { 0 };
+        let Some(view) = views.get(index) else {
+            return;
+        };
 
-        if let Some(first) = self
-            .tileable()
-            .chunks(PANES_PER_TAB)
-            .nth(index)
-            .and_then(<[PaneId]>::first)
-            .copied()
-        {
-            let _ = self.state.focus(first);
+        let remembered = view
+            .id
+            .and_then(|id| self.tab_focus.get(&id).copied())
+            .filter(|pane| view.panes.contains(pane));
+        if let Some(pane) = remembered.or_else(|| view.panes.first().copied()) {
+            let _ = self.state.focus(pane);
         }
     }
 
@@ -1847,7 +2614,7 @@ impl App {
         // ends with must not make it for the user.
         if let Event::Paste(text) = event {
             match &mut self.overlay {
-                Some(Overlay::OpenOn { prompt, .. }) => text
+                Some(Overlay::OpenOn { prompt, .. } | Overlay::RenameTab { prompt, .. }) => text
                     .chars()
                     .filter(|c| !matches!(c, '\r' | '\n'))
                     .for_each(|c| prompt.push(c)),
@@ -1880,6 +2647,16 @@ impl App {
         // Plain letters are what is being typed, so this takes every key.
         if matches!(self.overlay, Some(Overlay::OpenOn { .. })) {
             self.handle_open_on_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::RenameTab { .. })) {
+            self.handle_rename_tab_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::CloseTab { .. })) {
+            self.handle_close_tab_key(key);
             return Ok(());
         }
 
@@ -2241,6 +3018,7 @@ impl App {
             task: &request.task,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
+            border: Style::default().fg(self.theme.faded),
         })
     }
 
@@ -2283,7 +3061,9 @@ impl App {
 
                 // Reload so the new harness is offered immediately rather
                 // than only after a restart.
-                self.harnesses = HarnessRegistry::load_from_dir(&dir)
+                self.harnesses = self
+                    .harnesses
+                    .reloaded(&dir)
                     .context("failed to reload harness definitions")?;
                 self.status = format!("registered {id}");
             }
@@ -2305,18 +3085,55 @@ impl App {
         Ok(())
     }
 
+    /// Opens the picker for a pane on the tab on screen.
     fn open_harness_picker(&mut self) {
-        let items: Vec<Item> = self
+        let place = self
+            .current_tab_id()
+            .map_or(Placement::Auto, |tab| Placement::Into { tab });
+        self.open_picker_placing(place);
+    }
+
+    /// Opens the picker for a pane that goes where `place` says.
+    fn open_picker_placing(&mut self, place: Placement) {
+        let local = self.project_is_local();
+        // A daemon that predates tabs predates the built-in `shell` too: a
+        // Shell offered, and chosen by Enter, would only be refused as an
+        // unknown harness. Standalone, this machine starts it, and has one.
+        let old_daemon = !matches!(self.mode, Mode::Standalone) && !self.keeps_tabs();
+        let mut items: Vec<Item> = self
             .harnesses
             .all()
-            .map(|h| Item::new(&h.id, &h.display_name).with_detail(&h.launch.command))
+            .filter(|h| !(old_daemon && h.id == SHELL))
+            .map(|h| {
+                if h.id == SHELL && !local {
+                    // The picker is this machine's, but a shell runs where the
+                    // project is, and this machine cannot say which one that
+                    // machine will start.
+                    return Item::new(&h.id, &h.display_name);
+                }
+                let label = if h.id == SHELL {
+                    shell_label(&h.launch.command)
+                } else {
+                    h.display_name.clone()
+                };
+                Item::new(&h.id, label).with_detail(&h.launch.command)
+            })
             .collect();
+        // The user's own shell first, and so chosen: Enter on a new tab gives
+        // a shell, one arrow an agent.
+        items.sort_by_key(|item| item.id != SHELL);
 
         if items.is_empty() {
-            self.status = "no harnesses registered; press ^a H to add one".into();
+            // The key as it is bound: a hint naming a key the user moved
+            // would send them to the wrong one.
+            self.status = match self.router.keymap().path_to(Command::HarnessManager) {
+                Some(keys) => format!("no harnesses registered; press {keys} to add one"),
+                None => "no harnesses registered".into(),
+            };
             return;
         }
 
+        self.placing = place;
         self.overlay = Some(Overlay::Harness(Picker::new("New pane", items)));
     }
 
@@ -2575,6 +3392,7 @@ impl App {
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
+        let now = self.now();
         let Some(id) = self.state.focused_pane() else {
             return;
         };
@@ -2605,6 +3423,8 @@ impl App {
             Ok(bytes) if !bytes.is_empty() => {
                 if let Err(error) = pane.backend.write(&bytes) {
                     tracing::warn!(%error, "failed to write to a pane");
+                } else {
+                    pane.activity.input(now);
                 }
             }
             Ok(_) => {}
@@ -2620,6 +3440,7 @@ impl App {
     fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
         use dispatch_pty::MouseButton;
 
+        let now = self.now();
         let wheel = match input.button {
             MouseButton::WheelUp => Some(-3),
             MouseButton::WheelDown => Some(3),
@@ -2656,6 +3477,10 @@ impl App {
         if !bytes.is_empty() {
             if let Err(error) = pane.backend.write(&bytes) {
                 tracing::warn!(%error, "failed to send a pointer event to a pane");
+            } else {
+                // Input like a keystroke: what the pane draws in answer — a
+                // highlight, a moved cursor — is not the agent at work.
+                pane.activity.input(now);
             }
             return;
         }
@@ -2668,16 +3493,17 @@ impl App {
         self.scroll_pane(id, rows);
     }
 
-    /// Scrolls the focused pane.
-    fn scroll_focused(&mut self, rows: isize) {
-        let Some(id) = self.state.focused_pane() else {
-            return;
-        };
-        self.scroll_pane(id, rows);
-    }
-
     /// Scrolls one pane and refreshes what it shows.
     fn scroll_pane(&mut self, id: PaneId, rows: isize) {
+        // The wheel over any pane but the one scroll mode is reading is the
+        // user turning to it, so the mode ends first. Settled here rather than
+        // after: going back to live output clears the status row, which would
+        // take this pane's message with it.
+        if self.router.key_mode() == KeyMode::Scroll && self.scrolling != Some(id) {
+            self.router.leave_mode();
+            self.settle_scroll_mode();
+        }
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -2689,7 +3515,65 @@ impl App {
             pane.screen = screen;
         }
 
-        self.status = "scrolled back — press End or type to return".into();
+        // Not for the pane scroll mode is reading, where End and typing return
+        // nowhere, and the mode's own row already says how to leave.
+        if self.router.key_mode() != KeyMode::Scroll {
+            self.status = "scrolled back — press End or type to return".into();
+        }
+    }
+
+    /// Focuses the next pane on the tab on screen, wrapping to the first.
+    fn focus_next(&mut self) {
+        let panes = self.panes_on_tab();
+        if panes.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .focused_pane()
+            .and_then(|focused| panes.iter().position(|pane| *pane == focused))
+            .map_or(0, |at| (at + 1) % panes.len());
+        self.focus_pane(panes[next]);
+    }
+
+    /// The pane a scroll command moves: the one scroll mode is reading, or
+    /// the focused one for a scroll key bound outside the mode.
+    fn scroll_target(&self) -> Option<PaneId> {
+        self.scrolling.or_else(|| self.state.focused_pane())
+    }
+
+    /// Moves a pane's view over its scrollback, for scroll mode.
+    ///
+    /// Says nothing on the status row, unlike a wheel scroll: the mode's own
+    /// row already says where the user is and how to get back.
+    fn scroll_view(&mut self, to: ScrollTo) {
+        let Some(id) = self.scroll_target() else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+
+        pane.backend.terminal_mut().scroll(to);
+        pane.scrolled_back = !matches!(to, ScrollTo::Bottom);
+
+        if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+            pane.screen = screen;
+        }
+    }
+
+    /// Scrolls a pane by `pages` of its own height, or of half its height;
+    /// negative towards older output.
+    fn scroll_pages(&mut self, pages: isize, half: bool) {
+        let Some(rows) = self
+            .scroll_target()
+            .and_then(|id| self.panes.get(&id))
+            .map(|pane| pane.backend.size().rows)
+        else {
+            return;
+        };
+        let step = if half { (rows / 2).max(1) } else { rows.max(1) };
+        self.scroll_view(ScrollTo::Delta(pages * step as isize));
     }
 
     /// Returns a pane to the newest output.
@@ -2712,6 +3596,7 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        let now = self.now();
         let Some(id) = self.state.focused_pane() else {
             return;
         };
@@ -2736,6 +3621,8 @@ impl App {
 
         if let Err(error) = pane.backend.write(&bytes) {
             tracing::warn!(%error, "failed to paste into a pane");
+        } else {
+            pane.activity.input(now);
         }
     }
 
@@ -2782,7 +3669,11 @@ impl App {
         let Some(id) = self.state.focused_pane() else {
             return;
         };
+        self.close_pane(id);
+    }
 
+    /// Closes one pane, terminating its process.
+    fn close_pane(&mut self, id: PaneId) {
         // Refused rather than done locally: the machine still has the process,
         // and a row taken off this client's screen is a running agent nobody
         // can find again.
@@ -2803,48 +3694,112 @@ impl App {
     /// Draws one frame.
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        let now = self.now();
+        self.animations.sweep(now);
+        self.notice_focus(now);
 
-        let sidebar_width = sidebar::WIDTH.min(area.width);
-        let sidebar_area = Rect::new(area.x, area.y, sidebar_width, area.height);
+        // Remembered once a frame rather than on each way focus can move:
+        // there are many ways, and the frame sees the result of all of them.
+        if let Some(focused) = self.state.focused_pane()
+            && let Some(tab) = self
+                .tab_views()
+                .into_iter()
+                .find(|view| view.panes.contains(&focused))
+                .and_then(|view| view.id)
+        {
+            self.tab_focus.insert(tab, focused);
+        }
 
-        // One row at the bottom for status.
-        let body_height = area.height.saturating_sub(1);
-        let panes_area = Rect::new(
-            area.x + sidebar_width,
-            area.y,
-            area.width.saturating_sub(sidebar_width),
-            body_height,
+        // One row across the top for the name and the tabs, one along the
+        // bottom for status, and everything between for the sidebar and the
+        // panes.
+        let top = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let body = Rect::new(
+            area.x,
+            area.y + top.height,
+            area.width,
+            area.height.saturating_sub(top.height + 1),
         );
 
+        let sidebar_width = sidebar::WIDTH.min(area.width);
+        let sidebar_area = Rect::new(body.x, body.y, sidebar_width, body.height);
+        let panes_area = Rect::new(
+            body.x + sidebar_width,
+            body.y,
+            body.width.saturating_sub(sidebar_width),
+            body.height,
+        );
+
+        // Scrolled to the focus only when the focus has moved or the sidebar
+        // has been resized, so the wheel's scroll survives every frame drawn
+        // in between.
+        let anchor = self
+            .state
+            .focused_pane()
+            .map(sidebar::Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
+        let moved = (anchor, sidebar_area) != self.anchored;
+        sidebar::settle(
+            &self.state,
+            sidebar_area,
+            &mut self.sidebar_scroll,
+            if moved { anchor } else { None },
+        );
+        self.anchored = (anchor, sidebar_area);
+
+        let sidebar_motion = sidebar::SidebarMotion {
+            pulses: self
+                .state
+                .projects()
+                .iter()
+                .flat_map(|project| self.state.panes_for(project.id))
+                .filter_map(|pane| {
+                    self.animations
+                        .linear(Target::Pulse(pane.id), now)
+                        .map(|t| (pane.id, sidebar::pulse_strength(t)))
+                })
+                .collect(),
+            glide: self
+                .glide_from
+                .zip(self.animations.value(Target::Glide, now))
+                .map(|(from, t)| sidebar::Glide { from, t }),
+        };
         frame.render_widget(
-            Sidebar::new(&self.state).with_harnesses(&self.harnesses),
+            Sidebar::new(&self.state)
+                .with_harnesses(&self.harnesses)
+                .with_theme(self.theme)
+                .with_scroll(&self.sidebar_scroll)
+                .with_spinner(self.spinner_frame())
+                .with_motion(&sidebar_motion),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
 
-        // One row above the grid, and only once there is a second tab: a row
-        // saying "1" and nothing else is a row of output given away for no
-        // information.
-        let panes_area = if self.tab_count() > 1 {
-            let tabs_row = Rect::new(panes_area.x, panes_area.y, panes_area.width, 1);
-            self.draw_tabs(frame, tabs_row);
-            Rect::new(
-                panes_area.x,
-                panes_area.y + 1,
-                panes_area.width,
-                panes_area.height.saturating_sub(1),
-            )
-        } else {
-            panes_area
-        };
+        self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
+        let tab = self.current_tab();
+        if tab != self.last_tab {
+            self.tab_from = self.last_tab;
+            self.animations.start(Target::Tab, now, SLIDE, 0.0);
+            self.last_tab = tab;
+        }
+        let shown = self.current_tab_id();
+        if shown != self.tab_shown {
+            self.tab_back = self.tab_shown;
+            self.tab_shown = shown;
+        }
+        self.draw_tabs(
+            frame,
+            Rect::new(panes_area.x, top.y, panes_area.width, top.height),
+            now,
+        );
 
-        self.frames = self.compute_frames(panes_area);
+        self.frames = self.lay_out(panes_area, now);
         self.layout = self
             .frames
             .iter()
             .map(|(id, frame)| (*id, Self::interior(*frame)))
             .collect();
-        self.draw_panes(frame);
+        self.draw_panes(frame, now);
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area);
@@ -2852,6 +3807,11 @@ impl App {
 
     /// Draws whichever overlay is open, if any.
     fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
+        let border = Style::default().fg(self.theme.faded);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_border(border);
+        }
+
         let Some(overlay) = &self.overlay else {
             return;
         };
@@ -2866,7 +3826,10 @@ impl App {
             return;
         }
 
-        if let Overlay::OpenOn { prompt, .. } = overlay {
+        if let Overlay::OpenOn { prompt, .. }
+        | Overlay::RenameTab { prompt, .. }
+        | Overlay::CloseTab { prompt, .. } = overlay
+        {
             frame.render_widget(prompt, panes_area);
             return;
         }
@@ -2976,11 +3939,14 @@ impl App {
         }
     }
 
-    /// How many tabs the tileable panes fill.
-    ///
-    /// Always at least one, so an empty project still has a tab to be on.
+    /// The tabs of the project on screen.
+    fn tab_views(&self) -> Vec<TabView> {
+        tabs::views(&self.state, self.state.selected_project(), &self.tileable())
+    }
+
+    /// How many tabs the project on screen has. Always at least one.
     fn tab_count(&self) -> usize {
-        self.tileable().len().div_ceil(PANES_PER_TAB).max(1)
+        self.tab_views().len()
     }
 
     /// The tab on screen: the one holding the focused pane.
@@ -2990,21 +3956,326 @@ impl App {
     /// all move focus without going anywhere near a tab — and a view showing
     /// one tab while typing went to another would be the worst bug here.
     fn current_tab(&self) -> usize {
-        let tileable = self.tileable();
+        let Some(focused) = self.state.focused_pane() else {
+            return 0;
+        };
+        self.tab_views()
+            .iter()
+            .position(|view| view.panes.contains(&focused))
+            .unwrap_or(0)
+    }
 
-        self.state
-            .focused_pane()
-            .and_then(|id| tileable.iter().position(|pane| *pane == id))
-            .map_or(0, |index| index / PANES_PER_TAB)
+    /// The id of the tab on screen, when the project keeps tabs.
+    fn current_tab_id(&self) -> Option<TabId> {
+        self.tab_views()
+            .into_iter()
+            .nth(self.current_tab())
+            .and_then(|view| view.id)
     }
 
     /// The panes on the tab being shown.
     fn panes_on_tab(&self) -> Vec<PaneId> {
-        self.tileable()
-            .chunks(PANES_PER_TAB)
+        self.tab_views()
+            .into_iter()
             .nth(self.current_tab())
-            .map(<[PaneId]>::to_vec)
+            .map(|view| view.panes)
             .unwrap_or_default()
+    }
+
+    /// Whether the selected project's daemon keeps tabs of its own, rather
+    /// than this client grouping panes into them itself.
+    fn keeps_tabs(&self) -> bool {
+        self.state
+            .selected_project()
+            .is_some_and(|project| self.state.project_tabs(project).is_some())
+    }
+
+    /// Why the selected project's tabs cannot be changed, if they cannot.
+    ///
+    /// With no project at all, the daemon is not what is missing, and
+    /// telling the user to upgrade it would send them the wrong way.
+    fn tabs_refused(&self) -> Option<&'static str> {
+        if self.state.selected_project().is_none() {
+            Some("no project selected")
+        } else if !self.keeps_tabs() {
+            Some(NEEDS_UPGRADE)
+        } else {
+            None
+        }
+    }
+
+    /// The tab on screen, when its project keeps tabs; otherwise says why
+    /// nothing can be done with it, and gives `None`.
+    fn tab_to_change(&mut self) -> Option<TabId> {
+        if let Some(reason) = self.tabs_refused() {
+            self.status = reason.into();
+            return None;
+        }
+        self.current_tab_id()
+    }
+
+    /// Makes a change to the selected project's tabs: here for a project this
+    /// client runs itself, by asking its daemon otherwise.
+    ///
+    /// The change is the message a daemon would be sent either way, so the
+    /// two paths cannot drift apart in what they mean.
+    fn change_tabs(&mut self, change: ClientMessage) {
+        let Some(project) = self.state.selected_project() else {
+            return;
+        };
+
+        if matches!(self.mode, Mode::Standalone) {
+            self.apply_tab_change(project, change);
+            return;
+        }
+
+        if let Some(daemon) = self
+            .reachable_for_project(project)
+            .map(|attachment| attachment.client.handle())
+        {
+            daemon.send(change);
+        }
+    }
+
+    /// Makes a tab change to a project this client runs: what the daemon does
+    /// for its own.
+    fn apply_tab_change(&mut self, project: ProjectId, change: ClientMessage) {
+        if let ClientMessage::CloseTab { tab } = change {
+            let members = self
+                .state
+                .project_tabs(project)
+                .and_then(|tabs| tabs.members(tab).ok())
+                .unwrap_or_default();
+            for pane in members {
+                self.close_pane(pane);
+            }
+            return;
+        }
+
+        let Some(tabs) = self.state.project_tabs_mut(project) else {
+            return;
+        };
+        let changed = match change {
+            ClientMessage::MovePane { pane, to } => tabs.move_pane(pane, to).map(|_| ()),
+            ClientMessage::RenameTab { tab, name } => tabs.rename(tab, &name),
+            ClientMessage::MoveTab { tab, index } => tabs.move_tab(tab, index),
+            // Only tab changes are made here.
+            _ => Ok(()),
+        };
+        if let Err(error) = changed {
+            self.status = error.to_string();
+        }
+    }
+
+    /// Opens the picker for a pane on a new tab, straight after the one on
+    /// screen.
+    ///
+    /// Not routed through `tab_to_change`: an empty project that does keep
+    /// tabs has none on screen to change, but a new one is exactly what this
+    /// opens the picker for.
+    fn open_new_tab_picker(&mut self) {
+        if let Some(reason) = self.tabs_refused() {
+            self.status = reason.into();
+            return;
+        }
+        self.open_picker_placing(Placement::NewAfter {
+            tab: self.current_tab_id(),
+        });
+    }
+
+    /// Moves the focused pane to the tab `step` away: `-1` the previous, `1`
+    /// the next, or a new one past the last.
+    ///
+    /// Refused here, with the reason, when the answer is already known, so a
+    /// round trip to the daemon is not what tells the user a tab is full.
+    fn move_focused_pane(&mut self, step: isize) {
+        let Some(pane) = self.state.focused_pane() else {
+            return;
+        };
+        if self
+            .state
+            .pane(pane)
+            .is_some_and(|pane| pane.parent.is_some())
+        {
+            self.status = "a subagent stays beside the pane that asked for it".into();
+            return;
+        }
+        let Some(current) = self.tab_to_change() else {
+            return;
+        };
+
+        let views = self.tab_views();
+        let here = self.current_tab();
+        let to = match here.checked_add_signed(step) {
+            None => {
+                self.status = "no tab to the left".into();
+                return;
+            }
+            Some(index) if index >= views.len() => Placement::NewAfter { tab: Some(current) },
+            Some(index) => {
+                let Some(tab) = views[index].id else {
+                    return;
+                };
+                let full = self
+                    .state
+                    .selected_project()
+                    .and_then(|project| self.state.project_tabs(project))
+                    .is_some_and(|tabs| tabs.is_full(tab));
+                if full {
+                    self.status = dispatch_core::TabError::Full.to_string();
+                    return;
+                }
+                Placement::Into { tab }
+            }
+        };
+
+        self.change_tabs(ClientMessage::MovePane { pane, to });
+    }
+
+    /// Moves the tab on screen `step` places along the row. Past either end
+    /// it stays where it is.
+    fn move_current_tab(&mut self, step: isize) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let Some(index) = self.current_tab().checked_add_signed(step) else {
+            return;
+        };
+        if index >= self.tab_count() {
+            return;
+        }
+        self.change_tabs(ClientMessage::MoveTab { tab, index });
+    }
+
+    /// Opens the prompt that renames the tab on screen, holding its name.
+    fn open_rename_tab(&mut self) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let current = self
+            .tab_views()
+            .into_iter()
+            .find(|view| view.id == Some(tab))
+            .and_then(|view| view.name)
+            .unwrap_or_default();
+
+        self.overlay = Some(Overlay::RenameTab {
+            tab,
+            prompt: Prompt::new("Rename tab", "empty goes back to the first pane's title")
+                .with_input(current),
+        });
+    }
+
+    /// Acts on one key while a tab's new name is being typed.
+    fn handle_rename_tab_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::RenameTab { tab, prompt }) = &mut self.overlay else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Backspace => prompt.backspace(),
+            // Enter on nothing is a choice here, unlike a path: it clears the
+            // name, and the tab goes back to its first pane's title.
+            KeyCode::Enter => {
+                let change = ClientMessage::RenameTab {
+                    tab: *tab,
+                    name: prompt.input().to_string(),
+                };
+                self.overlay = None;
+                self.change_tabs(change);
+            }
+            KeyCode::Char(c) if !ctrl => prompt.push(c),
+            _ => {}
+        }
+    }
+
+    /// Asks before closing the tab on screen: it can stop running agents.
+    fn open_close_tab(&mut self) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let Some(view) = self
+            .tab_views()
+            .into_iter()
+            .find(|view| view.id == Some(tab))
+        else {
+            return;
+        };
+        let count = self
+            .state
+            .selected_project()
+            .and_then(|project| self.state.project_tabs(project))
+            .and_then(|tabs| tabs.members(tab).ok())
+            .map_or(0, |members| members.len());
+        let noun = if count == 1 { "pane" } else { "panes" };
+        let name = tabs::name(&self.state, &view);
+
+        self.overlay = Some(Overlay::CloseTab {
+            tab,
+            prompt: Prompt::new(
+                format!("Close \"{name}\" and its {count} {noun}? y/n"),
+                "y closes them, n keeps them",
+            ),
+        });
+    }
+
+    /// Acts on one key while closing a tab waits on an answer.
+    fn handle_close_tab_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::CloseTab { tab, .. }) = &self.overlay else {
+            return;
+        };
+        let tab = *tab;
+
+        match key.code {
+            KeyCode::Char('y') => {
+                self.overlay = None;
+                self.change_tabs(ClientMessage::CloseTab { tab });
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.overlay = None,
+            _ => {}
+        }
+    }
+
+    /// Shows the tab to the left, wrapping to the last.
+    fn select_previous_tab(&mut self) {
+        let count = self.tab_count();
+        self.select_tab((self.current_tab() + count - 1) % count);
+    }
+
+    /// Shows the tab this client was on before the one on screen.
+    fn select_last_tab(&mut self) {
+        let Some(back) = self.tab_back else {
+            return;
+        };
+        if let Some(index) = self
+            .tab_views()
+            .iter()
+            .position(|view| view.id == Some(back))
+        {
+            self.select_tab(index);
+        }
+    }
+
+    /// Moves focus left or right, going on to the neighbouring tab at the
+    /// grid's edge, and staying put past the first or last tab.
+    fn focus_or_tab(&mut self, direction: Direction) {
+        let before = self.state.focused_pane();
+        self.focus_direction(direction);
+        if self.state.focused_pane() != before {
+            return;
+        }
+
+        let current = self.current_tab();
+        let next = match direction {
+            Direction::Left => current.checked_sub(1),
+            Direction::Right => Some(current + 1).filter(|index| *index < self.tab_count()),
+            Direction::Up | Direction::Down => None,
+        };
+        if let Some(index) = next {
+            self.select_tab(index);
+        }
     }
 
     /// Which tile each visible pane gets this frame, border included.
@@ -3024,12 +4295,84 @@ impl App {
             .collect()
     }
 
-    /// The area inside a tile's border, which is what the pane itself owns.
-    fn interior(frame: Rect) -> Rect {
-        pane_block(false).inner(frame)
+    /// Where each pane goes this frame.
+    ///
+    /// A pane leaving the grid — closed, exited, gone — leaves its tile in
+    /// place for a moment while its border retracts, and the rest of the grid
+    /// keeps its shape for drawing and input alike until the last such tile
+    /// is gone; then everything reflows once. A resize ends that at once:
+    /// held tiles belong to a screen that no longer exists. So does a switch
+    /// to another project, whose grid has nothing to do with this one's.
+    fn lay_out(&mut self, area: Rect, now: Instant) -> Vec<(PaneId, Rect)> {
+        let tileable = self.tileable();
+        let project = self.state.selected_project();
+        let switched = project != self.frames_project;
+
+        let finished = self
+            .closing
+            .iter()
+            .filter(|(id, _)| self.animations.value(Target::Close(*id), now).is_none())
+            .count();
+        if finished > 0 {
+            self.closing
+                .retain(|(id, _)| self.animations.value(Target::Close(*id), now).is_some());
+        }
+
+        // Only a pane that has actually gone is leaving: closed, exited, or
+        // no longer known at all. One folded back under its parent is still
+        // running, and the grid simply goes on without it.
+        let leaving: Vec<(PaneId, Rect)> = if switched {
+            Vec::new()
+        } else {
+            self.frames
+                .iter()
+                .filter(|(id, _)| {
+                    !tileable.contains(id)
+                        && self
+                            .state
+                            .pane(*id)
+                            .is_none_or(|pane| pane.closed || !pane.status.is_live())
+                })
+                .copied()
+                .collect()
+        };
+        if self.animations.enabled() {
+            for (id, rect) in leaving {
+                self.animations.start(Target::Close(id), now, CLOSE, 0.0);
+                self.closing.push((id, rect));
+                if self.held.is_none() {
+                    self.held = Some((self.frames_area, self.frames.clone()));
+                }
+            }
+        }
+
+        if switched
+            || self.closing.is_empty()
+            || self.held.as_ref().is_some_and(|(held, _)| *held != area)
+        {
+            self.held = None;
+            self.closing.clear();
+        }
+
+        let frames = match &self.held {
+            Some((_, frames)) => frames
+                .iter()
+                .filter(|(id, _)| tileable.contains(id))
+                .copied()
+                .collect(),
+            None => self.compute_frames(area),
+        };
+        self.frames_area = area;
+        self.frames_project = project;
+        frames
     }
 
-    fn draw_panes(&mut self, frame: &mut Frame<'_>) {
+    /// The area inside a tile's border, which is what the pane itself owns.
+    fn interior(frame: Rect) -> Rect {
+        Block::bordered().inner(frame)
+    }
+
+    fn draw_panes(&mut self, frame: &mut Frame<'_>, now: Instant) {
         let focused = self.state.focused_pane();
         let mut cursor = None;
 
@@ -3044,10 +4387,25 @@ impl App {
             // is what separates one agent's output from the next and from the
             // sidebar. Without it two panes of similarly-coloured text read as
             // one pane with a very confusing wrap.
+            let level = self.border_level(*id, now);
+            let colour = if self.animations.value(Target::Focus(*id), now).is_some()
+                || self.animations.value(Target::Blur(*id), now).is_some()
+            {
+                // A tween rather than a bare blend: at either end it is the
+                // colour at rest, which in 256 colours no blend reaches.
+                self.theme.tween(Role::Faded, Role::Accent, level)
+            } else if is_focused {
+                self.theme.accent
+            } else {
+                self.theme.faded
+            };
             frame.render_widget(
-                pane_block(is_focused).title(pane_title(&self.state, *id)),
+                pane_block(colour, is_focused).title(pane_title(&self.state, *id)),
                 *outer,
             );
+            if let Some(t) = self.animations.value(Target::Open(*id), now) {
+                mask_border(frame.buffer_mut(), *outer, t);
+            }
 
             let widget = PaneWidget::new(&pane.screen).focused(is_focused);
 
@@ -3058,6 +4416,22 @@ impl App {
             frame.render_widget(widget, *inner);
         }
 
+        for (id, rect) in &self.closing {
+            // Kept to the grid this frame is drawn in: a tile is never drawn
+            // past the edge of the screen, whatever the screen did since.
+            let rect = rect.intersection(self.frames_area);
+            if rect.is_empty() {
+                continue;
+            }
+            let t = self
+                .animations
+                .value(Target::Close(*id), now)
+                .unwrap_or(1.0);
+            Clear.render(rect, frame.buffer_mut());
+            frame.render_widget(pane_block(self.theme.faded, false), rect);
+            mask_border(frame.buffer_mut(), rect, 1.0 - t);
+        }
+
         // Placing the real cursor is what makes typing feel native rather
         // than like editing a picture of a terminal.
         if let Some((x, y)) = cursor {
@@ -3065,38 +4439,228 @@ impl App {
         }
     }
 
-    /// Draws the row of tabs above the grid.
-    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.height == 0 {
+    /// Writes the program's name in the top row, over the sidebar's column.
+    fn draw_name(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 || area.width < 2 {
             return;
         }
 
-        let current = self.current_tab();
-        let mut spans = Vec::new();
+        // One column in, where the sidebar's own text starts below it.
+        let row = Rect::new(area.x + 1, area.y, area.width - 1, 1);
+        Paragraph::new(APP_NAME)
+            .style(Style::default().fg(self.theme.faded))
+            .render(row, frame.buffer_mut());
+    }
 
-        for index in 0..self.tab_count() {
-            let panes = self
-                .tileable()
-                .chunks(PANES_PER_TAB)
-                .nth(index)
-                .map_or(0, <[PaneId]>::len);
-
-            let style = if index == current {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Gray)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            spans.push(ratatui::text::Span::styled(
-                format!(" {} ({panes}) ", index + 1),
-                style,
-            ));
+    /// Draws the row of tabs above the grid.
+    ///
+    /// Each is its rollup glyph and its name: the one it was given, else its
+    /// first pane's title. No number: a digit still picks one by position, and
+    /// the status row says which position is on screen. The one on screen
+    /// sits on a tint rather than being inverted: it should read as the one
+    /// you are in, not as a warning.
+    fn draw_tabs(&mut self, frame: &mut Frame<'_>, area: Rect, now: Instant) {
+        self.tab_hits.clear();
+        self.tab_row = area;
+        if area.height == 0 || area.width == 0 {
+            return;
         }
 
-        Paragraph::new(ratatui::text::Line::from(spans)).render(area, frame.buffer_mut());
+        let views = self.tab_views();
+        let current = self.current_tab();
+        let sliding = self.animations.value(Target::Tab, now).is_some();
+        let spinner = self.spinner_frame();
+
+        // A project with nothing to tile has a tab to be on but nothing to
+        // call it: it draws no label, only the `+`.
+        let labels: Vec<Vec<Span<'static>>> = views
+            .iter()
+            .enumerate()
+            .map(|(index, view)| {
+                if view.panes.is_empty() {
+                    return Vec::new();
+                }
+                // `tab` is mixed from the palette, the fallback's dark one
+                // when the terminal did not answer, so the text on it comes
+                // from the palette too. While the tint slides it is laid on
+                // afterwards, across whichever columns it has reached.
+                let style = if index == current {
+                    let style = Style::default()
+                        .fg(self.theme.text)
+                        .add_modifier(Modifier::BOLD);
+                    if sliding {
+                        style
+                    } else {
+                        style.bg(self.theme.tab)
+                    }
+                } else {
+                    Style::default().fg(self.theme.faded)
+                };
+
+                let mut spans = Vec::new();
+                if let Some(rollup) = sidebar::Rollup::of(
+                    &self.state,
+                    view.panes.iter().filter_map(|id| self.state.pane(*id)),
+                ) {
+                    let (glyph, glyph_style) = rollup.glyph(spinner, &self.theme);
+                    spans.push(Span::styled(" ", style));
+                    spans.push(Span::styled(glyph, style.patch(glyph_style)));
+                }
+                let name = truncate(&tabs::name(&self.state, view), TAB_TITLE);
+                spans.push(Span::styled(format!(" {name} "), style));
+                spans
+            })
+            .collect();
+        let widths: Vec<u16> = labels
+            .iter()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| u16::try_from(span.width()).unwrap_or(u16::MAX))
+                    .sum()
+            })
+            .collect();
+        let shown = tabs::visible_range(&widths, current, area.width);
+        let right = area.x.saturating_add(area.width);
+
+        // The width the tabs and marks would take if drawn in full: the same
+        // tally `visible_range` reserves room against, so it says whether the
+        // `+` can simply follow them or has to be pinned instead. This can
+        // still exceed the row: `visible_range` keeps a tab too wide to fit
+        // alone on screen anyway, cut off at the edge.
+        let drawn_indices: Vec<usize> = shown.clone().filter(|&index| widths[index] > 0).collect();
+        let labels_width: u32 = drawn_indices
+            .iter()
+            .map(|&index| u32::from(widths[index]))
+            .sum();
+        let gaps = u32::try_from(drawn_indices.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let before_mark = shown.start > 0;
+        let after_mark = shown.end < views.len();
+        let marks = u32::from(tabs::MARK) * (u32::from(before_mark) + u32::from(after_mark));
+        let content_width = u16::try_from(labels_width.saturating_add(gaps).saturating_add(marks))
+            .unwrap_or(u16::MAX);
+        let content_end = area.x.saturating_add(content_width);
+
+        let have_plus = area.width >= tabs::PLUS;
+        let natural_plus_x = content_end.saturating_add(u16::from(content_width > 0));
+        // Pinned once the tabs and marks would not leave room for ` + ` and
+        // its own gap after them; otherwise it follows the last one drawn.
+        let pin = have_plus && natural_plus_x.saturating_add(tabs::PLUS) > right;
+        let plus_x = have_plus.then(|| {
+            if pin {
+                right.saturating_sub(tabs::PLUS)
+            } else {
+                natural_plus_x
+            }
+        });
+
+        // Where the tabs and marks may be drawn: the whole row ordinarily,
+        // but ending a gap before a pinned `+` so it can never overwrite
+        // them. When there is more to scroll to, a forced `›` — rather than
+        // wherever the tabs' own would naturally fall — claims the last two
+        // of those columns, so the clipped end still says so.
+        let content_limit = if pin {
+            plus_x.unwrap_or(right).saturating_sub(1).max(area.x)
+        } else {
+            right
+        };
+        let forced_next = pin && after_mark;
+        let inline_next = after_mark && !pin;
+        let tail_reserve = if forced_next { tabs::MARK } else { 0 };
+        let body_limit = content_limit.saturating_sub(tail_reserve).max(area.x);
+
+        let faded = Style::default().fg(self.theme.faded);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut column = area.x;
+        // Where each tab sits in the row, for the sliding tint.
+        let mut extents: Vec<Option<(u16, u16)>> = vec![None; views.len()];
+        let mut hits: Vec<(u16, u16, TabHit)> = Vec::new();
+
+        if before_mark && column < body_limit {
+            spans.push(Span::styled("‹ ", faded));
+            hits.push((column, 1, TabHit::Previous));
+            column = column.saturating_add(tabs::MARK);
+        }
+        let mut drawn_any = false;
+        for index in shown.clone() {
+            if widths[index] == 0 {
+                continue;
+            }
+            if column >= body_limit {
+                break;
+            }
+            // The gap between two tabs belongs to neither.
+            let gap = u16::from(drawn_any);
+            if column.saturating_add(gap) >= body_limit {
+                break;
+            }
+            if drawn_any {
+                spans.push(Span::raw(" "));
+                column = column.saturating_add(1);
+            }
+            drawn_any = true;
+            // A tab cut off by the edge — the row scrolled, or this is the
+            // one tab too wide to fit alone — keeps a hit only for the
+            // columns actually drawn; `Paragraph` clips the rest on its own.
+            let visible = widths[index].min(body_limit.saturating_sub(column));
+            extents[index] = Some((column, visible));
+            hits.push((column, visible, TabHit::Tab(index)));
+            spans.extend(labels[index].iter().cloned());
+            column = column.saturating_add(widths[index]).min(body_limit);
+        }
+        if inline_next && column < body_limit {
+            spans.push(Span::styled(" ›", faded));
+            hits.push((column.saturating_add(1), 1, TabHit::Next));
+        }
+
+        if body_limit > area.x {
+            Paragraph::new(Line::from(spans)).render(
+                Rect::new(area.x, area.y, body_limit - area.x, 1),
+                frame.buffer_mut(),
+            );
+        }
+
+        if forced_next {
+            let width = content_limit.saturating_sub(body_limit).min(tabs::MARK);
+            if width > 0 {
+                let (mark, glyph_at) = if width >= tabs::MARK {
+                    (" ›", body_limit.saturating_add(1))
+                } else {
+                    ("›", body_limit)
+                };
+                Paragraph::new(Span::styled(mark, faded))
+                    .render(Rect::new(body_limit, area.y, width, 1), frame.buffer_mut());
+                hits.push((glyph_at, 1, TabHit::Next));
+            }
+        }
+
+        if let Some(plus_x) = plus_x {
+            Paragraph::new(Span::styled(" + ", faded))
+                .render(Rect::new(plus_x, area.y, tabs::PLUS, 1), frame.buffer_mut());
+            hits.push((plus_x, tabs::PLUS, TabHit::New));
+        }
+        self.tab_hits = hits;
+
+        if let Some(t) = self.animations.value(Target::Tab, now) {
+            let (from_x, from_w) = extents
+                .get(self.tab_from)
+                .copied()
+                .flatten()
+                .unwrap_or((area.x, 0));
+            let (to_x, to_w) = extents
+                .get(current)
+                .copied()
+                .flatten()
+                .unwrap_or((area.x, 0));
+            let lerp =
+                |a: u16, b: u16| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u16;
+            let (x, width) = (lerp(from_x, to_x), lerp(from_w, to_w));
+            for column in x..x.saturating_add(width).min(right) {
+                if let Some(cell) = frame.buffer_mut().cell_mut((column, area.y)) {
+                    cell.set_bg(self.theme.tab);
+                }
+            }
+        }
     }
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -3114,14 +4678,35 @@ impl App {
         // prompt itself is on screen, since it would only repeat what is
         // already in front of the user.
         //
-        // Appended rather than shown in place of `self.status`: a daemon
+        // Put after `self.status` rather than in its place: a daemon
         // disconnect or an error is worth knowing about more than a queued
         // prompt is, and when the daemon is gone the prompt cannot be acted
         // on anyway, so hiding the disconnect notice behind it would be
         // exactly backwards.
+        //
+        // The key that reopens it is named as it is bound, and left out when
+        // no key reaches it, rather than naming one that does nothing.
         let waiting_reminder = (!self.pending.is_empty()
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
-        .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
+        .then(|| {
+            let waiting = format!("{} delegation(s) waiting", self.pending.len());
+            match self.router.keymap().path_to(Command::Approvals) {
+                Some(keys) => format!("{waiting} — {keys}"),
+                None => waiting,
+            }
+        });
+
+        // A blocked pane on another tab, or in a folded project, still needs
+        // to be found; the status row is the one place always on screen.
+        let blocked = self
+            .state
+            .projects()
+            .iter()
+            .flat_map(|project| self.state.panes_for(project.id))
+            .filter(|pane| !pane.closed && pane.status == PaneStatus::Blocked)
+            .count();
+        let blocked_reminder =
+            (blocked > 0 && self.overlay.is_none()).then(|| format!("{blocked} waiting on you"));
 
         // Read from the `Device.reachable` `sync_attachment` stamps each poll,
         // not asked live: this runs every frame, and re-checking the
@@ -3138,29 +4723,54 @@ impl App {
             .map(|device| device.name.clone())
             .collect();
 
-        let text = if self.router.is_armed() {
+        // Ahead of `self.status`, which may still hold whatever was happening
+        // when the connection went: a user needs to know the agents are out of
+        // reach more than they need the last message.
+        let lead = if !unreachable.is_empty() {
+            Some(format!(
+                "waiting for {} — its agents are still running",
+                unreachable.join(", ")
+            ))
+        } else if !self.status.is_empty() {
+            Some(self.status.clone())
+        } else {
+            None
+        };
+
+        let mode = self.router.key_mode();
+        let keymap = self.router.keymap();
+        let text = if mode == KeyMode::Prefix {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
+        } else if mode == KeyMode::Lock {
+            // Everything the normal row says but its keys, which lock does
+            // not read: a lock can last all afternoon, and a refusal or a
+            // waiting agent hidden behind it for that long is as good as
+            // dropped.
+            std::iter::once(keymap.lock_help())
+                .chain(lead)
+                .chain(waiting_reminder)
+                .chain(blocked_reminder)
+                .collect::<Vec<_>>()
+                .join("  ")
+        } else if mode.is_modal() {
+            // A mode spells out its own keys, from the same table that runs
+            // them. A message goes between its name and its keys: several
+            // keys keep the mode on, and a refusal hidden behind the key list
+            // would make the key look dead.
+            let help = keymap.mode_help(mode);
+            match help.split_once("  ") {
+                Some((title, keys)) if !self.status.is_empty() => {
+                    format!("{title}  {}  {keys}", self.status)
+                }
+                _ => help,
+            }
         } else {
-            let base = if !unreachable.is_empty() {
-                // Ahead of `self.status`, which may still hold whatever was
-                // happening when the connection went: a user needs to know the
-                // agents are out of reach more than they need the last message.
-                format!(
-                    "waiting for {} — its agents are still running",
-                    unreachable.join(", ")
-                )
-            } else if !self.status.is_empty() {
-                self.status.clone()
-            } else {
+            let help = lead.is_none().then(|| {
                 let panes = self.state.visible_panes().len();
                 let tabs = if self.tab_count() > 1 {
-                    format!(
-                        "  tab {}/{}  ^a 1-9",
-                        self.current_tab() + 1,
-                        self.tab_count()
-                    )
+                    format!("  tab {}/{}", self.current_tab() + 1, self.tab_count())
                 } else {
                     String::new()
                 };
@@ -3169,24 +4779,31 @@ impl App {
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
-                format!(
-                    "{panes} pane(s){where_}{tabs}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
-                )
-            };
+                format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help())
+            });
 
-            match waiting_reminder {
-                Some(reminder) => format!("{base}  {reminder}"),
-                None => base,
-            }
+            // The reminders ahead of the key help: it alone runs past eighty
+            // columns, and whatever follows it is cut off on the terminals
+            // most people have. The key help is the one thing here that is
+            // the same every time, so it is what can best afford to lose its
+            // end.
+            lead.into_iter()
+                .chain(waiting_reminder)
+                .chain(blocked_reminder)
+                .chain(help)
+                .collect::<Vec<_>>()
+                .join("  ")
         };
 
-        let style = if self.router.is_armed() {
+        // On `tab`, like the active tab, and in the same text colour for the
+        // same reason.
+        let style = if mode != KeyMode::Normal {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(self.theme.tab)
+                .fg(self.theme.text)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.faded)
         };
 
         Paragraph::new(text)
@@ -3199,6 +4816,7 @@ impl App {
     /// A child that is not told its new size redraws to the old one, which is
     /// the most visible bug this layer can have.
     pub fn resize_panes(&mut self) {
+        let now = self.now();
         let layout = self.layout.clone();
 
         for (id, rect) in layout {
@@ -3224,6 +4842,9 @@ impl App {
                 tracing::warn!(%error, "failed to resize a pane");
                 continue;
             }
+            // The program repaints to fit, and that repaint is this resize's
+            // doing rather than the program at work.
+            pane.activity.resized(now);
 
             if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                 pane.screen = screen;
@@ -3231,19 +4852,31 @@ impl App {
         }
     }
 
-    /// How long to wait for input before drawing again.
+    /// How long to wait for input before drawing again: what is left of the
+    /// current frame, or a whole frame once that has passed.
+    ///
+    /// Never zero. Once a frame went by with nothing to draw, a timeout
+    /// counted down from the last draw would stay at zero, and the loop would
+    /// poll without waiting and spin a core for as long as Dispatch sat idle.
+    /// A whole frame still picks up pane output within a frame.
     #[must_use]
-    pub fn poll_timeout(last_draw: Instant) -> Duration {
-        FRAME.saturating_sub(last_draw.elapsed())
+    pub fn poll_timeout(last_draw: Instant, now: Instant) -> Duration {
+        match FRAME.saturating_sub(now.saturating_duration_since(last_draw)) {
+            Duration::ZERO => FRAME,
+            left => left,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::mpsc::{Receiver, Sender};
 
-    use dispatch_core::{PaneRole, Project, ProjectSource};
+    use dispatch_core::{PaneRole, Project, ProjectSource, Tab};
+    use ratatui::style::Color;
 
     /// An `App` attached to a daemon that says only what a test tells it to,
     /// with one project already announced.
@@ -3291,12 +4924,6 @@ mod tests {
         }
     }
 
-    /// The column a row's title starts in, for comparing one row's indentation
-    /// against another's.
-    ///
-    /// Counted in characters rather than bytes: the status dot and the focus
-    /// marker are three bytes each, so a byte offset would make a focused row
-    /// look indented further than an unfocused one at the same depth.
     /// Just the sidebar's columns of one rendered row.
     ///
     /// A pane's border carries its title, so a whole row can name a harness
@@ -3306,6 +4933,12 @@ mod tests {
         line.chars().take(sidebar::WIDTH as usize).collect()
     }
 
+    /// The column `needle` starts in, for comparing one row's indentation
+    /// against another's.
+    ///
+    /// Counted in characters rather than bytes: a twisty is three bytes and
+    /// a leaf's blank is one, so a byte offset would make a pane with
+    /// children look indented further than one without at the same depth.
     fn column_of(line: &str, needle: &str) -> usize {
         let byte = line
             .find(needle)
@@ -3330,6 +4963,558 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    /// A clock the test moves by hand, installed in `app`.
+    fn hand_clock(app: &mut App) -> Rc<Cell<Instant>> {
+        let now = Rc::new(Cell::new(Instant::now()));
+        let reading = Rc::clone(&now);
+        app.clock = Box::new(move || reading.get());
+        now
+    }
+
+    fn advance(clock: &Rc<Cell<Instant>>, by: Duration) {
+        clock.set(clock.get() + by);
+    }
+
+    /// Delivers `bytes` as `pane`'s output and lets the app take it in.
+    fn print(app: &mut App, daemon: &Sender<ServerMessage>, pane: PaneId, bytes: &[u8]) {
+        daemon
+            .send(ServerMessage::PaneOutput {
+                pane,
+                bytes: bytes.to_vec(),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.poll_panes();
+    }
+
+    fn status_of(app: &App, pane: PaneId) -> PaneStatus {
+        app.state.pane(pane).expect("the pane exists").status
+    }
+
+    /// Lets a pane that has stopped printing settle: a second of quiet makes
+    /// it idle, which is reported once it has held for the settling time.
+    fn settle(app: &mut App, clock: &Rc<Cell<Instant>>) {
+        advance(clock, Duration::from_millis(1100));
+        app.poll_panes();
+        advance(clock, Duration::from_millis(800));
+        app.poll_panes();
+    }
+
+    #[test]
+    fn output_makes_a_pane_working_and_quiet_makes_it_idle() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"compiling\r\n");
+        assert_eq!(status_of(&app, pane), PaneStatus::Running);
+
+        advance(&clock, Duration::from_millis(1100));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Running, "still settling");
+
+        advance(&clock, Duration::from_millis(800));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn a_pane_finishing_out_of_focus_is_marked_done_until_focused() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let (background, foreground) = (panes[0], panes[1]);
+        assert_eq!(app.state.focused_pane(), Some(foreground));
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, background, b"working\r\n");
+        settle(&mut app, &clock);
+
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        assert!(app.state.is_unseen(background), "it finished out of sight");
+        assert!(!app.state.is_unseen(foreground));
+
+        app.focus_pane(background);
+        app.poll_panes();
+        assert!(
+            !app.state.is_unseen(background),
+            "looking at it clears the mark"
+        );
+    }
+
+    #[test]
+    fn clearing_a_done_mark_asks_for_a_redraw() {
+        // Focus can move with no input to draw a frame: the focused pane
+        // closing hands it to another. With motion off nothing else is
+        // drawing, so unless clearing the mark says so, the done glyph stays
+        // on screen after the pane has been looked at.
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let (background, foreground) = (panes[0], panes[1]);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, background, b"working\r\n");
+        settle(&mut app, &clock);
+        assert!(app.state.is_unseen(background));
+
+        let _ = app.state.close_pane(foreground);
+        assert_eq!(app.state.focused_pane(), Some(background));
+
+        assert!(
+            app.poll_panes(),
+            "the mark went, and the frame must show it"
+        );
+        assert!(!app.state.is_unseen(background));
+        assert!(
+            !app.poll_panes(),
+            "and once it has gone, nothing is left to draw"
+        );
+    }
+
+    #[test]
+    fn a_reattach_replay_marks_nothing_done() {
+        // A client attaching is replayed every pane's recent output at once;
+        // without the grace every pane would come back "done".
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+
+        for pane in &panes {
+            print(&mut app, &daemon, *pane, b"history\r\n");
+        }
+        settle(&mut app, &clock);
+
+        for pane in &panes {
+            assert_eq!(status_of(&app, *pane), PaneStatus::Idle);
+            assert!(!app.state.is_unseen(*pane));
+        }
+    }
+
+    #[test]
+    fn a_bell_from_a_pane_out_of_focus_marks_it() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"\x07");
+
+        assert!(app.state.is_unseen(panes[0]));
+    }
+
+    #[test]
+    fn typing_into_a_pane_is_not_work() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+
+        app.send_key(
+            dispatch_pty::Key::Char('l'),
+            dispatch_pty::Modifiers::default(),
+        );
+        advance(&clock, Duration::from_millis(40));
+        print(&mut app, &daemon, pane, b"l");
+        advance(&clock, Duration::from_millis(200));
+        app.poll_panes();
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Idle,
+            "the echo of a keystroke is not the agent working"
+        );
+    }
+
+    #[test]
+    fn the_repaint_after_a_resize_is_not_work() {
+        // Every agent and shell repaints on SIGWINCH. A pane that is resized
+        // because a sibling opened, closed or the terminal changed size has
+        // done nothing; counted as work, it would spin and then be marked
+        // done having finished nothing.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let background = panes[0];
+        assert_ne!(app.state.focused_pane(), Some(background));
+        let mut small = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut small);
+        app.resize_panes();
+
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        let before = app.panes[&background].backend.size();
+
+        let mut large = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut large);
+        app.resize_panes();
+        assert_ne!(
+            app.panes[&background].backend.size(),
+            before,
+            "the unfocused pane was resized"
+        );
+
+        advance(&clock, Duration::from_millis(50));
+        print(&mut app, &daemon, background, b"\x1b[H\x1b[2Jrepainted\r\n");
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(100));
+            app.poll_panes();
+            assert_eq!(
+                status_of(&app, background),
+                PaneStatus::Idle,
+                "a repaint is not work"
+            );
+        }
+        settle(&mut app, &clock);
+
+        assert!(
+            !app.state.is_unseen(background),
+            "and it finished nothing, so it is not done"
+        );
+    }
+
+    #[test]
+    fn what_a_pane_prints_in_answer_to_a_click_is_not_work() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        // Asks for the mouse while it starts, as a full-screen agent does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h\x1b[?1006h");
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        advance(&clock, Duration::from_millis(800));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+        let _ = sent.try_iter().count();
+
+        app.send_mouse(
+            pane,
+            MouseInput {
+                action: dispatch_pty::MouseAction::Press,
+                button: dispatch_pty::MouseButton::Left,
+                col: 2,
+                row: 1,
+                modifiers: dispatch_pty::Modifiers::default(),
+            },
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { pane: p, .. } if p == pane)),
+            "the click reached the pane"
+        );
+        advance(&clock, Duration::from_millis(40));
+        print(&mut app, &daemon, pane, b"\x1b[2;3Hclicked");
+        advance(&clock, Duration::from_millis(200));
+        app.poll_panes();
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Idle,
+            "the answer to a click is not the agent working"
+        );
+    }
+
+    #[test]
+    fn a_pane_scrolled_back_keeps_its_state() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"output\r\n");
+        assert_eq!(status_of(&app, pane), PaneStatus::Running);
+
+        app.panes.get_mut(&pane).expect("adopted").scrolled_back = true;
+        settle(&mut app, &clock);
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Running,
+            "the screen is not the live one, so it is not read"
+        );
+    }
+
+    /// The rows a pane shows now, as text.
+    fn shown(app: &App, pane: PaneId) -> Vec<String> {
+        app.panes[&pane].screen.text_lines()
+    }
+
+    /// A pane that has printed `line-001` to `line-100`, so it has
+    /// scrollback.
+    fn pane_with_history(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+    ) -> PaneId {
+        let pane = spawn_several(app, daemon, project, 1)[0];
+        let output: String = (1..=100).map(|n| format!("line-{n:03}\r\n")).collect();
+        print(app, daemon, pane, output.as_bytes());
+        pane
+    }
+
+    #[test]
+    fn scroll_mode_reads_back_through_a_panes_output_and_esc_returns() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = pane_with_history(&mut app, &daemon, project);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(
+            shown(&app, pane)[0].trim_end(),
+            "line-001",
+            "the oldest output"
+        );
+        assert!(
+            app.status.is_empty(),
+            "the mode's own row says where the user is"
+        );
+
+        // Half of a 24-row pane.
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(shown(&app, pane)[0].trim_end(), "line-013");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("line-100")),
+            "back to live output"
+        );
+        assert!(!app.panes[&pane].scrolled_back);
+    }
+
+    #[test]
+    fn scroll_mode_on_a_pane_with_no_scrollback_is_harmless() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        print(&mut app, &daemon, pane, b"only-line\r\n");
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for code in [
+            KeyCode::Char('g'),
+            KeyCode::Char('u'),
+            KeyCode::PageUp,
+            KeyCode::Char('k'),
+        ] {
+            press(&mut app, code);
+        }
+
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("only-line"))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn pane_mode_p_walks_the_panes_on_this_tab() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.focus_pane(panes[0]);
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        for expected in [panes[1], panes[2], panes[0]] {
+            press(&mut app, KeyCode::Char('p'));
+            assert_eq!(app.state.focused_pane(), Some(expected));
+        }
+        assert_eq!(app.router.key_mode(), KeyMode::Pane, "still walking");
+    }
+
+    #[test]
+    fn the_prefix_then_a_bracket_opens_scroll_mode_in_the_app() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        command(&mut app, '[');
+
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+    }
+
+    #[test]
+    fn a_pane_that_exits_mid_work_stays_exited_and_unmarked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"working\r\n");
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane: panes[0],
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(0),
+                },
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        settle(&mut app, &clock);
+
+        assert_eq!(status_of(&app, panes[0]), PaneStatus::Exited(0));
+        assert!(!app.state.is_unseen(panes[0]));
+    }
+
+    #[test]
+    fn a_harnesss_rules_decide_blocked() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/rules", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project_id, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"Do you want to proceed?\r\n");
+
+        assert_eq!(status_of(&app, pane), PaneStatus::Blocked);
+    }
+
+    /// Announces a subagent `parent` delegated to, running `harness`, and
+    /// puts the focus back on the parent, where the user left it.
+    fn delegated(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+        parent: PaneId,
+        harness: &str,
+    ) -> PaneId {
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, harness, Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.focus_pane(parent);
+        child
+    }
+
+    #[test]
+    fn a_subagent_that_has_said_nothing_yet_is_running() {
+        // `claude -p` prints nothing until its answer. Read by activity alone
+        // it would sit idle — "waiting on you" — for its whole run.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "claude");
+
+        assert_eq!(
+            status_of(&app, child),
+            PaneStatus::Running,
+            "from the moment it is adopted"
+        );
+
+        // Ten seconds of silence: well past the grace and the settling.
+        for _ in 0..40 {
+            advance(&clock, Duration::from_millis(250));
+            app.poll_panes();
+            assert_eq!(status_of(&app, child), PaneStatus::Running);
+        }
+        assert!(!app.state.is_unseen(child));
+    }
+
+    #[test]
+    fn a_subagent_that_goes_quiet_mid_task_is_still_running_and_not_done() {
+        // `codex exec` goes quiet for seconds at a time while the model
+        // thinks; a subagent is not finished until it exits.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "codex");
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, child, b"reading the tests\r\n");
+        settle(&mut app, &clock);
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(250));
+            app.poll_panes();
+        }
+
+        assert_eq!(status_of(&app, child), PaneStatus::Running);
+        assert!(!app.state.is_unseen(child), "it has not finished");
+        assert!(
+            app.animations
+                .linear(Target::Pulse(child), app.now())
+                .is_none(),
+            "so nothing asks the user to look"
+        );
+    }
+
+    #[test]
+    fn a_subagent_at_a_prompt_is_blocked_and_running_again_once_it_is_answered() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/rules", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project_id, 1)[0];
+        let child = delegated(&mut app, &daemon, project_id, parent, "shell");
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, child, b"Do you want to proceed?\r\n");
+        assert_eq!(status_of(&app, child), PaneStatus::Blocked);
+
+        advance(&clock, Duration::from_millis(300));
+        print(&mut app, &daemon, child, b"\x1b[H\x1b[2J");
+        settle(&mut app, &clock);
+
+        assert_eq!(
+            status_of(&app, child),
+            PaneStatus::Running,
+            "answered, it goes back to its task"
+        );
+        assert!(!app.state.is_unseen(child));
     }
 
     #[test]
@@ -3431,6 +5616,360 @@ mod tests {
             1,
             "focusing across the cap moves the view"
         );
+    }
+
+    /// `attached_app`, with a `shell` harness for the picker to offer.
+    fn attached_app_with_shell() -> (
+        App,
+        ProjectId,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (client, daemon, sent) = Client::for_test();
+        let shell = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::attached([shell].into_iter().collect(), client);
+
+        let project = Project::new("/tmp/attached", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, id, daemon, sent)
+    }
+
+    /// `attached_app`, with `claude` as well as a shell: a daemon too old for
+    /// tabs is offered no shell, and needs something else to be asked for.
+    fn attached_app_with_claude() -> (
+        App,
+        ProjectId,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (client, daemon, sent) = Client::for_test();
+        let mut app = App::attached(registry_with_shell("/usr/bin/zsh"), client);
+
+        let project = Project::new("/tmp/attached", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, id, daemon, sent)
+    }
+
+    /// Sends `project`'s tabs as the daemon does, one tab per group, and
+    /// returns their ids.
+    fn send_tabs(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+        groups: &[&[PaneId]],
+    ) -> Vec<TabId> {
+        let tabs: Vec<Tab> = groups
+            .iter()
+            .map(|panes| Tab {
+                id: TabId::new(),
+                name: None,
+                panes: panes.to_vec(),
+            })
+            .collect();
+        let ids = tabs.iter().map(|tab| tab.id).collect();
+        daemon
+            .send(ServerMessage::Tabs { project, tabs })
+            .expect("the app is listening");
+        app.poll_daemon();
+        ids
+    }
+
+    /// Where the last pane this app asked its daemon for was to go.
+    fn placed(sent: &Receiver<ClientMessage>) -> Option<Placement> {
+        sent.try_iter()
+            .filter_map(|message| match message {
+                ClientMessage::SpawnPane { place, .. } => Some(place),
+                _ => None,
+            })
+            .last()
+    }
+
+    fn a_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn the_daemons_snapshot_decides_which_tab_each_pane_is_on() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+
+        assert_eq!(app.tab_count(), 2);
+        app.focus_pane(panes[1]);
+        assert_eq!(app.current_tab(), 1);
+        assert_eq!(app.panes_on_tab(), panes[1..].to_vec());
+    }
+
+    fn key_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.handle(
+            &Event::Key(KeyEvent::new(code, modifiers)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+    }
+
+    #[test]
+    fn ctrl_t_then_n_asks_for_a_new_tab_after_the_one_on_screen() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[0]) })
+        );
+    }
+
+    #[test]
+    fn a_tab_mode_key_that_opens_the_picker_hands_it_the_keyboard() {
+        let (mut app, project, daemon, _sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'));
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Harness(_))),
+            "x went to the picker, not to closing a tab"
+        );
+    }
+
+    #[test]
+    fn a_click_ends_tab_mode() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        click(&mut app, 2, 5);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn tab_mode_arrows_step_along_the_tabs() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        app.focus_pane(panes[0]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.current_tab(), 2);
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still stepping");
+    }
+
+    #[test]
+    fn alt_n_opens_the_picker_for_this_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('n'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Into { tab: tabs[0] }));
+    }
+
+    #[test]
+    fn ctrl_t_twice_types_ctrl_t_into_the_pane() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(sent.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::WritePane { pane: p, bytes } if p == pane && bytes == [0x14]
+        )));
+    }
+
+    #[test]
+    fn a_new_pane_is_asked_into_the_tab_on_screen() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        command(&mut app, 'n');
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Into { tab: tabs[0] }));
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_no_tabs_is_asked_for_no_particular_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_claude();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        command(&mut app, 'n');
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Auto));
+    }
+
+    #[test]
+    fn choosing_a_tab_goes_back_to_the_pane_last_used_there() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(&mut app, &daemon, project, &[&panes[..2], &panes[2..]]);
+        let mut terminal = a_terminal();
+
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        app.select_tab(1);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.state.focused_pane(), Some(panes[2]));
+
+        app.select_tab(0);
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[1]),
+            "where the user left it, not the tab's first pane"
+        );
+    }
+
+    #[test]
+    fn a_pane_the_snapshot_has_not_placed_yet_is_still_shown() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let first = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&first]);
+
+        let fresh = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        assert_eq!(app.tab_count(), 1);
+        app.focus_pane(fresh);
+        assert_eq!(app.panes_on_tab(), vec![first[0], fresh]);
+    }
+
+    #[test]
+    fn a_tab_whose_last_pane_exits_leaves_the_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[1]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane: panes[1],
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(0),
+                },
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(app.tab_count(), 1);
+        assert_eq!(app.current_tab(), 0);
+        assert_eq!(app.panes_on_tab(), vec![panes[0]]);
+        drawn(&mut app, &mut terminal);
+    }
+
+    #[test]
+    fn a_standalone_project_keeps_its_own_tabs() {
+        let shell = dispatch_config::HarnessDef {
+            id: "sh".to_string(),
+            display_name: "Sh".to_string(),
+            launch: Launch {
+                command: if cfg!(windows) { "cmd.exe" } else { "sh" }.to_string(),
+                ..Launch::default()
+            },
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([shell].into_iter().collect());
+        let root = scratch("standalone-tabs");
+        app.add_project(root.clone());
+        let project = app
+            .state
+            .selected_project()
+            .expect("the project is selected");
+        assert!(
+            app.state.project_tabs(project).is_some(),
+            "a standalone client keeps its own panes' tabs"
+        );
+
+        app.spawn_pane("sh", Size::new(80, 24))
+            .expect("the pane starts");
+        app.placing = Placement::NewAfter {
+            tab: app.current_tab_id(),
+        };
+        app.spawn_pane("sh", Size::new(80, 24))
+            .expect("the pane starts");
+
+        assert_eq!(
+            app.tab_count(),
+            2,
+            "the second pane opened a tab of its own"
+        );
+
+        // Real shells: stopped here rather than left to outlive the test.
+        for (_, mut pane) in app.panes.drain() {
+            pane.backend.terminate();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_standalone_pane_that_fails_to_start_is_reported_not_fatal() {
+        // A typo in `[shell] command` is one Enter away, and Dispatch
+        // exiting over it would take every other standalone agent with it.
+        let broken = dispatch_config::HarnessDef {
+            id: "broken".to_string(),
+            display_name: "Broken".to_string(),
+            launch: Launch {
+                command: "/nonexistent/definitely-not-here".to_string(),
+                ..Launch::default()
+            },
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([broken].into_iter().collect());
+        let root = scratch("broken-harness");
+        app.add_project(root.clone());
+
+        let result = app.spawn_pane("broken", Size::new(80, 24));
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            app.status.starts_with("failed to start broken:"),
+            "{:?}",
+            app.status
+        );
+        assert!(app.panes.is_empty(), "nothing was adopted");
+        assert!(app.state.visible_panes().is_empty(), "nor added");
     }
 
     #[test]
@@ -3653,6 +6192,51 @@ mod tests {
         assert!(
             app.state.pane(pane).is_some(),
             "the pane is untouched by an update this build cannot read"
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_pane_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane,
+                update: PaneUpdate::Branch {
+                    branch: Some("feat/tabs".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon(), "a branch change is worth a redraw");
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("feat/tabs")
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_project_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+
+        daemon
+            .send(ServerMessage::ProjectChanged {
+                project,
+                update: ProjectUpdate::Branch {
+                    branch: Some("main".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon());
+        assert_eq!(
+            app.state
+                .projects()
+                .iter()
+                .find(|candidate| candidate.id == project)
+                .and_then(|project| project.branch.as_deref()),
+            Some("main")
         );
     }
 
@@ -4432,13 +7016,14 @@ mod tests {
     fn a_click_on_a_project_row_selects_it_and_folds_its_panes() {
         let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
 
-        // The first row inside the sidebar's frame is the first project.
-        click(&mut app, 1, 1);
+        // The first row inside the sidebar's frame — below the top row and
+        // the frame's own edge — is the first project.
+        click(&mut app, 1, 2);
 
         assert_eq!(app.state.selected_project(), Some(first));
         assert!(app.state.is_project_collapsed(first), "and it folds");
 
-        click(&mut app, 1, 1);
+        click(&mut app, 1, 2);
         assert!(!app.state.is_project_collapsed(first), "and unfolds again");
     }
 
@@ -4447,9 +7032,9 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        // A pane row is indented two columns inside the frame, and its twisty
-        // is the first of them.
-        click(&mut app, 3, 2);
+        // A pane row starts four columns inside the frame, and its twisty is
+        // the first of them.
+        click(&mut app, 5, 3);
 
         assert!(app.state.is_pane_collapsed(parent));
         assert_eq!(
@@ -4464,7 +7049,8 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        click(&mut app, 8, 2);
+        // One row lower than before the top row.
+        click(&mut app, 8, 3);
 
         assert_eq!(app.state.focused_pane(), Some(parent));
         assert!(!app.state.is_pane_collapsed(parent), "and folds nothing");
@@ -4483,6 +7069,1104 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_tab_is_prefixed_with_its_most_urgent_state() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        // The row carries no numbers now, so the two tabs need names of their
+        // own to tell which one the glyph sits on.
+        app.rename(panes[0], "alpha");
+        app.rename(panes[4], "beta");
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+        let top: String = text
+            .lines()
+            .next()
+            .expect("a row")
+            .chars()
+            .skip(sidebar::WIDTH as usize)
+            .collect();
+
+        assert!(
+            top.contains(&format!("{} alpha", sidebar::BLOCKED)),
+            "{top:?}"
+        );
+        assert!(
+            !top.contains(&format!("{} beta", sidebar::BLOCKED)),
+            "the other tab has nothing blocked: {top:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_row_counts_panes_waiting_on_the_user() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        for pane in &panes[..2] {
+            app.state
+                .set_pane_status(*pane, PaneStatus::Blocked)
+                .expect("exists");
+        }
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+
+        assert!(
+            text.lines()
+                .last()
+                .expect("a row")
+                .contains("2 waiting on you"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_reminders_fit_an_eighty_column_status_row() {
+        // The key help alone runs past eighty columns, so a reminder after it
+        // was cut off on the terminals most people have.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Blocked)
+            .expect("exists");
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: panes[1],
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        let text = rendered_text(&terminal);
+        let row = text.lines().last().expect("a row");
+
+        assert!(row.contains("1 waiting on you"), "{row:?}");
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl a a"),
+            "{row:?}"
+        );
+        assert!(
+            row.find("waiting on you") < row.find("pane(s)"),
+            "the key help follows, where being cut costs least: {row:?}"
+        );
+    }
+
+    /// `app` reading its keys with `entries` laid over the defaults, each
+    /// (mode, key, command).
+    fn rebind(app: &mut App, entries: &[(&str, &str, &str)]) {
+        use std::collections::BTreeMap;
+
+        let mut modes: BTreeMap<String, BTreeMap<String, dispatch_config::KeyValue>> =
+            BTreeMap::new();
+        for (mode, chord, name) in entries {
+            modes.entry((*mode).to_string()).or_default().insert(
+                (*chord).to_string(),
+                dispatch_config::KeyValue::Command((*name).to_string()),
+            );
+        }
+        let keys = dispatch_config::KeysConfig {
+            modes: modes
+                .into_iter()
+                .map(|(mode, table)| (mode, dispatch_config::KeyTable::Table(table)))
+                .collect(),
+            not_a_table: false,
+        };
+        let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        app.set_keymap(keymap);
+    }
+
+    /// The status row with one delegation request waiting.
+    fn row_with_a_request_waiting(app: &mut App, project: ProjectId, parent: PaneId) -> String {
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        let mut terminal = a_terminal();
+        drawn(app, &mut terminal);
+        bottom_row(&terminal)
+    }
+
+    #[test]
+    fn hints_name_the_keys_as_they_are_bound() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("normal", "Ctrl b", "prefix")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl b a"),
+            "{row:?}"
+        );
+
+        app.open_harness_picker();
+        assert_eq!(
+            app.status,
+            "no harnesses registered; press Ctrl b H to add one"
+        );
+    }
+
+    #[test]
+    fn a_hint_with_no_key_to_name_says_what_it_can() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "a", "none")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(row.contains("1 delegation(s) waiting  "), "{row:?}");
+        assert!(!row.contains('—'), "{row:?}");
+
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "H", "none")],
+        );
+        app.open_harness_picker();
+        assert_eq!(app.status, "no harnesses registered");
+    }
+
+    #[test]
+    fn the_spinner_follows_the_clock_and_stops_with_motion_off() {
+        let (mut app, _, _, _) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.started = clock.get();
+
+        advance(&clock, Duration::from_millis(350));
+        assert_eq!(app.spinner_frame(), Some(3));
+
+        app.set_motion(false);
+        assert_eq!(app.spinner_frame(), None);
+    }
+
+    #[test]
+    fn a_still_interface_asks_for_no_frames() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let now = app.now();
+        app.animations.sweep(now + Duration::from_secs(10));
+        app.state
+            .set_pane_status(pane, PaneStatus::Idle)
+            .expect("exists");
+
+        assert_eq!(app.next_frame(now + Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn a_spinner_asks_for_a_frame_a_tenth_of_a_second() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let later = app.now() + Duration::from_secs(10);
+        app.animations.sweep(later);
+        app.state
+            .set_pane_status(pane, PaneStatus::Running)
+            .expect("exists");
+
+        assert_eq!(app.next_frame(later), Some(Duration::from_millis(100)));
+
+        app.set_motion(false);
+        assert_eq!(app.next_frame(later), None, "a still glyph needs no frames");
+    }
+
+    #[test]
+    fn the_loop_waits_out_what_is_left_of_the_frame() {
+        let drawn = Instant::now();
+
+        assert_eq!(
+            App::poll_timeout(drawn, drawn + Duration::from_millis(10)),
+            FRAME - Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn an_idle_loop_waits_a_whole_frame_rather_than_spinning() {
+        let drawn = Instant::now();
+
+        assert_eq!(App::poll_timeout(drawn, drawn + FRAME), FRAME);
+        assert_eq!(
+            App::poll_timeout(drawn, drawn + Duration::from_secs(5)),
+            FRAME,
+            "long after the last frame, still never zero"
+        );
+    }
+
+    #[test]
+    fn a_running_tween_asks_for_thirty_frames_a_second() {
+        let (mut app, _, _, _) = attached_app();
+        let now = app.now();
+        app.animations
+            .start(Target::Glide, now, Duration::from_millis(150), 0.0);
+
+        assert_eq!(app.next_frame(now), Some(Duration::from_millis(33)));
+    }
+
+    /// The colour of the top-left corner of `pane`'s tile, as last drawn.
+    fn corner(
+        app: &App,
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        pane: PaneId,
+    ) -> Color {
+        let (_, rect) = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane is tiled");
+        terminal
+            .backend()
+            .buffer()
+            .cell((rect.x, rect.y))
+            .expect("the corner is on screen")
+            .fg
+    }
+
+    fn drawn(app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>) {
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+    }
+
+    #[test]
+    fn focus_eases_the_border_from_faded_to_accent() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        let theme = Theme::fallback();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(60));
+        drawn(&mut app, &mut terminal);
+
+        let (new, old) = (
+            corner(&app, &terminal, panes[0]),
+            corner(&app, &terminal, panes[1]),
+        );
+        for colour in [new, old] {
+            assert_ne!(colour, theme.faded, "mid-ease");
+            assert_ne!(colour, theme.accent, "mid-ease");
+        }
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+    }
+
+    #[test]
+    fn in_256_colours_an_ease_starts_and_ends_on_the_colours_at_rest() {
+        // The accent at rest is palette slot 5 itself, which no blend reaches;
+        // an ease ending on the nearest cube entry instead jumps the frame
+        // after it, and one starting there jumps the frame it starts.
+        use dispatch_tui::theme::{Depth, Palette};
+
+        let (mut app, project, daemon, _sent) = attached_app();
+        let theme = Theme::new(Palette::FALLBACK, Depth::Indexed);
+        app.set_theme(theme);
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.accent, "at rest");
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            corner(&app, &terminal, panes[1]),
+            theme.accent,
+            "the ease away starts where the border was"
+        );
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.faded);
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+    }
+
+    #[test]
+    fn rapid_focus_changes_continue_rather_than_queue() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+
+        for pane in [panes[0], panes[1], panes[0], panes[2]] {
+            app.focus_pane(pane);
+            drawn(&mut app, &mut terminal);
+            advance(&clock, Duration::from_millis(20));
+        }
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let theme = Theme::fallback();
+        assert_eq!(corner(&app, &terminal, panes[2]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.faded);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+        assert!(!app.animations.active(app.now()), "nothing left running");
+    }
+
+    #[test]
+    fn with_motion_off_focus_changes_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(corner(&app, &terminal, panes[0]), Theme::fallback().accent);
+    }
+
+    #[test]
+    fn a_pane_turning_blocked_out_of_focus_pulses() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/pulse", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project_id, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"Do you want to proceed?\r\n");
+
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn focusing_a_pulsing_pane_stops_its_pulse() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/pulse", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project_id, 2);
+        app.state
+            .set_pane_title(panes[0], "asking")
+            .expect("the pane exists");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"Do you want to proceed?\r\n");
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_some(),
+            "it pulses while out of focus"
+        );
+
+        // Past the focus tint's glide, and well inside the pulse's 1.2 s.
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_none(),
+            "looked at, it has nothing left to ask"
+        );
+        let text = rendered_text(&terminal);
+        let (y, line) = text
+            .lines()
+            .map(sidebar_column)
+            .enumerate()
+            .find(|(_, line)| line.contains("asking"))
+            .expect("the pane has a sidebar row");
+        let x = column_of(&line, "asking");
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((
+                u16::try_from(x).expect("fits"),
+                u16::try_from(y).expect("fits"),
+            ))
+            .expect("the row is on screen");
+        assert_eq!(cell.bg, Theme::fallback().tint, "its row shows the focus");
+    }
+
+    #[test]
+    fn the_perimeter_runs_clockwise_from_the_top_left() {
+        let path = perimeter(Rect::new(0, 0, 3, 3));
+
+        assert_eq!(
+            path,
+            vec![
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (1, 2),
+                (0, 2),
+                (0, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_panes_border_is_drawn_in() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+
+        // 40 ms of 200 is a fifth of the way; eased out, a little under half
+        // of the border is drawn — well short of the bottom-left corner,
+        // which is about five-sixths of the way round.
+        advance(&clock, Duration::from_millis(40));
+        drawn(&mut app, &mut terminal);
+        let (_, rect) = *app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("tiled");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf.cell((rect.x, rect.y)).expect("cell").symbol(),
+            "┌",
+            "the sweep starts at the corner"
+        );
+        assert_eq!(
+            buf.cell((rect.x, rect.y + rect.height - 1))
+                .expect("cell")
+                .symbol(),
+            " ",
+            "the bottom-left corner is the last to be drawn"
+        );
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf.cell((rect.x, rect.y + rect.height - 1))
+                .expect("cell")
+                .symbol(),
+            "└"
+        );
+    }
+
+    #[test]
+    fn a_closed_panes_tile_holds_the_grid_until_it_has_retracted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before: Vec<(PaneId, Rect)> = app.frames.clone();
+
+        app.close_focused(); // panes[1]
+        drawn(&mut app, &mut terminal);
+        let kept = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert_eq!(
+            kept,
+            before
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("was tiled")
+                .1,
+            "the other pane keeps its tile while the closed one retracts"
+        );
+        assert!(
+            !app.frames.iter().any(|(id, _)| *id == panes[1]),
+            "the closed pane takes no input"
+        );
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let reflowed = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert!(reflowed.width > kept.width, "then the grid reflows");
+    }
+
+    #[test]
+    fn closing_two_panes_in_quick_succession_reflows_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(50));
+        let _ = app.state.focus(panes[1]);
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            app.frames
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("tiled")
+                .1,
+            before,
+            "still held while either tile retracts"
+        );
+
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        let _ = app.state.focus(panes[0]);
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        assert!(app.frames.is_empty(), "an empty grid is fine");
+    }
+
+    #[test]
+    fn a_resize_while_a_tile_retracts_lays_out_for_the_new_size_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        let mut smaller = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut smaller);
+
+        for (_, rect) in &app.frames {
+            assert!(
+                rect.x + rect.width <= 60 && rect.y + rect.height <= 20,
+                "{rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_grid_lifts_on_its_own_once_the_tile_has_retracted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        // Nothing spinning, so nothing but the animations asks for frames.
+        for pane in &panes {
+            app.state
+                .set_pane_status(*pane, PaneStatus::Idle)
+                .expect("exists");
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        // The close is input, so it is drawn at once; from then on frames
+        // come only when `next_frame` asks for them, as in `main.rs`.
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        let mut last_draw = app.now();
+        for _ in 0..250 {
+            advance(&clock, Duration::from_millis(1));
+            let now = app.now();
+            if app
+                .next_frame(now)
+                .is_some_and(|every| now.duration_since(last_draw) >= every)
+            {
+                drawn(&mut app, &mut terminal);
+                last_draw = now;
+            }
+        }
+
+        assert!(app.closing.is_empty(), "the tile has retracted");
+        assert!(app.held.is_none(), "and nothing holds the grid");
+        let after = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert!(after.width > before.width, "the other pane has reflowed");
+    }
+
+    #[test]
+    fn a_pane_leaving_as_the_terminal_shrinks_is_laid_out_for_the_new_size() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        // The pane goes and the terminal shrinks before the next frame, so
+        // one draw is the first to see both.
+        app.close_focused();
+        let mut smaller = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut smaller);
+
+        for (_, rect) in app.frames.iter().chain(&app.closing) {
+            assert!(
+                rect.x + rect.width <= 60 && rect.y + rect.height <= 20,
+                "{rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_projects_lays_out_the_new_one_at_once() {
+        let (mut app, first, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let project = Project::new("/tmp/second", ProjectSource::LocalDir);
+        let second = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.select_project(second);
+        let theirs = spawn_several(&mut app, &daemon, second, 2);
+        app.select_project(first);
+        let ours = spawn_several(&mut app, &daemon, first, 2);
+        app.select_project(first);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        assert!(
+            ours.iter()
+                .all(|pane| app.frames.iter().any(|(id, _)| id == pane)),
+            "the first project's panes are on screen"
+        );
+
+        app.select_project(second);
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.closing.is_empty(),
+            "the first project's panes have not closed"
+        );
+        assert!(app.held.is_none(), "so nothing holds the grid");
+        assert!(
+            theirs
+                .iter()
+                .all(|pane| app.frames.iter().any(|(id, _)| id == pane)),
+            "the second project's panes are laid out: {:?}",
+            app.frames
+        );
+    }
+
+    #[test]
+    fn the_active_tab_tint_slides_to_the_new_tab() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 5); // tab 2 active
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let tab = Theme::fallback().tab;
+        let tinted = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<u16> {
+            let buf = terminal.backend().buffer();
+            (sidebar::WIDTH..buf.area.width)
+                .filter(|x| buf.cell((*x, 0)).is_some_and(|cell| cell.bg == tab))
+                .collect()
+        };
+        let at_rest_on_two = tinted(&terminal);
+
+        let _ = app.state.focus(panes[0]); // tab 1
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(40));
+        drawn(&mut app, &mut terminal);
+        let sliding = tinted(&terminal);
+
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        let at_rest_on_one = tinted(&terminal);
+
+        assert!(
+            sliding.first() > at_rest_on_one.first(),
+            "not arrived yet: {sliding:?}"
+        );
+        assert!(
+            sliding.first() < at_rest_on_two.first(),
+            "but on its way: {sliding:?}"
+        );
+    }
+
+    #[test]
+    fn with_motion_off_a_close_reflows_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.frames
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("tiled")
+                .1
+                .width
+                > before.width
+        );
+    }
+
+    #[test]
+    fn the_top_row_carries_the_name_and_the_tabs() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "refactor")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let text = rendered_text(&terminal);
+        let top = text.lines().next().expect("the frame has rows");
+        let over_sidebar: String = top.chars().take(sidebar::WIDTH as usize).collect();
+        let over_panes: String = top.chars().skip(sidebar::WIDTH as usize).collect();
+
+        assert_eq!(over_sidebar.trim(), APP_NAME, "{top:?}");
+        assert!(
+            over_panes.contains(" refactor "),
+            "a lone tab is still drawn, named for its pane, with no number: {top:?}"
+        );
+        assert!(!over_panes.contains("1 refactor"), "{top:?}");
+    }
+
+    #[test]
+    fn a_tab_title_is_cut_by_the_columns_it_takes() {
+        // Twelve wide characters are twenty-four columns: counted as twelve,
+        // they fit a sixteen-column title and ran half as far again past it.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "日本語のプロジェクト名前")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let buf = terminal.backend().buffer();
+        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .collect();
+
+        // No number ahead of it now: the title starts right after the tab's
+        // single leading blank.
+        let title = top
+            .iter()
+            .position(|cell| cell.symbol() != " ")
+            .expect("the tab is drawn");
+        let cut = top
+            .iter()
+            .position(|cell| cell.symbol() == "…")
+            .expect("the title is cut, and says so");
+        assert!(
+            cut + 1 - title <= TAB_TITLE,
+            "the title takes {} columns",
+            cut + 1 - title
+        );
+    }
+
+    #[test]
+    fn the_active_tab_is_tinted_rather_than_inverted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        // The tint at rest, rather than a first frame sliding it over from
+        // the first tab.
+        app.set_motion(false);
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        // The row carries no numbers now, so the two tabs need names of
+        // their own to tell which is which.
+        app.rename(panes[0], "alpha");
+        app.rename(panes[4], "beta");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+        let row = text.lines().next().expect("a row");
+        let buf = terminal.backend().buffer();
+        let theme = Theme::fallback();
+
+        let active = buf
+            .cell((cell_of(row, "beta"), 0))
+            .expect("the focused pane's tab is drawn");
+        let inactive = buf
+            .cell((cell_of(row, "alpha"), 0))
+            .expect("the other tab is drawn");
+
+        assert_eq!(
+            active.bg, theme.tab,
+            "the fifth pane is focused, on the beta tab"
+        );
+        assert_eq!(
+            active.fg, theme.text,
+            "in the palette's text: the terminal's own may be a light \
+             theme's dark text on the fallback's dark tab"
+        );
+        assert!(!active.modifier.contains(Modifier::REVERSED));
+        assert_eq!(inactive.fg, theme.faded);
+        assert_eq!(inactive.bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_armed_prefix_is_drawn_on_the_tab_colour_in_the_palettes_text() {
+        let mut app = App::new(HarnessRegistry::default());
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let badge = terminal
+            .backend()
+            .buffer()
+            .cell((0, 29))
+            .expect("the status row is drawn")
+            .clone();
+        let theme = Theme::fallback();
+
+        assert_eq!(badge.symbol(), "P", "the prefix is armed");
+        assert_eq!(badge.bg, theme.tab);
+        assert_eq!(badge.fg, theme.text);
+    }
+
+    #[test]
+    fn the_focused_pane_stays_in_view_when_the_sidebar_shrinks() {
+        // Nothing about the focus changes when the terminal does, so
+        // anchoring only on a new focus left a shorter sidebar showing its
+        // top while the focused row fell off the bottom.
+        let mut app = App::new(HarnessRegistry::default());
+        let mut last = None;
+        for index in 0..20 {
+            last = Some(app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            )));
+        }
+        let last = last.expect("projects were added");
+        app.state.select_project(last).expect("the project exists");
+        let pane = app
+            .state
+            .spawn_pane(last, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "far-down")
+            .expect("the pane exists");
+        assert_eq!(app.state.focused_pane(), Some(pane));
+
+        let sidebar_at = |app: &mut App, height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("the frame is drawn");
+            rendered_text(&terminal)
+                .lines()
+                .map(sidebar_column)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let tall = sidebar_at(&mut app, 30);
+        assert!(tall.contains("far-down"), "{tall}");
+
+        let short = sidebar_at(&mut app, 12);
+        assert!(
+            short.contains("far-down"),
+            "the focused pane is still in view: {short}"
+        );
+    }
+
+    #[test]
+    fn pane_corners_are_square() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        // The border at rest, rather than a first frame drawing it in.
+        app.set_motion(false);
+        spawn_several(&mut app, &daemon, project, 2);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+
+        assert!(!text.contains('╭') && !text.contains('╯'), "{text}");
+        let panes: String = text
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(sidebar::WIDTH as usize)
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(panes.contains('┌') && panes.contains('┘'), "{text}");
+    }
+
+    #[test]
+    fn a_terminal_smaller_than_the_sidebar_still_draws() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 3);
+
+        for (width, height) in [(1, 1), (5, 2), (10, 3), (20, 4), (40, 2)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("drawing into a tiny terminal does not fail");
+        }
     }
 
     /// A terminal sized so the approval prompt's own inner content area comes
@@ -5415,7 +9099,7 @@ mod tests {
     #[test]
     fn a_project_from_a_daemon_lands_on_a_machine_the_sidebar_knows() {
         // The invariant the whole slice rests on: the sidebar groups projects
-        // under their machine's row, so a project stamped with a device that
+        // into their machine's section, so a project stamped with a device that
         // was never registered is drawn nowhere at all — open, invisible and
         // unreachable. `attach` registers the machine before its connection
         // can announce anything, which is what makes that impossible.
@@ -5618,7 +9302,7 @@ mod tests {
     fn attaching_takes_down_the_agents_this_process_started() {
         // `attach` is public and a standalone client can have been running
         // agents of its own for an hour before it ever reaches a daemon.
-        // Dropping that machine's rows while keeping its panes would leave a
+        // Dropping that machine's section while keeping its panes would leave a
         // real child process running with nothing on screen pointing at it,
         // nothing reading it and nobody left to stop it.
         let def = dispatch_config::HarnessDef {
@@ -5661,6 +9345,158 @@ mod tests {
             1,
             "the daemon's machine is the only one left"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_client_watches_its_own_panes_and_projects_branches() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        assert_eq!(
+            app.state.projects()[0].branch.as_deref(),
+            Some("main"),
+            "a project knows its branch as soon as it is opened"
+        );
+
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app
+            .state
+            .pane(pane)
+            .and_then(|pane| pane.branch.clone())
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("main")
+        );
+
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_clients_exited_pane_keeps_the_branch_it_last_had() {
+        // The standalone twin of the daemon's test of the same name. An
+        // exited pane still holds the pid it was spawned with, and once the
+        // system hands that number to some unrelated process, looking there
+        // would give the finished pane that process's branch and move it
+        // into another group.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local-exit");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let branch = |app: &App| app.state.pane(pane).and_then(|pane| pane.branch.clone());
+        while branch(&app).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(branch(&app).as_deref(), Some("main"));
+
+        app.panes
+            .get_mut(&pane)
+            .expect("the client holds the pane")
+            .backend
+            .write(b"exit\n")
+            .expect("the shell is listening");
+        while !app
+            .state
+            .pane(pane)
+            .is_some_and(|pane| matches!(pane.status, PaneStatus::Exited(_)))
+        {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The project moving is what says the looking has run since the
+        // switch, so the pane's branch below is not merely a stale read.
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..5 {
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            branch(&app).as_deref(),
+            Some("main"),
+            "a finished pane stays where it last was"
+        );
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6287,5 +10123,1096 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(app.state.devices().len(), devices, "no row was added");
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_scrolls_it_rather_than_a_pane() {
+        let mut app = App::new(HarnessRegistry::default());
+        for index in 0..40 {
+            app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            ));
+        }
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle(&wheel, Size::new(100, 20))
+            .expect("the wheel is handled");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        // Row 0 is the top row and row 1 the sidebar's frame, so row 2 is the
+        // first project shown — p1 now, and not scrolled back to the
+        // selected p0 by the redraw.
+        let text = rendered_text(&terminal);
+        let first = sidebar_column(text.lines().nth(2).expect("the frame has rows"));
+        assert!(first.contains(" p1 "), "{text}");
+    }
+
+    /// Every tab command the app has sent its daemon.
+    fn tab_commands(sent: &Receiver<ClientMessage>) -> Vec<ClientMessage> {
+        sent.try_iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ClientMessage::MovePane { .. }
+                        | ClientMessage::RenameTab { .. }
+                        | ClientMessage::CloseTab { .. }
+                        | ClientMessage::MoveTab { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moving_a_pane_to_the_next_tab_asks_the_daemon() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MovePane {
+                pane: panes[0],
+                to: Placement::Into { tab: tabs[1] },
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_past_the_last_tab_asks_for_a_new_one() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[1]);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MovePane {
+                pane: panes[1],
+                to: Placement::NewAfter { tab: Some(tabs[1]) },
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_left_from_the_first_tab_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(-1);
+
+        assert_eq!(app.status, "no tab to the left");
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn moving_into_a_full_tab_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        send_tabs(&mut app, &daemon, project, &[&panes[..4], &panes[4..]]);
+        app.focus_pane(panes[4]);
+
+        app.move_focused_pane(-1);
+
+        assert_eq!(app.status, "that tab is full (4 panes)");
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_subagent_is_not_moved_between_tabs() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        send_tabs(&mut app, &daemon, project, &[&[parent]]);
+        let kid = PaneId::new();
+        daemon
+            .send(spawned(kid, project, "shell", Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.focus_pane(kid);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            app.status,
+            "a subagent stays beside the pane that asked for it"
+        );
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_tabs_is_asked_nothing() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(1);
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.open_rename_tab();
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.open_close_tab();
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.move_current_tab(1);
+        assert_eq!(app.status, NEEDS_UPGRADE);
+
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_new_tab_on_a_daemon_too_old_for_tabs_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        app.open_new_tab_picker();
+
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        assert!(app.overlay.is_none(), "no picker opens");
+        assert_eq!(placed(&sent), None);
+    }
+
+    #[test]
+    fn a_tab_command_with_no_project_says_so_rather_than_blaming_the_daemon() {
+        let (client, _daemon, _sent) = Client::for_test();
+        let mut app = App::attached(HarnessRegistry::default(), client);
+
+        app.open_new_tab_picker();
+        assert_eq!(app.status, "no project selected");
+
+        app.status.clear();
+        app.open_rename_tab();
+        assert_eq!(app.status, "no project selected");
+    }
+
+    #[test]
+    fn renaming_asks_the_daemon_with_what_was_typed() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.open_rename_tab();
+        for c in "work".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::RenameTab {
+                tab: tabs[0],
+                name: "work".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_rename_changes_nothing() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.open_rename_tab();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn closing_a_tab_asks_first() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.rename(panes[0], "fix login");
+        app.focus_pane(panes[0]);
+
+        app.open_close_tab();
+        let Some(Overlay::CloseTab { prompt, .. }) = &app.overlay else {
+            panic!("the confirmation is open");
+        };
+        assert_eq!(prompt.title(), "Close \"fix login\" and its 2 panes? y/n");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+
+        app.open_close_tab();
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::CloseTab { tab: tabs[0] }]
+        );
+    }
+
+    #[test]
+    fn reordering_asks_for_the_new_position_and_stops_at_the_ends() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+
+        app.move_current_tab(-1);
+        app.move_current_tab(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MoveTab {
+                tab: tabs[0],
+                index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_standalone_client_changes_its_own_tabs() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/standalone", ProjectSource::LocalDir));
+        app.state.set_project_tabs(project, ProjectTabs::new());
+        let panes: Vec<PaneId> = (0..2)
+            .map(|_| {
+                let id = app
+                    .state
+                    .spawn_pane(project, HarnessId::new("shell"))
+                    .expect("the project exists");
+                app.state.place_pane(id, Placement::Auto);
+                id
+            })
+            .collect();
+        app.focus_pane(panes[1]);
+
+        app.move_focused_pane(1);
+        assert_eq!(app.tab_count(), 2, "the pane moved onto a tab of its own");
+
+        app.open_rename_tab();
+        for c in "work".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.tab_views()[app.current_tab()].name.as_deref(),
+            Some("work")
+        );
+
+        app.open_close_tab();
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            app.state.pane(panes[1]).is_none(),
+            "closing the tab closed its pane"
+        );
+        assert_eq!(app.tab_count(), 1);
+    }
+
+    #[test]
+    fn the_previous_tab_wraps_and_the_last_tab_is_the_one_before() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        let mut terminal = a_terminal();
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        app.select_previous_tab();
+        assert_eq!(app.current_tab(), 2, "left of the first is the last");
+        drawn(&mut app, &mut terminal);
+
+        app.select_last_tab();
+        assert_eq!(app.current_tab(), 0, "back to the tab it came from");
+    }
+
+    #[test]
+    fn focus_crosses_to_the_next_tab_at_the_grids_edge_and_stops_at_the_last() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let mut terminal = a_terminal();
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        app.focus_or_tab(Direction::Right);
+        assert_eq!(app.state.focused_pane(), Some(panes[1]));
+        drawn(&mut app, &mut terminal);
+
+        app.focus_or_tab(Direction::Right);
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[1]),
+            "no tab past the last"
+        );
+
+        app.focus_or_tab(Direction::Left);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+    }
+
+    /// Row 0 of what was drawn: the name and the tab row.
+    fn top_row(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        rendered_text(terminal)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The last row of what was drawn: the status row.
+    fn bottom_row(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        rendered_text(terminal)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The screen column `needle` starts at in `row`, counted in cells.
+    fn cell_of(row: &str, needle: &str) -> u16 {
+        u16::try_from(column_of(row, needle)).expect("the row is narrow")
+    }
+
+    #[test]
+    fn a_tab_is_labelled_by_its_first_panes_title_with_no_number() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha");
+        app.rename(panes[1], "beta");
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        assert!(row.contains(" alpha ") && row.contains(" beta "), "{row:?}");
+        assert!(
+            !row.contains("1 alpha") && !row.contains("2 beta"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_given_to_a_tab_replaces_its_panes_title() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        app.rename(panes[0], "alpha");
+        daemon
+            .send(ServerMessage::Tabs {
+                project,
+                tabs: vec![Tab {
+                    id: TabId::new(),
+                    name: Some("work".into()),
+                    panes: panes.clone(),
+                }],
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        assert!(row.contains(" work ") && !row.contains("alpha"), "{row:?}");
+    }
+
+    #[test]
+    fn a_wide_name_is_cut_to_sixteen_columns() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let wide = "界".repeat(20);
+        daemon
+            .send(ServerMessage::Tabs {
+                project,
+                tabs: vec![Tab {
+                    id: TabId::new(),
+                    name: Some(wide.clone()),
+                    panes,
+                }],
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        // Sixteen columns: seven two-column characters and the ellipsis.
+        let row = top_row(&terminal);
+        assert_eq!(row.matches('界').count(), 7, "{row:?}");
+        assert!(row.contains('…'), "{row:?}");
+    }
+
+    #[test]
+    fn the_plus_opens_the_picker_for_a_new_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let plus = cell_of(&top_row(&terminal), " + ") + 1;
+        click(&mut app, plus, 0);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[0]) })
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_shows_it() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha");
+        app.rename(panes[1], "beta");
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        click(&mut app, cell_of(&top_row(&terminal), "beta"), 0);
+
+        assert_eq!(app.current_tab(), 1);
+    }
+
+    #[test]
+    fn with_more_tabs_than_fit_the_one_on_screen_stays_in_view() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 10);
+        for (index, pane) in panes.iter().enumerate() {
+            app.rename(*pane, &format!("tab-number-{index:02}"));
+        }
+        let groups: Vec<&[PaneId]> = panes.chunks(1).collect();
+        send_tabs(&mut app, &daemon, project, &groups);
+        let mut terminal = a_terminal();
+
+        app.focus_pane(panes[9]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            row.contains("tab-number-09") && row.contains('‹'),
+            "{row:?}"
+        );
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            row.contains("tab-number-00") && row.contains('›'),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn tab_mode_is_spelled_out_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).contains("Ctrl t tabs"));
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+        // The generated tab row is longer than this hundred-column test
+        // terminal, so the row is a prefix of the full help rather than
+        // equal to it.
+        assert!(
+            app.router
+                .keymap()
+                .mode_help(KeyMode::Tab)
+                .starts_with(bottom_row(&terminal).trim_end())
+        );
+    }
+
+    #[test]
+    fn a_refusal_in_tab_mode_shows_ahead_of_its_keys() {
+        // `[` keeps the mode on, so a refusal hidden behind the key list
+        // would make the key look dead.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('['));
+        drawn(&mut app, &mut terminal);
+
+        let row = bottom_row(&terminal);
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still in the mode");
+        assert!(row.starts_with("TAB  no tab to the left  "), "{row:?}");
+        assert!(row.contains("n new"), "the keys still follow: {row:?}");
+    }
+
+    #[test]
+    fn entering_tab_mode_clears_an_old_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.status = "something from before".into();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Tab);
+        assert!(app.status.is_empty(), "{:?}", app.status);
+    }
+
+    #[test]
+    fn the_tab_mode_row_is_drawn_like_the_armed_prefix() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        let badge = terminal
+            .backend()
+            .buffer()
+            .cell((0, 29))
+            .expect("the status row is drawn")
+            .clone();
+        assert_eq!(badge.symbol(), "T", "tab mode is on");
+        assert_eq!(badge.bg, app.theme.tab);
+        assert_eq!(badge.fg, app.theme.text);
+    }
+
+    #[test]
+    fn the_plus_and_the_scroll_marks_stay_clickable_on_a_narrow_row() {
+        // Sixteen-column names leave no room for even one to fit beside the
+        // marks and the `+`: the row pins the `+` to the edge and clips the
+        // current tab, exactly the width the reviewer's probe found broken.
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.rename(panes[0], "alphabetalphabet");
+        app.rename(panes[1], "betabetabetabeta");
+        app.rename(panes[2], "gammagammagammag");
+        let tabs = send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        app.focus_pane(panes[1]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(56, 30))
+            .expect("a test backend can be created");
+
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(row.contains('‹'), "{row:?}");
+        assert!(
+            row.contains('›'),
+            "the clipped end still says there is more: {row:?}"
+        );
+        assert!(row.contains(" + "), "{row:?}");
+
+        let plus = cell_of(&row, " + ") + 1;
+        click(&mut app, plus, 0);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[1]) }),
+            "the click on `+` landed on `+`, not on a tab or `›` beneath it"
+        );
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_the_plus_draws_none_and_leaves_the_sidebar_alone() {
+        let (mut app, project, daemon, _sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(35, 30))
+            .expect("a test backend can be created");
+
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            !row.contains('+'),
+            "no room for it, so none is drawn: {row:?}"
+        );
+
+        // The column the old, unclamped `+` used to spill onto: still the
+        // sidebar's own, so a click there is the sidebar's to answer.
+        click(&mut app, sidebar::WIDTH - 1, 0);
+
+        assert!(
+            app.overlay.is_none(),
+            "too narrow for a `+` to open a picker from"
+        );
+    }
+
+    #[test]
+    fn clicking_the_scroll_marks_moves_between_tabs() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 10);
+        for (index, pane) in panes.iter().enumerate() {
+            app.rename(*pane, &format!("tab-number-{index:02}"));
+        }
+        let groups: Vec<&[PaneId]> = panes.chunks(1).collect();
+        send_tabs(&mut app, &daemon, project, &groups);
+        app.focus_pane(panes[5]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        click(&mut app, cell_of(&row, "‹"), 0);
+        assert_eq!(app.current_tab(), 4, "clicking ‹ shows the previous tab");
+
+        app.focus_pane(panes[5]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        click(&mut app, cell_of(&row, "›"), 0);
+        assert_eq!(app.current_tab(), 6, "clicking › shows the next tab");
+    }
+
+    /// A registry holding `claude` and the user's shell, `command`.
+    fn registry_with_shell(command: &str) -> HarnessRegistry {
+        [
+            dispatch_config::HarnessDef {
+                id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                ..dispatch_config::HarnessDef::default()
+            },
+            dispatch_config::HarnessDef {
+                id: dispatch_config::SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                launch: Launch {
+                    command: command.to_string(),
+                    ..Launch::default()
+                },
+                ..dispatch_config::HarnessDef::default()
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn the_picker_offers_the_users_shell_first_named_after_its_program() {
+        let mut app = App::new(registry_with_shell("/usr/bin/zsh"));
+        app.state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        app.open_harness_picker();
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.items()[0].label, "Shell · zsh");
+        assert_eq!(
+            picker.selected().map(|item| item.id.as_str()),
+            Some("shell"),
+            "Enter gives a shell"
+        );
+    }
+
+    #[test]
+    fn a_shell_on_another_machine_is_not_named_after_this_ones() {
+        // The picker is this machine's, but a shell runs where the project
+        // is: its program is only this machine's to name when that is here.
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::new(registry_with_shell("/usr/bin/zsh"));
+        app.attach_named(client, Some("box".into()), Vec::new());
+        let project = Project::new("/srv/app", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        // A daemon that keeps tabs, and so has a shell to offer.
+        send_tabs(&mut app, &daemon, id, &[]);
+
+        app.open_harness_picker();
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.items()[0].label, "Shell");
+        assert_eq!(picker.items()[0].detail, None);
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_tabs_is_not_offered_a_shell() {
+        // A daemon that predates tabs predates the built-in `shell` too, so
+        // a pre-selected Shell would make Enter fail with an unknown harness.
+        let (mut app, id, daemon, _sent) = attached_app_with_claude();
+
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        let ids: Vec<&str> = picker.items().iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["claude"], "no shell, the others as they were");
+
+        app.overlay = None;
+        send_tabs(&mut app, &daemon, id, &[]);
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(
+            picker.items()[0].id,
+            SHELL,
+            "a daemon that keeps tabs has a shell"
+        );
+    }
+
+    fn a_wide_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30))
+            .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn each_mode_spells_out_its_keys_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        for (key, mode) in [
+            ('p', KeyMode::Pane),
+            ('t', KeyMode::Tab),
+            ('s', KeyMode::Scroll),
+            ('o', KeyMode::Session),
+        ] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            assert_eq!(
+                bottom_row(&terminal).trim_end(),
+                app.router.keymap().mode_help(mode),
+                "{mode:?}"
+            );
+            press(&mut app, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn lock_says_how_to_unlock() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED  Ctrl g unlock");
+    }
+
+    #[test]
+    fn a_message_still_shows_while_locked() {
+        // Lock lasts; a refusal hidden behind it would drop keys silently.
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.status = "far is unreachable".into();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(
+            bottom_row(&terminal).trim_end(),
+            "LOCKED  Ctrl g unlock  far is unreachable"
+        );
+    }
+
+    #[test]
+    fn a_waiting_delegation_is_still_mentioned_while_locked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: pane,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        drawn(&mut app, &mut terminal);
+
+        let row = bottom_row(&terminal);
+        assert!(row.starts_with("LOCKED  Ctrl g unlock"), "{row:?}");
+        assert!(row.contains("1 delegation(s) waiting"), "{row:?}");
+    }
+
+    #[test]
+    fn the_wheel_in_scroll_mode_scrolls_without_a_message() {
+        // The wheel's message says End or typing returns, and neither does
+        // in scroll mode; the mode's own row already says how to leave.
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, target);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        press(&mut app, KeyCode::Char('G'));
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert!(app.panes[&target].scrolled_back, "the wheel still scrolls");
+        assert!(app.status.is_empty(), "{:?}", app.status);
+
+        press(&mut app, KeyCode::Esc);
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
+    }
+
+    #[test]
+    fn the_wheel_over_another_pane_ends_scroll_mode_and_says_so() {
+        // Turning to another pane with the wheel is leaving the one being
+        // read. Were it quiet, that other pane would sit scrolled back with
+        // nothing to say so, and a pane scrolled back is never marked blocked.
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back, "back to live output");
+        assert!(app.panes[&other].scrolled_back, "the wheel still scrolls");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
+    }
+
+    #[test]
+    fn the_normal_row_lists_the_mode_keys() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains(
+                "Ctrl p pane  Ctrl t tabs  Ctrl s scroll  Ctrl o session  Ctrl g lock  Ctrl a prefix"
+            ),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn a_rebound_key_shows_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut keys = dispatch_config::KeysConfig::default();
+        keys.modes.insert(
+            "pane".into(),
+            dispatch_config::KeyTable::Table(
+                [(
+                    "w".to_string(),
+                    dispatch_config::KeyValue::Command("close_pane".into()),
+                )]
+                .into(),
+            ),
+        );
+        app.set_keymap(dispatch_tui::Keymap::with_overrides(&keys).0);
+        let mut terminal = a_wide_terminal();
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains("x/w close"),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn entering_any_mode_clears_a_stale_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        app.status = "old".into();
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(app.status.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        app.status = "old".into();
+        command(&mut app, '[');
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.status.is_empty(), "through the prefix too");
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_goes() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    /// A pane with scrollback and a second beside it, drawn once so the
+    /// pointer has somewhere to land, with scroll mode on the first and its
+    /// view at the oldest output.
+    fn scrolled_back_beside_another() -> (App, PaneId, PaneId, Sender<ServerMessage>) {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let target = pane_with_history(&mut app, &daemon, project);
+        let other = spawn_several(&mut app, &daemon, project, 1)[0];
+        drawn(&mut app, &mut a_terminal());
+        app.focus_pane(target);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back, "read back to the start");
+
+        (app, target, other, daemon)
+    }
+
+    /// The middle of the cell block `pane` was last drawn in.
+    fn middle_of(app: &App, pane: PaneId) -> (u16, u16) {
+        let (_, rect) = app
+            .layout
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane is drawn");
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_closes_and_focus_goes_to_another() {
+        // Closing the pane hands focus to the one beside it, and scroll mode
+        // must not carry on over a pane it was never entered on.
+        let (mut app, target, other, daemon) = scrolled_back_beside_another();
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane: target })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut a_terminal());
+
+        assert_eq!(app.state.focused_pane(), Some(other));
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn moving_the_pointer_in_scroll_mode_keeps_focus_and_the_mode() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        app.handle(
+            &Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Size::new(100, 30),
+        )
+        .expect("the pointer is handled");
+
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(target),
+            "a nudge moves nothing"
+        );
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.panes[&target].scrolled_back, "still reading back");
+    }
+
+    #[test]
+    fn a_click_on_another_pane_ends_scroll_mode_and_returns_to_live_output() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        click(&mut app, column, row);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            !app.panes[&target].scrolled_back,
+            "the pane scroll mode read is live again"
+        );
+    }
+
+    #[test]
+    fn a_paste_in_scroll_mode_returns_its_pane_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+
+        app.handle(&Event::Paste("hi".into()), Size::new(100, 30))
+            .expect("the paste is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
+    }
+
+    #[test]
+    fn a_key_bound_to_leave_mode_in_scroll_mode_returns_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        press(&mut app, KeyCode::Esc);
+        rebind(&mut app, &[("scroll", "q", "leave_mode")]);
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back);
+
+        press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
+    }
+
+    #[test]
+    fn every_mode_but_normal_is_drawn_highlighted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        for key in ['p', 's', 'o', 'g'] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            let row = terminal.backend().buffer().area.height - 1;
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((0, row))
+                .expect("the status row is drawn");
+            assert_eq!(cell.bg, app.theme.tab, "Ctrl {key}");
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+        }
     }
 }

@@ -67,14 +67,121 @@ well-meaning agents in check; it is not a sandbox for untrusted ones. See
 Every pane is drawn inside a thin border carrying its title, so one agent's
 output cannot be mistaken for the next one's or for the sidebar.
 
-At most four panes are tiled at once. A fifth does not shrink the other four —
-it opens a second tab, and `^a 1` through `^a 9` move between them (`^a Tab`
-walks them in order). The sidebar always lists every pane, whichever tab it is
-on, and the status row says which tab you are looking at.
+At most four panes are tiled at once, on a tab. Tabs are yours: a new pane
+opens on the tab you are on, and a fifth on a full tab opens the next one.
+Closing a pane never moves panes on other tabs. The sidebar always lists
+every pane, whichever tab it is on.
 
 A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
-what it printed — `^a x` is what removes it for good.
+what it printed — `Ctrl p x` (or `^a x`) is what removes it for good.
+
+## Tabs
+
+The row across the top names each tab after its first pane's title, or the
+name you give it, with `+` at its end for a new one. Click a tab to go to
+it. When there are more tabs than fit, the row scrolls to keep yours in view.
+
+`Ctrl t` enters tab mode, and the status row lists its keys:
+
+| Key | Does |
+|---|---|
+| `n` | new tab: the picker, with your shell first |
+| `r` | rename the tab (empty goes back to the first pane's title) |
+| `x` | close the tab and every pane on it, after a y/n |
+| `←` `→` / `h` `l` / `k` `j` | previous / next tab |
+| `[` `]` | move the focused pane to the previous / next tab (a new one past the last) |
+| `i` `o` | move the tab left / right |
+| `1`–`9` | go to a tab by position |
+| `Tab` | the tab you were on before |
+| `Esc` / `Enter` | leave tab mode |
+| `Ctrl t` | send `Ctrl t` itself to the pane (Claude Code and fzf use it) |
+
+Some keys work without a mode: see Keys below.
+
+A daemon keeps its projects' tabs, so they survive detaching and look the
+same from every client. A daemon older than tabs still works: its panes are
+grouped four at a time, as before.
+
+## Keys
+
+Keys work the way zellij's do: a `Ctrl` key enters a mode for one kind of
+thing, the status row lists that mode's keys, and `Esc` leaves it. Every
+other key goes to the pane.
+
+| Key | Mode |
+|---|---|
+| `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
+| `Ctrl t` | tab: see Tabs above |
+| `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
+| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit |
+| `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
+| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode |
+
+Some keys work without a mode: `Alt n` opens a new pane on this tab,
+`Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
+moves focus, going on to the next tab at the grid's edge. As in zellij, a
+quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
+that letter.
+
+Four of these keys are newly taken from panes: `Ctrl p` is a shell's
+previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is
+bash's operate-and-get-next, and `Ctrl g` is emacs's cancel. `Ctrl t` was
+already taken, by fzf's file finder and Claude Code's task list. A mode's
+key pressed twice goes to the pane instead (`Ctrl s Ctrl s` gives a shell
+its `Ctrl s`), lock mode gives a program every key until you unlock, and
+`"none"` in `[keys]` gives a key back for good. `Ctrl q` does not quit on
+its own — standalone, quitting ends every agent — so quit is `Ctrl o q` or
+`^a q`.
+
+To change a key, say only what differs in `config.toml`:
+
+```toml
+[keys.normal]
+"Ctrl q" = "quit"        # bind something new
+"Ctrl a" = "none"        # give Ctrl a back to the shell…
+"Ctrl b" = "prefix"      # …and use tmux's key for the prefix
+
+[keys.pane]
+"w" = "close_pane"       # a second key for a command
+"x" = "none"             # unbind a default
+```
+
+The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
+`lock`, and a key is written as zellij writes one: `"Ctrl t"`, `"Alt n"`,
+`"x"`, `"H"`, `"Shift Tab"`, `"PageUp"`, `"F5"`. `clear = true` in a table
+drops that mode's defaults. A command is named in snake_case — `new_pane`,
+`close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
+`next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
+`quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
+name and skipped, and the rest still applies. `Esc` always leaves a mode,
+lock always has a key that unlocks, and a config that leaves no key to quit
+is logged. Keys are read when Dispatch starts.
+
+## Shell panes
+
+The picker's first entry is your own shell — `Shell · zsh`, or whatever
+`$SHELL` is on the machine the project is on — so `Enter` opens a terminal
+in the project's directory. It starts the way your terminal starts it (a
+login shell on macOS, a plain interactive one elsewhere), so your rc file
+runs and your prompt, Starship or otherwise, looks as it does anywhere else.
+To choose it yourself:
+
+```toml
+# ~/.config/dispatch/config.toml
+[shell]
+command = "/usr/bin/fish"   # default: $SHELL, then your login record, then /bin/sh
+args = []
+login = "auto"              # auto | always | never
+```
+
+`[shell]` is read when the daemon (or a standalone Dispatch) starts, so
+restart the daemon after changing it.
+
+Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
+`COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
+runs in, so a program never sends it another terminal's private sequences.
+A harness's own `env` still wins.
 
 ## The sidebar
 
@@ -91,11 +198,90 @@ while you are looking inside it, shut while its panes are folded away or it has
 none -- with a git mark beside it when its root is a repository. A pane shows
 the icon of the harness running in it -- the `icon` key in that harness's TOML, so a harness you
 register yourself can have one too. On the right, one glyph says what the pane
-is doing: starting, running, idle, exited cleanly, exited badly, or closed and
-still listed for the sake of a subagent under it.
+is doing, read off its terminal as it runs:
+
+| Glyph | The pane is |
+|---|---|
+| a spinner | working: output is arriving, or its rules say it is busy |
+| a faded pause | idle: waiting for you to give it something |
+| a yellow warning | blocked: waiting on a decision only you can make, such as a permission prompt |
+| an accent check-circle | done: it finished while you were looking elsewhere |
+| an hourglass | starting |
+| a faded check, a red cross | exited cleanly, exited badly |
+| a faded ban | closed, and still listed for the sake of a subagent under it |
+
+A pane is marked done when it goes from working to idle, or rings the bell,
+while another pane has the focus; its row pulses, as does one that turns
+blocked out of sight. The mark stays until you look: focusing the pane clears
+it. Nothing is marked in a pane's first three seconds, so reattaching to a
+daemon, which replays every pane's recent output, does not bring them all
+back done. A subagent reads as working from the moment it starts until it
+exits, unless it is blocked: its one-shot task prints little before its
+answer, and quiet is not finished.
+
+A folded project's row carries the most urgent state among its panes --
+blocked, then done, then working -- and each tab is prefixed the same way, so
+a pane that needs you shows from anywhere. The status row counts the blocked
+panes too: `2 waiting on you`.
 
 Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
 terminal it runs in.
+
+## Status rules
+
+A pane's state comes from its terminal: output arriving means it is working,
+and quiet means idle -- though not the echo of your own typing, or its repaint
+after a resize. Each harness's rules recognise what activity alone cannot -- a
+spinner in the title, a permission prompt. `claude`, `codex`, `opencode` and
+`agy` have rules built in, adapted from
+[herdr](https://github.com/ogulcancelik/herdr)'s detection manifests. A
+harness's own TOML can carry its own:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+# Claude Code's permission prompt: the question, with a numbered yes under it.
+[[status.rules]]
+state = "blocked"
+region = "bottom:15"
+contains = ["do you want to proceed?"]
+regex = ['(?i)^\s*❯?\s*1\.\s*yes\b']
+priority = 990
+```
+
+- `state` is `working`, `idle` or `blocked`.
+- `region` is where to look: `title`, the title the program last set, spinner
+  and all; `progress`, its last `OSC 9;4` progress report, after the `9;`;
+  `bottom:N`, the last N non-blank lines of the screen; or `screen`, all of it.
+- `contains` must all appear, `any` at least one, and `not` none; all three
+  ignore case. `regex` must match some line of the region, and is
+  case-sensitive unless it says `(?i)`. A rule needs at least one of
+  `contains`, `any` or `regex`.
+- `priority` orders the rules, highest first, ties in file order, and the
+  first that matches decides. An `idle` rule does not outrank output still
+  arriving.
+
+A harness's own `[status]` replaces the built-ins for it rather than adding to
+them, so start from a copy of them in
+`crates/dispatch-config/src/status/builtin.rs`. `[status]` with `rules = []`
+means activity alone decides; with no `[status]` at all, the built-ins for its
+id apply, and a harness with none goes by activity alone. A rule with an
+unknown state or region, a regex that does not compile, or nothing to match on
+is logged and skipped, and the harness loads without it.
+
+## Motion
+
+Working panes spin, a pane that wants you pulses its row, focus eases from one
+border to the next, a new pane draws its border in and a closed one retracts
+it, and the active tab's tint slides across. To keep the screen still:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+motion = false   # default true
+```
+
+Every change then shows at once, a working pane shows a still play glyph, and
+nothing pulses; every state is still shown.
 
 ## Keeping projects
 
@@ -243,7 +429,8 @@ the number.
 
 The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
 from that pane for this daemon's lifetime, and `Esc` to defer. The status line
-reports how many are waiting and which key reopens them — that key is `^a a`.
+reports how many are waiting and which key reopens them — that key is `^a a`,
+or wherever `[keys]` has moved it.
 
 There are also keyboard bindings to open and close a subagent pane: `^a s` expands
 the focused pane's next child into the tiled grid, and `^a c` collapses it back out.

@@ -17,6 +17,10 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// A harness definition the test controls, written into a temporary config
 /// directory so the developer's own harnesses are neither used nor disturbed.
+///
+/// The built-in Shell now sorts first in the picker, so this one sorts first
+/// only among the harness files below it — it remains the harness the
+/// delegation tests delegate to, since it alone carries a `[task]` form.
 const SHELL_HARNESS: &str = r#"
 id = "aaashell"
 display_name = "Test Shell"
@@ -95,14 +99,23 @@ impl Fixture {
         std::fs::create_dir_all(&project).expect("temp dir is writable");
 
         // Dispatch writes its built-ins here on first run; adding one of our
-        // own proves a user-registered harness is picked up, and sorts first
-        // so `new pane` selects it.
+        // own proves a user-registered harness is picked up. It sorts first
+        // among the harness files, below the built-in Shell, and it remains
+        // the harness the delegation tests delegate to.
         let harnesses = config.path().join("harnesses");
         std::fs::create_dir_all(&harnesses).expect("temp dir is writable");
-        // The id must match the file stem, and sorting first is what makes
-        // "new pane" choose it over the built-ins.
+        // The id must match the file stem, and sorting first among the
+        // harness files is what makes "new pane" choose it over the others.
         std::fs::write(harnesses.join("aaashell.toml"), SHELL_HARNESS.trim())
             .expect("temp dir is writable");
+
+        // The built-in shell is offered first. Pinned to plain `sh` here, so
+        // no test runs the developer's own shell and its prompt.
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[shell]\ncommand = \"sh\"\nlogin = \"never\"\n",
+        )
+        .expect("temp dir is writable");
 
         Self { config, project }
     }
@@ -334,8 +347,9 @@ impl Harness {
 
     /// Opens the harness picker and chooses the test shell.
     ///
-    /// The picker lists harnesses by display name, and the test shell sorts
-    /// first, so Enter takes it.
+    /// The built-in Shell sorts first now, with the test shell right behind
+    /// it, so one `j` reaches the test shell: the harness the delegation
+    /// tests need, since only it carries a `[task]` form.
     fn spawn_shell(&mut self) {
         let before = self.shell_panes();
 
@@ -345,7 +359,7 @@ impl Harness {
             "the harness picker should open"
         );
 
-        self.send(b"\r");
+        self.send(b"j\r");
         assert!(
             self.wait_for(move |lines| panes_shown(lines) > before),
             "a pane should be listed after choosing a harness"
@@ -580,8 +594,8 @@ fn a_pane_is_told_the_size_of_the_rectangle_it_was_given() {
     app.send(b"stty size\r");
 
     // One pane fills the width left by the sidebar and the height left by the
-    // status row, less its own border.
-    let expected = reported_size(100 - dispatch_tui::sidebar::WIDTH, 30 - 1);
+    // top row and the status row, less its own border.
+    let expected = reported_size(100 - dispatch_tui::sidebar::WIDTH, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "the child should report {expected}"
@@ -602,7 +616,8 @@ fn a_second_pane_halves_the_width_of_the_first() {
     app.send(b"stty size\r");
 
     let full = 100 - dispatch_tui::sidebar::WIDTH;
-    let expected = reported_size(full / 2, 30 - 1);
+    // The top row and the status row both come off the height, as above.
+    let expected = reported_size(full / 2, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "with two panes the child should report {expected}"
@@ -622,7 +637,8 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let zoomed = reported_size(full, 30 - 1);
+    // The top row and the status row both come off the height, as above.
+    let zoomed = reported_size(full, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &zoomed)),
         "a zoomed pane should fill the grid and report {zoomed}"
@@ -630,7 +646,7 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let restored = reported_size(full / 2, 30 - 1);
+    let restored = reported_size(full / 2, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &restored)),
         "unzooming should restore the grid and report {restored}"
@@ -749,6 +765,35 @@ fn the_project_picker_lists_the_open_project() {
 }
 
 #[test]
+fn a_malformed_config_fails_the_start_before_anything_is_attached_to() {
+    // Read late, a bad `config.toml` was only noticed once a daemon had been
+    // started and every registered machine dialled, and they were left
+    // running behind the error. `--no-start` stands in for that here: the
+    // attach it asks for fails differently, so which error comes out says
+    // which step ran first.
+    let fixture = Fixture::new("badcfg");
+    std::fs::write(
+        fixture.config.path().join("config.toml"),
+        "[interface\nmotion = true\n",
+    )
+    .expect("temp dir is writable");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dispatch"))
+        .args(["--attach", "--no-start"])
+        .arg(&fixture.project)
+        .envs(fixture.env())
+        .output()
+        .expect("the dispatch binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("config.toml"),
+        "the configuration is what is reported: {stderr}"
+    );
+}
+
+#[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn the_harness_manager_reports_when_nothing_needs_adding() {
     // The temporary configuration has every built-in written already, so the
@@ -799,9 +844,9 @@ fn a_picker_takes_the_keyboard_while_it_is_open() {
 
 #[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
-fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
-    // Scrollback is only useful if new output does not yank the view away and
-    // typing brings it back, which is what every terminal does.
+fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output() {
+    // Scrollback is only useful if new output does not yank the view away
+    // and there is a plain way back, which in scroll mode is Esc.
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
@@ -814,16 +859,30 @@ fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
         "the newest output should be visible first"
     );
 
+    // The prefix route into scroll mode, which is what `^a [` became.
     app.send(b"\x01[");
     assert!(
-        app.wait_for(|lines| contains(lines, "scrolled back")),
-        "scrolling back should be announced"
+        app.wait_for(|lines| contains(lines, "SCROLL")),
+        "the prefix then [ opens scroll mode"
+    );
+
+    // Half a page back: the newest row is no longer on screen.
+    app.send(b"u");
+    assert!(
+        app.wait_for(|lines| !contains(lines, "row80")),
+        "the view moved back through the output"
+    );
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| contains(lines, "row80") && !contains(lines, "SCROLL")),
+        "Esc returns to the newest output"
     );
 
     app.send(b"echo back-at-the-bottom\r");
     assert!(
         app.wait_for(|lines| contains(lines, "back-at-the-bottom")),
-        "typing should return to the newest output"
+        "typing reaches the shell again"
     );
 }
 
@@ -1375,4 +1434,137 @@ fn a_machine_asleep_at_startup_joins_when_it_wakes() {
     drop(app);
     stop_recorded_daemon(&here);
     stop_recorded_daemon(&there);
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_picker_offers_the_users_shell_first() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01n");
+    assert!(
+        app.wait_for(|lines| contains(lines, "Shell · sh")),
+        "the user's shell is offered by name"
+    );
+
+    app.send(b"\r");
+    assert!(app.wait_for(|lines| panes_shown(lines) > 0));
+    app.send(b"echo from-the-users-shell\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "from-the-users-shell")),
+        "Enter started the shell, and it answers"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+
+    // Ctrl t, then n: the picker, for a pane on a new tab.
+    app.send(b"\x14n");
+    assert!(app.wait_for(|lines| contains(lines, "New pane")));
+    app.send(b"\r");
+
+    assert!(
+        app.wait_for(|lines| contains(lines, "tab 2/2")),
+        "the new pane is on a tab of its own"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+
+    app.send(b"seq -f 'line-%03g' 1 200\r");
+    assert!(app.wait_for(|lines| contains(lines, "line-200")));
+
+    // Ctrl s, then k thirty times: a line at a time, past a whole pane.
+    app.send(b"\x13");
+    app.send(&[b'k'; 30]);
+    assert!(
+        app.wait_for(|lines| contains(lines, "SCROLL") && !contains(lines, "line-200")),
+        "k scrolls the output back"
+    );
+
+    // g: the oldest output.
+    app.send(b"g");
+    assert!(
+        app.wait_for(|lines| contains(lines, "line-001")),
+        "g shows where the output began"
+    );
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| contains(lines, "line-200") && !contains(lines, "SCROLL")),
+        "Esc returns to live output"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn lock_mode_gives_the_shell_the_keys_dispatch_takes() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+    // Type-ahead into a shell that has not started yet can be lost.
+    assert!(
+        app.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    // `cat -v` shows a control key it is given as `^P`.
+    app.send(b"cat -v\r");
+
+    // Ctrl g locks.
+    app.send(b"\x07");
+    assert!(app.wait_for(|lines| contains(lines, "LOCKED")));
+
+    // Ctrl p, pane mode's key, is the shell's while locked. Ctrl p rather than
+    // Ctrl t: on macOS the terminal driver takes Ctrl t itself (it prints the
+    // load), so it would never reach `cat` and the test would prove nothing.
+    app.send(b"\x10\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "^P")),
+        "the shell was given Ctrl p"
+    );
+    let lines = app.lines();
+    assert!(contains(&lines, "LOCKED"), "still locked");
+    assert!(!contains(&lines, "PANE  "), "no pane mode while locked");
+
+    // Ctrl d ends `cat`; Ctrl g unlocks.
+    app.send(b"\x04\x07");
+    assert!(
+        app.wait_for(|lines| !contains(lines, "LOCKED")),
+        "Ctrl g unlocks"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_key_rebound_in_config_toml_is_the_one_dispatch_reads() {
+    let fixture = Fixture::new("rebind");
+    let config = fixture.config.path().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("the fixture wrote its config");
+    text.push_str("\n[keys.normal]\n\"Ctrl a\" = \"none\"\n\"Ctrl b\" = \"prefix\"\n");
+    std::fs::write(&config, text).expect("temp dir is writable");
+
+    let mut app = Harness::spawn(&fixture, Size::new(100, 30), &[]);
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    // Ctrl b, then n: the picker, through the moved prefix.
+    app.send(b"\x02");
+    assert!(app.wait_for(|lines| contains(lines, "PREFIX")));
+    app.send(b"n");
+    assert!(
+        app.wait_for(|lines| contains(lines, "New pane")),
+        "the new prefix reaches its commands"
+    );
+    app.send(b"\x1b");
 }

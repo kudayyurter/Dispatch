@@ -10,6 +10,7 @@
 //! each run their own emulator, so an emulator on its side would parse every
 //! byte a second time and hold a screen nothing ever reads.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -142,6 +143,89 @@ impl std::fmt::Debug for Pty {
     }
 }
 
+/// What every pane is told about the terminal it is in.
+///
+/// Dispatch draws each pane with its own emulator, not the terminal it was
+/// started from, so a program has to be told about this one: xterm's
+/// terminfo, which every machine a pane might SSH to has, and 24-bit colour,
+/// which the emulator draws.
+const PANE_TERMINAL: [(&str, &str); 3] = [
+    ("TERM", "xterm-256color"),
+    ("COLORTERM", "truecolor"),
+    ("TERM_PROGRAM", "dispatch"),
+];
+
+/// Variables naming the terminal Dispatch was started from, and any
+/// multiplexer it was started inside.
+///
+/// Left in, they send a program's kitty- or iTerm-only tricks through an
+/// emulator that is neither, or wrap its sequences for a tmux, screen or
+/// zellij that is not the one drawing it.
+const HOST_TERMINAL: [&str; 26] = [
+    "TERM_SESSION_ID",
+    "ITERM_SESSION_ID",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_LISTEN_ON",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    "VTE_VERSION",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+    "KITTY_INSTALLATION_DIR",
+    "WEZTERM_EXECUTABLE",
+];
+
+/// What `launch` is started with in a pane: the variables it is given, and
+/// those it must not have.
+///
+/// Dispatch's terminal first, then the harness's own `env` over it, so a
+/// harness can still set its own `TERM`. The host terminal's variables are
+/// taken out of what the child inherits, except any the harness sets
+/// itself, and so is everything the launch unsets, whatever would give it a
+/// value. Names are compared as the platform compares them: on Windows a
+/// harness's `Term` is `TERM`, and replaces Dispatch's rather than standing
+/// beside it for the spawn to choose between.
+fn pane_env(launch: &Launch) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let harness_sets = |name: &str| {
+        launch
+            .env
+            .keys()
+            .any(|key| dispatch_os::pty::same_variable(key, name))
+    };
+
+    let mut env: BTreeMap<String, String> = PANE_TERMINAL
+        .into_iter()
+        .chain([("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))])
+        .filter(|(key, _)| !harness_sets(key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    env.extend(launch.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    let remove = HOST_TERMINAL
+        .into_iter()
+        .filter(|key| !harness_sets(key))
+        .map(str::to_string)
+        .chain(launch.unset.iter().cloned())
+        .collect();
+
+    (env, remove)
+}
+
 impl Pty {
     /// Starts `launch` in a new pseudoterminal rooted at `cwd`.
     pub fn spawn(launch: &Launch, cwd: &Path, size: Size) -> Result<Self, PtyError> {
@@ -150,12 +234,13 @@ impl Pty {
         // place of the system's own.
         dispatch_os::dll::restrict_search_path();
 
+        let (env, env_remove) = pane_env(launch);
         let process = dispatch_os::pty::spawn(
             &dispatch_os::pty::PtyCommand {
                 program: &launch.command,
                 args: &launch.args,
-                env: &launch.env,
-                env_remove: &launch.unset,
+                env: &env,
+                env_remove: &env_remove,
                 cwd,
             },
             size.rows,
@@ -289,7 +374,13 @@ impl Pty {
         self.state
     }
 
-    /// The child's process id, until the pane is terminated.
+    /// The child's process id, as it was when the child was spawned, until
+    /// the pane is terminated.
+    ///
+    /// `None` once it has been, or where the platform did not report one.
+    /// Still returned after the child has exited, when the number may
+    /// already belong to some other process: check [`Pty::state`] before
+    /// looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -417,7 +508,13 @@ impl PtySession {
         self.pty.state()
     }
 
-    /// The child's process id, until the pane is terminated.
+    /// The child's process id, as it was when the child was spawned, until
+    /// the pane is terminated.
+    ///
+    /// `None` once it has been, or where the platform did not report one.
+    /// Still returned after the child has exited, when the number may
+    /// already belong to some other process: check [`PtySession::state`]
+    /// before looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pty.pid()

@@ -723,3 +723,124 @@ fn a_dropped_pane_lets_go_of_a_terminal_something_else_still_holds() {
         "the pane's side of the terminal was still open after the pane was dropped"
     );
 }
+
+#[test]
+fn a_pane_is_told_about_dispatchs_terminal_not_the_one_outside() {
+    // Dispatch draws the pane with its own emulator. A program told it is in
+    // kitty would send kitty's private sequences through, and over SSH a
+    // remote side without that terminfo mis-draws.
+    let inherited = [
+        ("TERM", "xterm-kitty"),
+        ("KITTY_WINDOW_ID", "7"),
+        ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
+        // A multiplexer outside counts too: a program that sees `TMUX` wraps
+        // its sequences for a tmux that is not the one drawing it.
+        ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+    ]
+    .map(|(key, value)| (key.into(), value.into()));
+
+    let (env, remove) = pane_env(&shell("true"));
+    // The environment both spawns build from these: what is inherited, the
+    // variables set on top, and the removals taken out last.
+    let child = dispatch_os::pty::WindowsEnvironment::new(inherited, &env, &remove);
+
+    assert_eq!(
+        child.get("TERM"),
+        Some(std::ffi::OsStr::new("xterm-256color"))
+    );
+    assert_eq!(
+        child.get("COLORTERM"),
+        Some(std::ffi::OsStr::new("truecolor"))
+    );
+    assert_eq!(
+        child.get("TERM_PROGRAM"),
+        Some(std::ffi::OsStr::new("dispatch"))
+    );
+    assert_eq!(
+        child.get("TERM_PROGRAM_VERSION"),
+        Some(std::ffi::OsStr::new(env!("CARGO_PKG_VERSION")))
+    );
+    assert_eq!(child.get("KITTY_WINDOW_ID"), None);
+    assert_eq!(child.get("GHOSTTY_RESOURCES_DIR"), None);
+    assert_eq!(child.get("TMUX"), None);
+}
+
+#[test]
+fn a_harnesss_spelling_of_a_pane_variable_is_the_one_its_pane_gets() {
+    // On Windows `Term` and `TERM` are one variable, so the harness's
+    // spelling replaces Dispatch's rather than sitting beside it for the
+    // spawn to choose between, and a host variable it sets itself, however
+    // spelled, is kept. Elsewhere they are different variables.
+    let mut launch = shell("true");
+    launch.env.insert("Term".into(), "vt100".into());
+    launch.env.insert("Tmux".into(), "the harness's".into());
+
+    let (env, remove) = pane_env(&launch);
+    let terms: Vec<&str> = env
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("TERM"))
+        .map(String::as_str)
+        .collect();
+
+    if cfg!(windows) {
+        assert_eq!(terms, ["Term"], "one variable, the harness's");
+        assert!(!remove.contains("TMUX"), "the harness sets it: {remove:?}");
+    } else {
+        assert_eq!(terms, ["TERM", "Term"], "two variables");
+        assert!(remove.contains("TMUX"), "{remove:?}");
+    }
+}
+
+#[test]
+fn a_variable_the_launch_unsets_stays_unset_in_a_pane() {
+    // Whoever starts the launch decides what it must not have, and that
+    // outranks what Dispatch tells every pane.
+    let mut launch = shell("true");
+    launch.unset.insert("TERM_PROGRAM".into());
+    launch.unset.insert("DISPATCH_TASK_FILE".into());
+
+    let (env, remove) = pane_env(&launch);
+    let child = dispatch_os::pty::WindowsEnvironment::new(
+        [("DISPATCH_TASK_FILE".into(), "stale".into())],
+        &env,
+        &remove,
+    );
+
+    assert_eq!(child.get("TERM_PROGRAM"), None);
+    assert_eq!(child.get("DISPATCH_TASK_FILE"), None);
+    assert_eq!(
+        child.get("TERM"),
+        Some(std::ffi::OsStr::new("xterm-256color"))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_child_sees_dispatchs_terminal() {
+    let mut session = PtySession::spawn(
+        &shell("echo T=$TERM C=$COLORTERM P=$TERM_PROGRAM"),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+
+    assert!(wait_until(&mut session, TIMEOUT, |session| {
+        visible(session)
+            .iter()
+            .any(|line| line.contains("T=xterm-256color C=truecolor P=dispatch"))
+    }));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_harnesss_own_environment_still_wins() {
+    let mut launch = shell("echo T=$TERM");
+    launch.env.insert("TERM".into(), "vt100".into());
+
+    let mut session =
+        PtySession::spawn(&launch, &cwd(), Size::new(80, 24)).expect("the shell starts");
+
+    assert!(wait_until(&mut session, TIMEOUT, |session| {
+        visible(session).iter().any(|line| line.contains("T=vt100"))
+    }));
+}

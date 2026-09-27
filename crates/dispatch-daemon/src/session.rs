@@ -8,11 +8,14 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
-use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
+use dispatch_core::{
+    PaneId, PaneStatus, Placement, Project, ProjectId, ProjectSource, ProjectTabs, RequestId,
+    TabError, TabId,
+};
 use dispatch_os::ipc::{Closer, Connection, Listener};
 use dispatch_proto::{
-    ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProtocolError, Role,
-    ServerMessage,
+    ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProjectUpdate, ProtocolError,
+    Role, ServerMessage,
 };
 use dispatch_pty::{Pty, RunState, Size};
 
@@ -250,6 +253,10 @@ pub struct Daemon {
     clients: HashMap<ClientId, Client>,
     harnesses: HarnessRegistry,
     projects: HashMap<ProjectId, Project>,
+    /// Each project's tabs. Kept here because the panes are: every client
+    /// attached to this machine sees one arrangement, and it outlives any of
+    /// them.
+    tabs: HashMap<ProjectId, ProjectTabs>,
     events: Receiver<Event>,
     sender: SyncSender<Event>,
     device: String,
@@ -270,6 +277,11 @@ pub struct Daemon {
     leftovers_tried: Instant,
     /// The task directory's lock, while this daemon holds it.
     task_dir_lock: Option<std::fs::File>,
+    /// When branches were last looked at.
+    branches_checked: Option<Instant>,
+    /// How often they are looked at: [`dispatch_os::git::RECHECK`], or every
+    /// tick in a test that cannot wait two seconds per step.
+    branch_every: Duration,
 }
 
 impl Daemon {
@@ -294,6 +306,7 @@ impl Daemon {
             clients: HashMap::new(),
             harnesses,
             projects: HashMap::new(),
+            tabs: HashMap::new(),
             events,
             sender,
             device: device.into(),
@@ -306,6 +319,8 @@ impl Daemon {
             leftovers: Leftovers::default(),
             leftovers_tried: Instant::now(),
             task_dir_lock: None,
+            branches_checked: None,
+            branch_every: dispatch_os::git::RECHECK,
         }
     }
 
@@ -352,9 +367,11 @@ impl Daemon {
             ProjectSource::LocalDir
         };
 
-        let project = Project::new(root, source);
+        let branch = dispatch_os::git::head(&root);
+        let project = Project::new(root, source).with_branch(branch);
         let id = project.id;
         self.projects.insert(id, project);
+        self.tabs.insert(id, ProjectTabs::new());
         id
     }
 
@@ -605,6 +622,18 @@ impl Daemon {
                         durable: pane.durable,
                     });
 
+                    // Not part of `PaneSpawned`, so said straight after it:
+                    // a client attaching now should not have to wait for the
+                    // pane to move before it can be grouped.
+                    if let Some(branch) = &pane.branch {
+                        existing.push(ServerMessage::PaneChanged {
+                            pane: pane.id,
+                            update: PaneUpdate::Branch {
+                                branch: Some(branch.clone()),
+                            },
+                        });
+                    }
+
                     // What the pane has printed, so a client that reattaches
                     // sees the work rather than a blank rectangle.
                     if !pane.history.is_empty() {
@@ -624,6 +653,17 @@ impl Daemon {
                             },
                         });
                     }
+                }
+
+                // Every project's tabs, empty ones included: a client that
+                // hears none from a daemon takes it for one too old to keep
+                // them. After the panes, so every pane a snapshot names is one
+                // the client has already been told about.
+                for (project, tabs) in &self.tabs {
+                    existing.push(ServerMessage::Tabs {
+                        project: *project,
+                        tabs: tabs.tabs().to_vec(),
+                    });
                 }
 
                 // A request already put to the user is put to this client too,
@@ -651,7 +691,8 @@ impl Daemon {
                 project,
                 harness,
                 size,
-            } => self.spawn_pane(id, project, &harness, Size::new(size.0, size.1)),
+                place,
+            } => self.spawn_pane(id, project, &harness, Size::new(size.0, size.1), place),
 
             ClientMessage::WritePane { pane, bytes } => {
                 let Some(target) = self.panes.get_mut(&pane) else {
@@ -701,27 +742,7 @@ impl Daemon {
                 }
             }
 
-            ClientMessage::ClosePane { pane } => {
-                if let Some(mut target) = self.panes.remove(&pane) {
-                    // The pane is being killed, not allowed to finish; its
-                    // caller, if it has one, is answered here or not at all.
-                    self.answer_for_a_closed_subagent(&mut target);
-                    target.session.terminate();
-                    // A pane that is gone can be asked for nothing more, so its
-                    // blanket approval goes with it.
-                    self.blanket.remove(&pane);
-                    self.broadcast(ServerMessage::PaneClosed { pane });
-                    self.refuse_requests_from(pane);
-                    self.drop_children_of(pane);
-                } else {
-                    self.send(
-                        id,
-                        ServerMessage::Error {
-                            error: ProtocolError::NoSuchPane(pane),
-                        },
-                    );
-                }
-            }
+            ClientMessage::ClosePane { pane } => self.close_pane(id, pane),
 
             ClientMessage::Ping { token } => self.send(id, ServerMessage::Pong { token }),
 
@@ -760,6 +781,15 @@ impl Daemon {
                     waiting.caller,
                     blanket,
                 );
+            }
+
+            ClientMessage::MovePane { pane, to } => self.move_pane(id, pane, to),
+            ClientMessage::RenameTab { tab, name } => {
+                self.change_tab(id, tab, |tabs| tabs.rename(tab, &name));
+            }
+            ClientMessage::CloseTab { tab } => self.close_tab(id, tab),
+            ClientMessage::MoveTab { tab, index } => {
+                self.change_tab(id, tab, |tabs| tabs.move_tab(tab, index));
             }
 
             ClientMessage::Unknown => {
@@ -821,6 +851,11 @@ impl Daemon {
         // Every client hears about it: they are looking at the same fleet, and
         // a project one of them opened is one they can all spawn into.
         self.broadcast(ServerMessage::ProjectOpened { project });
+
+        // Its tabs too, empty as they are: a client reads a project with no
+        // tabs as one on a daemon too old to keep them, and would refuse every
+        // tab command until something else changed this project's tabs.
+        self.broadcast_tabs(id);
     }
 
     /// Forgets a project, once nothing is running in it.
@@ -854,6 +889,7 @@ impl Daemon {
         }
 
         self.projects.remove(&project);
+        self.tabs.remove(&project);
         tracing::info!(project = %project, "project closed");
 
         // Every client hears about it, as they do when one is opened: they are
@@ -861,7 +897,14 @@ impl Daemon {
         self.broadcast(ServerMessage::ProjectClosed { project });
     }
 
-    fn spawn_pane(&mut self, client: ClientId, project: ProjectId, harness: &str, size: Size) {
+    fn spawn_pane(
+        &mut self,
+        client: ClientId,
+        project: ProjectId,
+        harness: &str,
+        size: Size,
+        place: Placement,
+    ) {
         let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
             self.send(
                 client,
@@ -912,6 +955,7 @@ impl Daemon {
             caller: None,
             exited_at: None,
             task_file: None,
+            branch: None,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -932,6 +976,132 @@ impl Daemon {
             parent: None,
             durable,
         });
+
+        // After the announcement, so a snapshot never names a pane a client
+        // has not heard of.
+        self.tabs.entry(project).or_default().place(id, place);
+        self.broadcast_tabs(project);
+    }
+
+    /// Tells every client what `project`'s tabs are now.
+    fn broadcast_tabs(&mut self, project: ProjectId) {
+        let tabs = self
+            .tabs
+            .get(&project)
+            .map(|tabs| tabs.tabs().to_vec())
+            .unwrap_or_default();
+        self.broadcast(ServerMessage::Tabs { project, tabs });
+    }
+
+    /// Tells one client why what it asked for was not done.
+    fn decline(&mut self, client: ClientId, reason: impl Into<String>) {
+        self.send(
+            client,
+            ServerMessage::Error {
+                error: ProtocolError::Other(reason.into()),
+            },
+        );
+    }
+
+    /// Closes a pane and terminates its process tree.
+    fn close_pane(&mut self, client: ClientId, pane: PaneId) {
+        let Some(mut target) = self.panes.remove(&pane) else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+        let project = target.project;
+
+        // Shared by `ClosePane` and `CloseTab`: closing a tab closes each of
+        // its panes exactly as closing that pane alone does.
+        //
+        // The pane is being killed, not allowed to finish; its caller, if it
+        // has one, is answered here or not at all.
+        self.answer_for_a_closed_subagent(&mut target);
+        target.session.terminate();
+        // A pane that is gone can be asked for nothing more, so its blanket
+        // approval goes with it.
+        self.blanket.remove(&pane);
+        self.broadcast(ServerMessage::PaneClosed { pane });
+        self.refuse_requests_from(pane);
+        self.drop_children_of(pane);
+
+        // Its place on a tab goes with it.
+        if self
+            .tabs
+            .get_mut(&project)
+            .is_some_and(|tabs| tabs.remove(pane))
+        {
+            self.broadcast_tabs(project);
+        }
+    }
+
+    /// Moves a top-level pane between its project's tabs.
+    fn move_pane(&mut self, client: ClientId, pane: PaneId, to: Placement) {
+        let Some((project, subagent)) = self
+            .panes
+            .get(&pane)
+            .map(|target| (target.project, target.parent.is_some()))
+        else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+        // A subagent is tiled beside the pane that asked for it, wherever
+        // that pane is, so it has no tab of its own to move between.
+        if subagent {
+            self.decline(client, "a subagent stays beside the pane that asked for it");
+            return;
+        }
+
+        match self.tabs.entry(project).or_default().move_pane(pane, to) {
+            Ok(_) => self.broadcast_tabs(project),
+            Err(error) => self.decline(client, error.to_string()),
+        }
+    }
+
+    /// Makes `change` to whichever project's tabs hold `tab`, telling every
+    /// client the result, or the asker why not.
+    fn change_tab(
+        &mut self,
+        client: ClientId,
+        tab: TabId,
+        change: impl FnOnce(&mut ProjectTabs) -> Result<(), TabError>,
+    ) {
+        let Some((project, tabs)) = self
+            .tabs
+            .iter_mut()
+            .find(|(_, tabs)| tabs.position(tab).is_some())
+        else {
+            self.decline(client, TabError::NoSuchTab.to_string());
+            return;
+        };
+
+        let project = *project;
+        match change(tabs) {
+            Ok(()) => self.broadcast_tabs(project),
+            Err(error) => self.decline(client, error.to_string()),
+        }
+    }
+
+    /// Closes every pane on a tab. The tab goes with its last pane.
+    fn close_tab(&mut self, client: ClientId, tab: TabId) {
+        let Some(members) = self.tabs.values().find_map(|tabs| tabs.members(tab).ok()) else {
+            self.decline(client, TabError::NoSuchTab.to_string());
+            return;
+        };
+
+        for pane in members {
+            self.close_pane(client, pane);
+        }
     }
 
     /// The environment a pane needs to talk back to this daemon.
@@ -1286,6 +1456,7 @@ impl Daemon {
                 caller: Some(caller),
                 exited_at: None,
                 task_file,
+                branch: None,
             },
         );
 
@@ -1529,11 +1700,11 @@ impl Daemon {
                 pane.exited_at = Some(Instant::now());
                 // Read by now, and nothing will read it again.
                 pane.task_file = None;
-                exited.push((*id, code));
+                exited.push((*id, pane.project, code));
             }
         }
 
-        for (id, code) in &exited {
+        for (id, _, code) in &exited {
             // The pane stays until a client closes it, so its final output can
             // still be read.
             messages.push(ServerMessage::PaneChanged {
@@ -1546,6 +1717,23 @@ impl Daemon {
 
         for message in messages {
             self.broadcast(message);
+        }
+
+        // An exited pane gives its place on a tab back. Its output stays
+        // readable from the sidebar until someone closes it.
+        let mut changed: Vec<ProjectId> = Vec::new();
+        for (id, project, _) in &exited {
+            if self
+                .tabs
+                .get_mut(project)
+                .is_some_and(|tabs| tabs.remove(*id))
+                && !changed.contains(project)
+            {
+                changed.push(*project);
+            }
+        }
+        for project in changed {
+            self.broadcast_tabs(project);
         }
 
         // A subagent's caller is waiting on exactly this. Not answered on the
@@ -1591,6 +1779,63 @@ impl Daemon {
         if !self.leftovers.is_empty() && self.leftovers_tried.elapsed() >= RETRY_LEFTOVERS {
             self.leftovers_tried = Instant::now();
             self.leftovers.retry();
+        }
+
+        self.refresh_branches();
+    }
+
+    /// Looks again at which branch every live pane and every project is on,
+    /// at most every `branch_every`, and tells clients about what moved.
+    ///
+    /// A pane whose directory cannot be read keeps the branch it had: that is
+    /// a process between exiting and being reaped, or one this user may not
+    /// look into, and neither has moved anywhere.
+    fn refresh_branches(&mut self) {
+        if self
+            .branches_checked
+            .is_some_and(|checked| checked.elapsed() < self.branch_every)
+        {
+            return;
+        }
+        self.branches_checked = Some(Instant::now());
+
+        let mut messages = Vec::new();
+
+        for (id, pane) in &mut self.panes {
+            if !pane.status.is_live() {
+                continue;
+            }
+            let Some(dir) = pane
+                .session
+                .pid()
+                .and_then(dispatch_os::process::working_dir)
+            else {
+                continue;
+            };
+
+            let branch = dispatch_os::git::head(&dir);
+            if branch != pane.branch {
+                pane.branch.clone_from(&branch);
+                messages.push(ServerMessage::PaneChanged {
+                    pane: *id,
+                    update: PaneUpdate::Branch { branch },
+                });
+            }
+        }
+
+        for project in self.projects.values_mut() {
+            let branch = dispatch_os::git::head(&project.root);
+            if branch != project.branch {
+                project.branch.clone_from(&branch);
+                messages.push(ServerMessage::ProjectChanged {
+                    project: project.id,
+                    update: ProjectUpdate::Branch { branch },
+                });
+            }
+        }
+
+        for message in messages {
+            self.broadcast(message);
         }
     }
 
