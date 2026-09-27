@@ -96,6 +96,18 @@ pub enum Action {
     /// Move focus left or right, going on to the neighbouring tab at the
     /// grid's edge.
     FocusOrTab(Direction),
+    /// Focus the next pane on the tab on screen, wrapping.
+    FocusNext,
+    /// Scroll the focused pane by half its height this many times; negative
+    /// towards older output.
+    ScrollHalfPages(isize),
+    /// Scroll the focused pane by its whole height this many times; negative
+    /// towards older output.
+    ScrollPages(isize),
+    /// Show the oldest output the focused pane still holds.
+    ScrollToTop,
+    /// Return the focused pane to its newest output.
+    ScrollToBottom,
     /// Enter scrollback mode.
     Scrollback,
     /// Reopen the approval prompt for whatever delegation requests are queued.

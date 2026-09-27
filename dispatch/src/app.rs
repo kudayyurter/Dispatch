@@ -2422,6 +2422,12 @@ impl App {
             Action::MoveTabLeft => self.move_current_tab(-1),
             Action::MoveTabRight => self.move_current_tab(1),
             Action::FocusOrTab(direction) => self.focus_or_tab(direction),
+            // Wired to the app's scrolling and focus in the next change.
+            Action::FocusNext
+            | Action::ScrollHalfPages(_)
+            | Action::ScrollPages(_)
+            | Action::ScrollToTop
+            | Action::ScrollToBottom => {}
         }
 
         Ok(())
