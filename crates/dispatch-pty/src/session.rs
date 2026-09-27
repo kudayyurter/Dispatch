@@ -13,9 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use dispatch_config::Launch;
@@ -32,12 +32,21 @@ use crate::vt::{Size, VtError, VtTerminal};
 /// paste bigger than the budget still reaches a pane that reads it.
 pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
 
-/// How many reads of output may wait between the reader thread and `drain`.
+/// How much output may wait between the reader thread and `drain`.
 ///
-/// Full, the reader stops reading, the pseudoterminal's own buffer fills,
+/// Past it, the reader stops reading, the pseudoterminal's own buffer fills,
 /// and the child blocks on its next write: a pane that prints faster than it
-/// is drawn is slowed down, not held in memory.
-const OUTPUT_CHUNKS: usize = 32;
+/// is drawn is slowed down, not held in memory. Counted in bytes rather than
+/// reads, so a program that writes a line at a time is drained as fast as one
+/// that writes in blocks.
+const OUTPUT_BUDGET: usize = 256 * 1024;
+
+/// What one read costs beyond its bytes: its `Vec` and its place in the
+/// channel.
+///
+/// Charged against [`OUTPUT_BUDGET`] with every read, so a flood of one-byte
+/// reads is held to the budget too.
+const READ_OVERHEAD: usize = 64;
 
 /// The most output one [`Pty::drain`] hands over, give or take the read that
 /// crosses it.
@@ -90,6 +99,77 @@ enum PtyEvent {
     Exited(i32),
 }
 
+/// Output that has been read and not yet drained, weighed in bytes plus
+/// [`READ_OVERHEAD`] per read.
+///
+/// The reader counts a read in the same critical section it sends it in,
+/// and a drain counts what it took under the same lock. So a drain can never
+/// take bytes that were not counted yet, and leave the count too high for
+/// good.
+#[derive(Default)]
+struct Backlog {
+    state: Mutex<Waiting>,
+    room: Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    weight: usize,
+    /// Nothing will drain again: the pane has gone.
+    closed: bool,
+}
+
+impl Backlog {
+    /// Sends `bytes` on and counts them as waiting, then waits while more
+    /// than `budget` is. Returns whether anything still drains.
+    fn send(&self, tx: &Sender<PtyEvent>, bytes: Vec<u8>, budget: usize) -> bool {
+        let mut waiting = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let weight = bytes.len() + READ_OVERHEAD;
+        if waiting.closed || tx.send(PtyEvent::Output(bytes)).is_err() {
+            return false;
+        }
+        waiting.weight += weight;
+        while waiting.weight > budget && !waiting.closed {
+            waiting = self.room.wait(waiting).unwrap_or_else(|e| e.into_inner());
+        }
+        !waiting.closed
+    }
+
+    /// Counts what one drain took as gone, and wakes a reader waiting for
+    /// room.
+    fn drained(&self, drained: &Drained) {
+        if drained.reads == 0 {
+            return;
+        }
+        let mut waiting = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let weight = drained.output.len() + drained.reads * READ_OVERHEAD;
+        waiting.weight = waiting.weight.saturating_sub(weight);
+        self.room.notify_all();
+    }
+
+    /// Counts one read of `len` bytes as gone, for a caller that takes
+    /// events one at a time rather than through [`drain_from`].
+    fn took(&self, len: usize) {
+        let mut waiting = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.weight = waiting.weight.saturating_sub(len + READ_OVERHEAD);
+        self.room.notify_all();
+    }
+
+    /// Nothing drains any more. A reader waiting for room is woken, and
+    /// never waits again.
+    fn close(&self) {
+        let mut waiting = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.closed = true;
+        self.room.notify_all();
+    }
+
+    /// How much is waiting now, weighed as the budget weighs it. For tests.
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).weight
+    }
+}
+
 /// Whether a pane's process is still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -112,9 +192,11 @@ pub struct Pty {
     input: Sender<Vec<u8>>,
     /// How many bytes are queued and not yet written.
     waiting: Arc<AtomicUsize>,
-    /// Bounded so a pane printing faster than it is drained is slowed rather
-    /// than stored: see [`OUTPUT_CHUNKS`].
+    /// What the reader and the waiter report, bounded by `backlog` so a pane
+    /// printing faster than it is drained is slowed rather than stored.
     events: Receiver<PtyEvent>,
+    /// How much of `events` is output not yet drained.
+    backlog: Arc<Backlog>,
     size: Size,
     /// Process id of the child, used to terminate its whole tree, and
     /// taken when it does.
@@ -255,14 +337,16 @@ impl Pty {
         let waiting = Arc::new(AtomicUsize::new(0));
         spawn_writer(process.writer, queued, Arc::clone(&waiting));
 
-        let (tx, events) = sync_channel(OUTPUT_CHUNKS);
-        spawn_reader(process.reader, tx.clone());
+        let (tx, events) = channel();
+        let backlog = Arc::new(Backlog::default());
+        spawn_reader(process.reader, tx.clone(), Arc::clone(&backlog));
         spawn_waiter(process.child, tx);
 
         Ok(Self {
             input,
             waiting,
             events,
+            backlog,
             size,
             pid: process.pid,
             state: RunState::Running,
@@ -277,6 +361,7 @@ impl Pty {
     /// What is left waits for the next call.
     pub fn drain(&mut self) -> Vec<u8> {
         let drained = drain_from(&self.events, DRAIN_BUDGET);
+        self.backlog.drained(&drained);
         if let Some(code) = drained.exited {
             self.state = RunState::Exited(code);
         }
@@ -307,7 +392,10 @@ impl Pty {
 
         while std::time::Instant::now() < deadline {
             match self.events.recv_timeout(Duration::from_millis(20)) {
-                Ok(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
+                Ok(PtyEvent::Output(bytes)) => {
+                    self.backlog.took(bytes.len());
+                    output.extend_from_slice(&bytes);
+                }
                 Ok(PtyEvent::Exited(code)) => {
                     self.state = RunState::Exited(code);
                     // Keep draining briefly: output already in flight should
@@ -315,6 +403,7 @@ impl Pty {
                     while let Ok(PtyEvent::Output(bytes)) =
                         self.events.recv_timeout(Duration::from_millis(50))
                     {
+                        self.backlog.took(bytes.len());
                         output.extend_from_slice(&bytes);
                     }
                     return (self.state, output);
@@ -415,6 +504,10 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        // Nothing drains from here on; a reader waiting for room must not
+        // wait for good.
+        self.backlog.close();
+
         // Whether or not the child is still running. One that exited on its
         // own may have left something running, which this ends as closing
         // the pane would. And on Windows its tree is recorded until it is
@@ -536,6 +629,8 @@ impl PtySession {
 struct Drained {
     /// The output taken.
     output: Vec<u8>,
+    /// How many reads `output` was made of.
+    reads: usize,
     /// The exit status, when the exit was among the events taken.
     exited: Option<i32>,
     /// Whether the channel was found closed: nothing more will ever arrive.
@@ -551,13 +646,17 @@ struct Drained {
 fn drain_from(events: &Receiver<PtyEvent>, budget: usize) -> Drained {
     let mut drained = Drained {
         output: Vec::new(),
+        reads: 0,
         exited: None,
         finished: false,
     };
 
     while drained.output.len() < budget {
         match events.try_recv() {
-            Ok(PtyEvent::Output(bytes)) => drained.output.extend_from_slice(&bytes),
+            Ok(PtyEvent::Output(bytes)) => {
+                drained.reads += 1;
+                drained.output.extend_from_slice(&bytes);
+            }
             Ok(PtyEvent::Exited(code)) => drained.exited = Some(code),
             Err(TryRecvError::Empty) => break,
             // Both senders are gone, which happens only once the reader has
@@ -581,7 +680,13 @@ fn drain_from(events: &Receiver<PtyEvent>, budget: usize) -> Drained {
 /// close waiting forever. On Unix it stops, letting go of its end of the
 /// terminal: reading on would keep that end open for as long as something
 /// that outlived the pane still holds the other.
-fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
+///
+/// Waits whenever more than [`OUTPUT_BUDGET`] is waiting to be drained.
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    tx: Sender<PtyEvent>,
+    backlog: Arc<Backlog>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Large enough that a burst of output is a few reads rather than
         // hundreds, small enough not to sit idle holding memory per pane.
@@ -592,7 +697,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if delivering && tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                    if delivering && !backlog.send(&tx, buf[..n].to_vec(), OUTPUT_BUDGET) {
                         if !dispatch_os::pty::OUTPUT_OUTLIVES_ITS_READER {
                             break;
                         }
@@ -603,7 +708,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
                 Err(_) => break,
             }
         }
-    });
+    })
 }
 
 /// Writes queued input to the pseudoterminal, in order, until the pane goes.
@@ -630,7 +735,7 @@ fn spawn_writer(
 }
 
 /// Waits for the child and reports its exit status.
-fn spawn_waiter(child: dispatch_os::pty::Child, tx: SyncSender<PtyEvent>) {
+fn spawn_waiter(child: dispatch_os::pty::Child, tx: Sender<PtyEvent>) {
     std::thread::spawn(move || {
         let _ = tx.send(PtyEvent::Exited(child.wait()));
     });

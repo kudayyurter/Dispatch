@@ -527,12 +527,12 @@ fn a_drain_stops_at_its_budget_and_the_next_takes_the_rest() {
     const CHUNK: usize = 5000;
     const CHUNKS: usize = 30;
 
-    let (tx, events) = sync_channel(OUTPUT_CHUNKS);
+    let (tx, events) = channel();
     let mut sent = Vec::new();
     for i in 0..CHUNKS {
         let chunk = vec![u8::try_from(i).expect("few chunks"); CHUNK];
         sent.extend_from_slice(&chunk);
-        tx.try_send(PtyEvent::Output(chunk))
+        tx.send(PtyEvent::Output(chunk))
             .expect("the channel has room for every chunk");
     }
     assert!(
@@ -843,4 +843,170 @@ fn a_harnesss_own_environment_still_wins() {
     assert!(wait_until(&mut session, TIMEOUT, |session| {
         visible(session).iter().any(|line| line.contains("T=vt100"))
     }));
+}
+
+/// A reader that hands out `left` reads of `size` bytes each, then ends.
+struct Reads {
+    left: usize,
+    size: usize,
+}
+
+impl Read for Reads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        self.left -= 1;
+        let n = self.size.min(buf.len());
+        buf[..n].fill(b'x');
+        Ok(n)
+    }
+}
+
+/// Waits until `done` holds, or fails the test after five seconds.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_program_writing_a_line_at_a_time_is_not_held_to_a_few_lines_a_drain() {
+    // A line is a small read. Counting reads rather than bytes let 32
+    // through per drain, about 180 KB/s at the daemon's tick.
+    const READS: usize = 1000;
+    const LINE: usize = 50;
+
+    let (tx, events) = channel();
+    let backlog = Arc::new(Backlog::default());
+    let reader = spawn_reader(
+        Box::new(Reads {
+            left: READS,
+            size: LINE,
+        }),
+        tx,
+        Arc::clone(&backlog),
+    );
+
+    eventually("the reader stopped before anything drained it", || {
+        reader.is_finished()
+    });
+    let drained = drain_from(&events, DRAIN_BUDGET);
+    assert_eq!(
+        drained.output.len(),
+        READS * LINE,
+        "one drain takes every line"
+    );
+}
+
+#[test]
+fn a_reader_waits_once_the_budget_is_waiting_and_goes_on_after_a_drain() {
+    const READ: usize = 8192;
+    let reads = 4 * OUTPUT_BUDGET / READ;
+
+    let (tx, events) = channel();
+    let backlog = Arc::new(Backlog::default());
+    let reader = spawn_reader(
+        Box::new(Reads {
+            left: reads,
+            size: READ,
+        }),
+        tx,
+        Arc::clone(&backlog),
+    );
+
+    eventually("the reader never filled the budget", || {
+        backlog.waiting() > OUTPUT_BUDGET
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!reader.is_finished(), "the reader waits for room");
+    assert!(
+        backlog.waiting() <= OUTPUT_BUDGET + READ + READ_OVERHEAD,
+        "it stopped just past the budget, at {}",
+        backlog.waiting()
+    );
+
+    let mut received = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while received < reads * READ {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {received} arrived"
+        );
+        let drained = drain_from(&events, DRAIN_BUDGET);
+        backlog.drained(&drained);
+        received += drained.output.len();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    eventually("the reader never finished", || reader.is_finished());
+}
+
+#[test]
+fn a_flood_of_tiny_reads_is_held_to_the_budget_too() {
+    // A spinner writing a byte at a time costs more per read than its one
+    // byte: each read is a Vec and a place in the channel. Charged only its
+    // bytes, a flood of them would pile up far past what the budget means.
+    let (tx, events) = channel();
+    let backlog = Arc::new(Backlog::default());
+    let reader = spawn_reader(
+        Box::new(Reads {
+            left: 1_000_000,
+            size: 1,
+        }),
+        tx,
+        Arc::clone(&backlog),
+    );
+
+    eventually("the reader never filled the budget", || {
+        backlog.waiting() > OUTPUT_BUDGET
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let queued = events.try_iter().count();
+    assert!(
+        queued <= OUTPUT_BUDGET / (1 + READ_OVERHEAD) + 1,
+        "{queued} one-byte reads were queued"
+    );
+    drop(events);
+    backlog.close();
+    eventually("the reader never let go", || reader.is_finished());
+}
+
+#[test]
+fn a_reader_waiting_for_room_lets_go_once_nothing_drains() {
+    // A pane dropped while its reader waits for room must not leave the
+    // reader waiting for a drain that will never come.
+    let (tx, events) = channel();
+    let backlog = Arc::new(Backlog::default());
+    let reader = spawn_reader(
+        Box::new(Reads {
+            left: 4 * OUTPUT_BUDGET / 8192,
+            size: 8192,
+        }),
+        tx,
+        Arc::clone(&backlog),
+    );
+
+    eventually("the reader never filled the budget", || {
+        backlog.waiting() > OUTPUT_BUDGET
+    });
+    drop(events);
+    backlog.close();
+
+    eventually("the reader kept waiting after the pane went", || {
+        reader.is_finished()
+    });
+}
+
+#[test]
+fn an_exit_sent_after_output_is_taken_with_it() {
+    let (tx, events) = channel();
+    tx.send(PtyEvent::Output(b"last words".to_vec()))
+        .expect("the channel is open");
+    tx.send(PtyEvent::Exited(3)).expect("the channel is open");
+
+    let drained = drain_from(&events, DRAIN_BUDGET);
+    assert_eq!(drained.output, b"last words");
+    assert_eq!(drained.exited, Some(3));
 }
