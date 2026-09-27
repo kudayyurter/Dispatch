@@ -350,6 +350,22 @@ mod imp {
 
     use crate::process::{KILL_TIMEOUT, ProcessError, signal_group, wait_for_group_to_exit};
 
+    /// How long `wait_exit` waits before asking again about a leader that
+    /// has only stopped, not exited. Doubles each time, up to
+    /// [`STOPPED_POLL_MAX`]: a fixed rate would poll a Ctrl-Z'd program at
+    /// 100 Hz for as long as it stayed stopped, which can be days.
+    pub(super) const STOPPED_POLL_FIRST: Duration = Duration::from_millis(10);
+
+    /// The longest `wait_exit` waits between asking again about a stopped
+    /// leader.
+    pub(super) const STOPPED_POLL_MAX: Duration = Duration::from_secs(1);
+
+    /// The next wait after `current`, doubled and capped at
+    /// [`STOPPED_POLL_MAX`].
+    pub(super) fn next_stopped_poll(current: Duration) -> Duration {
+        (current * 2).min(STOPPED_POLL_MAX)
+    }
+
     pub(super) struct Terminal(Box<dyn MasterPty + Send>);
 
     impl Terminal {
@@ -400,6 +416,7 @@ mod imp {
         }
 
         pub(super) fn wait_exit(&self) -> i32 {
+            let mut backoff = STOPPED_POLL_FIRST;
             loop {
                 if let Some(code) = self.seen() {
                     return code;
@@ -409,11 +426,22 @@ mod imp {
                         self.record(code);
                         return code;
                     }
-                    // An answer that was not an exit. Asked again after a
-                    // moment, so a kernel that keeps giving it for a stopped
-                    // child is polled rather than spun on.
-                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+                    // An answer that was not an exit: the leader is stopped,
+                    // on a kernel that keeps answering WEXITED for one anyway
+                    // (see `wait_without_reaping`). Backed off rather than
+                    // polled at a fixed rate, so a leader left stopped for
+                    // days does not cost a thread parked at 100 Hz for all of
+                    // it.
+                    Ok(None) => {
+                        std::thread::sleep(backoff);
+                        backoff = next_stopped_poll(backoff);
+                    }
+                    // The wait was genuinely interrupted rather than answered
+                    // at once, so the leader was not caught in that loop:
+                    // the next answer starts the backoff over.
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                        backoff = STOPPED_POLL_FIRST;
+                    }
                     // Reaped under this wait by `end_tree`, which recorded
                     // the exit before it reaped.
                     Err(_) => return self.seen().unwrap_or(1),
@@ -957,6 +985,31 @@ mod tests {
         assert!(
             super::imp::wait_without_reaping(pid, false).is_err(),
             "killed after the grace, and reaped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stopped_leaders_poll_backs_off_and_caps() {
+        // `wait_exit` cannot be driven through the real busy loop here --
+        // the spurious wakeups it backs off are a macOS kernel quirk this
+        // Linux test cannot reproduce -- so this pins the sequence the
+        // backoff itself must produce: doubling from the first wait, capped
+        // at the longest one, for as long as the leader keeps answering
+        // "not yet".
+        use super::imp::{STOPPED_POLL_FIRST, STOPPED_POLL_MAX, next_stopped_poll};
+
+        let mut wait = STOPPED_POLL_FIRST;
+        let mut waits = vec![wait];
+        for _ in 0..8 {
+            wait = next_stopped_poll(wait);
+            waits.push(wait);
+        }
+
+        assert_eq!(
+            waits,
+            [10, 20, 40, 80, 160, 320, 640, 1000, 1000].map(Duration::from_millis),
+            "it doubles from {STOPPED_POLL_FIRST:?} and caps at {STOPPED_POLL_MAX:?}"
         );
     }
 
