@@ -32,7 +32,9 @@ use dispatch_tui::input::{
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
-use dispatch_tui::{Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
+use dispatch_tui::{
+    Command, Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -3122,7 +3124,12 @@ impl App {
         items.sort_by_key(|item| item.id != SHELL);
 
         if items.is_empty() {
-            self.status = "no harnesses registered; press ^a H to add one".into();
+            // The key as it is bound: a hint naming a key the user moved
+            // would send them to the wrong one.
+            self.status = match self.router.keymap().path_to(Command::HarnessManager) {
+                Some(keys) => format!("no harnesses registered; press {keys} to add one"),
+                None => "no harnesses registered".into(),
+            };
             return;
         }
 
@@ -4669,9 +4676,18 @@ impl App {
         // prompt is, and when the daemon is gone the prompt cannot be acted
         // on anyway, so hiding the disconnect notice behind it would be
         // exactly backwards.
+        //
+        // The key that reopens it is named as it is bound, and left out when
+        // no key reaches it, rather than naming one that does nothing.
         let waiting_reminder = (!self.pending.is_empty()
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
-        .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
+        .then(|| {
+            let waiting = format!("{} delegation(s) waiting", self.pending.len());
+            match self.router.keymap().path_to(Command::Approvals) {
+                Some(keys) => format!("{waiting} — {keys}"),
+                None => waiting,
+            }
+        });
 
         // A blocked pane on another tab, or in a folded project, still needs
         // to be found; the status row is the one place always on screen.
@@ -7135,11 +7151,97 @@ mod tests {
         let row = text.lines().last().expect("a row");
 
         assert!(row.contains("1 waiting on you"), "{row:?}");
-        assert!(row.contains("1 delegation(s) waiting — ^a a"), "{row:?}");
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl a a"),
+            "{row:?}"
+        );
         assert!(
             row.find("waiting on you") < row.find("pane(s)"),
             "the key help follows, where being cut costs least: {row:?}"
         );
+    }
+
+    /// `app` reading its keys with `entries` laid over the defaults, each
+    /// (mode, key, command).
+    fn rebind(app: &mut App, entries: &[(&str, &str, &str)]) {
+        use std::collections::BTreeMap;
+
+        let mut modes: BTreeMap<String, BTreeMap<String, dispatch_config::KeyValue>> =
+            BTreeMap::new();
+        for (mode, chord, name) in entries {
+            modes.entry((*mode).to_string()).or_default().insert(
+                (*chord).to_string(),
+                dispatch_config::KeyValue::Command((*name).to_string()),
+            );
+        }
+        let keys = dispatch_config::KeysConfig {
+            modes: modes
+                .into_iter()
+                .map(|(mode, table)| (mode, dispatch_config::KeyTable::Table(table)))
+                .collect(),
+            not_a_table: false,
+        };
+        let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        app.set_keymap(keymap);
+    }
+
+    /// The status row with one delegation request waiting.
+    fn row_with_a_request_waiting(app: &mut App, project: ProjectId, parent: PaneId) -> String {
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        let mut terminal = a_terminal();
+        drawn(app, &mut terminal);
+        bottom_row(&terminal)
+    }
+
+    #[test]
+    fn hints_name_the_keys_as_they_are_bound() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("normal", "Ctrl b", "prefix")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl b a"),
+            "{row:?}"
+        );
+
+        app.open_harness_picker();
+        assert_eq!(
+            app.status,
+            "no harnesses registered; press Ctrl b H to add one"
+        );
+    }
+
+    #[test]
+    fn a_hint_with_no_key_to_name_says_what_it_can() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "a", "none")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(row.contains("1 delegation(s) waiting  "), "{row:?}");
+        assert!(!row.contains('—'), "{row:?}");
+
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "H", "none")],
+        );
+        app.open_harness_picker();
+        assert_eq!(app.status, "no harnesses registered");
     }
 
     #[test]
@@ -11050,20 +11152,7 @@ mod tests {
     fn a_key_bound_to_leave_mode_in_scroll_mode_returns_to_live_output() {
         let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
         press(&mut app, KeyCode::Esc);
-        let mut keys = dispatch_config::KeysConfig::default();
-        keys.modes.insert(
-            "scroll".into(),
-            dispatch_config::KeyTable::Table(
-                [(
-                    "q".to_string(),
-                    dispatch_config::KeyValue::Command("leave_mode".into()),
-                )]
-                .into(),
-            ),
-        );
-        let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&keys);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        app.set_keymap(keymap);
+        rebind(&mut app, &[("scroll", "q", "leave_mode")]);
         key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('g'));
         assert!(app.panes[&target].scrolled_back);

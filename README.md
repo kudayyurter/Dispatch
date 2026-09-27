@@ -147,7 +147,8 @@ drops that mode's defaults. A command is named in snake_case — `new_pane`,
 `next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
 `quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
 name and skipped, and the rest still applies. `Esc` always leaves a mode,
-and lock always has a key that unlocks. Keys are read when Dispatch starts.
+lock always has a key that unlocks, and a config that leaves no key to quit
+is logged. Keys are read when Dispatch starts.
 
 ## Shell panes
 
@@ -410,7 +411,8 @@ the number.
 
 The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
 from that pane for this daemon's lifetime, and `Esc` to defer. The status line
-reports how many are waiting and which key reopens them — that key is `^a a`.
+reports how many are waiting and which key reopens them — that key is `^a a`,
+or wherever `[keys]` has moved it.
 
 There are also keyboard bindings to open and close a subagent pane: `^a s` expands
 the focused pane's next child into the tiled grid, and `^a c` collapses it back out.

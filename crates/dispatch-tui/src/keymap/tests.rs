@@ -411,21 +411,22 @@ fn a_command_is_the_action_the_app_runs() {
 fn each_mode_spells_out_its_keys() {
     let keymap = Keymap::defaults();
 
+    // How to get out comes first, where a narrow terminal does not cut it.
     assert_eq!(
         keymap.mode_help(KeyMode::Pane),
-        "PANE  n new  x close  f/z zoom  h/← left  j/↓ down  k/↑ up  l/→ right  p next  s child  c collapse  Esc/Enter done"
+        "PANE  Esc/Enter done  n new  x close  f/z zoom  h/← left  j/↓ down  k/↑ up  l/→ right  p next  s child  c collapse"
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Tab),
-        "TAB  n new  r rename  x close  ←/h prev  →/l next  [ pane left  ] pane right  i tab left  o tab right  1-9 go  Tab last  Esc/Enter done"
+        "TAB  Esc/Enter done  n new  r rename  x close  ←/h prev  →/l next  [ pane left  ] pane right  i tab left  o tab right  1-9 go  Tab last"
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Scroll),
-        "SCROLL  j/↓ down  k/↑ up  d half down  u half up  PageDown/Ctrl f page down  PageUp/Ctrl b page up  g top  G bottom  Esc/Enter done"
+        "SCROLL  Esc/Enter done  j/↓ down  k/↑ up  d half down  u half up  PageDown/Ctrl f page down  PageUp/Ctrl b page up  g top  G bottom"
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Session),
-        "SESSION  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  Esc/Enter done"
+        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit"
     );
     assert_eq!(
         keymap.normal_help(),
@@ -521,9 +522,9 @@ fn clearing_a_mode_drops_its_defaults() {
             (parsed("Esc"), Command::LeaveMode)
         ]
     );
-    assert_eq!(
-        warnings,
-        vec!["keys.session: Esc always leaves the mode".to_string()]
+    assert!(
+        warnings.is_empty(),
+        "Esc always leaves a mode, so putting it back is no news: {warnings:?}"
     );
 }
 
@@ -590,6 +591,7 @@ fn esc_always_leaves_a_mode() {
     let (keymap, warnings) = Keymap::with_overrides(&keys(&[
         ("pane", "Esc", named("none")),
         ("scroll", "Esc", named("scroll_down")),
+        ("tab", "clear", KeyValue::Flag(true)),
     ]));
 
     assert_eq!(
@@ -601,11 +603,103 @@ fn esc_always_leaves_a_mode() {
         Some(Command::LeaveScroll)
     );
     assert_eq!(
+        keymap.lookup(KeyMode::Tab, &parsed("Esc")),
+        Some(Command::LeaveMode),
+        "a cleared mode still leaves on Esc"
+    );
+    assert_eq!(
         warnings,
         vec![
             "keys.pane: Esc always leaves the mode".to_string(),
             "keys.scroll: Esc always leaves the mode".to_string(),
         ]
+    );
+}
+
+#[test]
+fn esc_may_leave_scroll_mode_as_any_other_mode_is_left() {
+    // However scroll mode ends, its pane goes back to live output, so
+    // leave_mode there leaves nothing behind.
+    let (keymap, warnings) =
+        Keymap::with_overrides(&keys(&[("scroll", "Esc", named("leave_mode"))]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        keymap.lookup(KeyMode::Scroll, &parsed("Esc")),
+        Some(Command::LeaveMode)
+    );
+}
+
+#[test]
+fn a_config_with_no_key_to_quit_is_told_so() {
+    let (keymap, warnings) =
+        Keymap::with_overrides(&keys(&[("normal", "clear", KeyValue::Flag(true))]));
+
+    assert_eq!(keymap.path_to(Command::Quit), None);
+    assert_eq!(warnings, vec!["keys: no key reaches quit".to_string()]);
+}
+
+#[test]
+fn the_path_to_a_command_is_the_keys_that_reach_it_from_normal_mode() {
+    let keymap = Keymap::defaults();
+
+    assert_eq!(
+        keymap.path_to(Command::NewPane).as_deref(),
+        Some("Alt n"),
+        "a key of its own in normal mode"
+    );
+    assert_eq!(
+        keymap.path_to(Command::Approvals).as_deref(),
+        Some("Ctrl a a"),
+        "else through a mode, the prefix first"
+    );
+    assert_eq!(
+        keymap.path_to(Command::Quit).as_deref(),
+        Some("Ctrl a q"),
+        "the prefix before session mode"
+    );
+    assert_eq!(
+        keymap.path_to(Command::RenameTab).as_deref(),
+        Some("Ctrl t r")
+    );
+
+    let (cleared, _) = Keymap::with_overrides(&keys(&[("normal", "clear", KeyValue::Flag(true))]));
+    assert_eq!(
+        cleared.path_to(Command::Approvals),
+        None,
+        "nothing reaches it"
+    );
+}
+
+#[test]
+fn the_path_to_a_command_follows_a_moved_prefix() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("normal", "Ctrl a", named("none")),
+        ("normal", "Ctrl b", named("prefix")),
+    ]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        keymap.path_to(Command::Approvals).as_deref(),
+        Some("Ctrl b a")
+    );
+    assert_eq!(
+        keymap.path_to(Command::HarnessManager).as_deref(),
+        Some("Ctrl b H")
+    );
+}
+
+#[test]
+fn go_to_tab_keys_read_as_a_range_only_when_none_is_missing() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[("tab", "5", named("none"))]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(
+        keymap
+            .mode_help(KeyMode::Tab)
+            .contains("  1/2/3/4/6/7/8/9 go  "),
+        "{}",
+        keymap.mode_help(KeyMode::Tab)
     );
 }
 

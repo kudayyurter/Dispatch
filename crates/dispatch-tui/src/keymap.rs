@@ -818,9 +818,10 @@ impl Keymap {
         self.modes[mode.index()].clear();
     }
 
-    /// The status row for a mode: its title, then each command with its
-    /// first one or two keys, in the order the keys are bound. The go-to-tab
-    /// keys read as one range, `1-9 go`.
+    /// The status row for a mode: its title, how to leave it, then each
+    /// other command with its first one or two keys, in the order the keys
+    /// are bound. The go-to-tab keys read as one range, `1-9 go`, when none
+    /// between is missing.
     #[must_use]
     pub fn mode_help(&self, mode: KeyMode) -> String {
         let mut groups: Vec<(Command, Vec<Chord>)> = Vec::new();
@@ -835,21 +836,57 @@ impl Keymap {
             }
         }
 
+        // The way out first: a mode's row runs past the edge of a narrow
+        // terminal, and how to leave is the one thing on it that must not be
+        // cut off. Stable, so the rest keep the order they are bound in.
+        groups.sort_by_key(|(command, _)| {
+            !matches!(command, Command::LeaveMode | Command::LeaveScroll)
+        });
+
         let mut parts = vec![mode.title().to_string()];
         for (command, chords) in groups {
-            let keys = if matches!(command, Command::GoToTab(_)) && chords.len() > 2 {
-                format!("{}-{}", chords[0].short(), chords[chords.len() - 1].short())
-            } else {
-                chords
+            let keys = match command {
+                Command::GoToTab(_) if chords.len() > 2 && in_a_row(&chords) => {
+                    format!("{}-{}", chords[0].short(), chords[chords.len() - 1].short())
+                }
+                // Every one: a range would claim the missing keys, and a
+                // first two would hide the rest.
+                Command::GoToTab(_) => chords
+                    .iter()
+                    .map(Chord::short)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                _ => chords
                     .iter()
                     .take(2)
                     .map(Chord::short)
                     .collect::<Vec<_>>()
-                    .join("/")
+                    .join("/"),
             };
             parts.push(format!("{keys} {}", command.label()));
         }
         parts.join("  ")
+    }
+
+    /// The keys that reach `command` from normal mode, as a user types them:
+    /// a normal-mode key of its own, or else the key into a mode that binds
+    /// it and that mode's key for it (`Ctrl a a`), trying the modes in table
+    /// order so the prefix comes first. `None` when nothing reaches it.
+    ///
+    /// For hints that name a key: written from the keymap, they stay true
+    /// when the user moves one.
+    #[must_use]
+    pub fn path_to(&self, command: Command) -> Option<String> {
+        if let Some(chord) = self.chords_for(KeyMode::Normal, command).first() {
+            return Some(chord.to_string());
+        }
+        KeyMode::ALL.into_iter().find_map(|mode| {
+            let into = *self
+                .chords_for(KeyMode::Normal, mode.entered_by()?)
+                .first()?;
+            let then = *self.chords_for(mode, command).first()?;
+            Some(format!("{into} {then}"))
+        })
     }
 
     /// The keys normal mode offers, for the status row: the first key of
@@ -892,6 +929,7 @@ impl Keymap {
     pub fn with_overrides(keys: &KeysConfig) -> (Self, Vec<String>) {
         let mut keymap = Self::defaults();
         let mut warnings = Vec::new();
+        let mut cleared = Vec::new();
 
         if keys.not_a_table {
             warnings.push("keys: a table of modes".to_string());
@@ -913,7 +951,10 @@ impl Keymap {
             // First, so the mode's own keys in the same table are added to
             // an empty mode rather than cleared with the defaults.
             match table.get("clear") {
-                Some(KeyValue::Flag(true)) => keymap.clear(mode),
+                Some(KeyValue::Flag(true)) => {
+                    keymap.clear(mode);
+                    cleared.push(mode);
+                }
                 Some(KeyValue::Flag(false)) | None => {}
                 Some(_) => warnings.push(format!("keys.{mode_name}.clear: true or false")),
             }
@@ -949,31 +990,61 @@ impl Keymap {
             }
         }
 
-        keymap.keep_a_way_out(&mut warnings);
+        keymap.keep_a_way_out(&cleared, &mut warnings);
         (keymap, warnings)
     }
 
     /// Puts back what a config took away that would leave the user stuck:
-    /// lock's unlock, and `Esc` out of every mode that stays on.
-    fn keep_a_way_out(&mut self, warnings: &mut Vec<String>) {
+    /// lock's unlock, and `Esc` out of every mode that stays on. Says so
+    /// when no key is left that quits.
+    fn keep_a_way_out(&mut self, cleared: &[KeyMode], warnings: &mut Vec<String>) {
         if self.chords_for(KeyMode::Lock, Command::Unlock).is_empty() {
             self.bind(KeyMode::Lock, Chord::ctrl('g'), Command::Unlock);
             warnings.push("keys.lock: nothing unlocks, so Ctrl g still does".to_string());
         }
 
+        // Either way of leaving will do: however scroll mode ends, its pane
+        // goes back to live output.
         let esc = Chord::key(KeyCode::Esc);
         for mode in KeyMode::ALL.into_iter().filter(|mode| mode.is_modal()) {
+            if matches!(
+                self.lookup(mode, &esc),
+                Some(Command::LeaveMode | Command::LeaveScroll)
+            ) {
+                continue;
+            }
             let leave = if mode == KeyMode::Scroll {
                 Command::LeaveScroll
             } else {
                 Command::LeaveMode
             };
-            if self.lookup(mode, &esc) != Some(leave) {
-                self.bind(mode, esc, leave);
+            self.bind(mode, esc, leave);
+            // A cleared mode lost its Esc with the rest of its defaults, not
+            // because the user asked, and Esc always leaving a mode is what
+            // they were told: putting it back is no news.
+            if !cleared.contains(&mode) {
                 warnings.push(format!("keys.{}: Esc always leaves the mode", mode.name()));
             }
         }
+
+        // Only said, not mended: which key should quit, if any, is the
+        // user's choice, and one bound here would be taken from a pane.
+        if self.path_to(Command::Quit).is_none() {
+            warnings.push("keys: no key reaches quit".to_string());
+        }
     }
+}
+
+/// Whether `chords` are digits each one more than the last, so that `1-9`
+/// claims no key that is not bound.
+fn in_a_row(chords: &[Chord]) -> bool {
+    let digit = |chord: &Chord| match chord.code {
+        KeyCode::Char(c) if chord.modifiers.is_empty() => c.to_digit(10),
+        _ => None,
+    };
+    chords
+        .windows(2)
+        .all(|pair| matches!((digit(&pair[0]), digit(&pair[1])), (Some(a), Some(b)) if b == a + 1))
 }
 
 /// Why `command` cannot be bound in `mode`, when it cannot.

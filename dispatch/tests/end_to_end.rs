@@ -1535,10 +1535,7 @@ fn lock_mode_gives_the_shell_the_keys_dispatch_takes() {
     );
     let lines = app.lines();
     assert!(contains(&lines, "LOCKED"), "still locked");
-    assert!(
-        !contains(&lines, "PANE  n new"),
-        "no pane mode while locked"
-    );
+    assert!(!contains(&lines, "PANE  "), "no pane mode while locked");
 
     // Ctrl d ends `cat`; Ctrl g unlocks.
     app.send(b"\x04\x07");

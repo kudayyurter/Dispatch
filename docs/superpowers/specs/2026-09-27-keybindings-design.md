@@ -256,10 +256,19 @@ did.
   - if lock would have no `unlock` chord, the default `Ctrl g` unlock is
     kept, with a warning;
   - every mode other than normal and lock always leaves on `Esc`, whatever
-    the config says;
+    the config says. `Esc` bound to `leave_mode` or `leave_scroll` will do
+    in any of them; bound to anything else, or to nothing, it is put back,
+    with a warning unless the mode's table set `clear = true`, which took
+    `Esc` away with the rest of the defaults rather than on purpose;
   - a chord bound to a mode-entering command in any mode other than normal
     and prefix is refused with a warning (modes are entered from normal, or
-    through the prefix, as `^a [` enters scroll mode).
+    through the prefix, as `^a [` enters scroll mode);
+  - if no key reaches `quit` any more, a warning says so; nothing is bound
+    in its place, since which key quits is the user's choice.
+- Hints that name a key (`N delegation(s) waiting — Ctrl a a`, `press
+  Ctrl a H to add one`) are written from the keymap: the keys that reach
+  the command from normal mode, through the first mode that binds it, so
+  they follow a moved prefix, and drop the key when nothing reaches it.
 - Keys are the client's; the daemon ignores `[keys]`. `unknown_keys` learns
   the `keys.<mode>` tables.
 
@@ -273,11 +282,16 @@ Generated from the keymap, so it always matches the bindings:
   `prefix`, with the labels `pane`, `tabs`, `scroll`, `session`, `lock` and
   `prefix`: `Ctrl p pane  Ctrl t tabs  Ctrl s scroll  Ctrl o session  Ctrl g lock  Ctrl a prefix`.
   A command left with no chord is left out.
-- **Pane / Tab / Scroll / Session**: the mode's name in capitals, then each
-  command in table order with its first one or two chords and its label:
-  `PANE  n new  x close  f/z zoom  h/← left  …  Esc done`. As slice C built
-  it, a status message (such as a refusal) sits between the name and the
-  keys, entering a mode clears a stale message, and the row is drawn in the
+- **Pane / Tab / Scroll / Session**: the mode's name in capitals, then how
+  to leave it, then each other command in table order with its first one or
+  two chords and its label:
+  `PANE  Esc/Enter done  n new  x close  f/z zoom  h/← left  …`.
+  The way out comes first because the rows run past eighty
+  columns, and it is the one thing that must not be cut off. The go-to-tab
+  keys read as a range, `1-9 go`, only when none between is unbound;
+  otherwise each is listed, `1/2/3/4/6/7/8/9 go`. As slice C built it, a
+  status message (such as a refusal) sits between the name and the keys,
+  entering a mode clears a stale message, and the row is drawn in the
   highlighted style.
 - **Lock**: `LOCKED  Ctrl g unlock` (the chord as bound), highlighted, then
   what the normal row would say before its keys — an unreachable machine, a
