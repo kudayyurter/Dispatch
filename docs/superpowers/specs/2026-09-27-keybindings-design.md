@@ -1,6 +1,6 @@
 # D — Keybindings: zellij-style modes, configurable
 
-Status: approved design, not yet implemented.
+Status: implemented on branch `ui/keybindings`.
 Date: 2026-09-27.
 Last of four UI slices: A visual refresh (merged), B live status and motion
 (merged), C tabs and shell panes (PR #2), D this.
@@ -164,12 +164,12 @@ A new module, `crates/dispatch-tui/src/keymap.rs`.
 - **`Chord`** — a key plus modifiers, parsed from and printed as the text a
   user writes: `"Ctrl t"`, `"Alt n"`, `"x"`, `"H"` (a capital means shift),
   `"Esc"`, `"Enter"`, `"Tab"`, `"Space"`, `"Backspace"`, `"Left"` `"Right"`
-  `"Up"` `"Down"`, `"PageUp"` `"PageDown"`, `"Home"` `"End"`, `"F1"`–`"F12"`,
-  and `Ctrl`/`Alt`/`Shift` combined with any of them (`"Ctrl Alt x"`). Parsing
-  is case-insensitive for modifier and named-key words, case-sensitive for
-  a single character. A chord prints back as it is written; the status row
-  uses a short form of the same text that shows the arrow keys as `←` `→`
-  `↑` `↓`.
+  `"Up"` `"Down"`, `"PageUp"` `"PageDown"`, `"Home"` `"End"`, `"Delete"`
+  `"Insert"`, `"F1"`–`"F12"`, and `Ctrl`/`Alt`/`Shift` combined with any of
+  them (`"Ctrl Alt x"`). Parsing is case-insensitive for modifier and
+  named-key words, case-sensitive for a single character. A chord prints
+  back as it is written; the status row uses a short form of the same text
+  that shows the arrow keys as `←` `→` `↑` `↓`.
 - **`Command`** — every named thing a key can do, each with a snake_case
   name used in `[keys]`, a short label for the status row, and whether it
   keeps its mode on:
