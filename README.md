@@ -394,7 +394,8 @@ dispatch delegate "write the tests for the http client"
 Dispatch asks you first, every time — unless you have approved that pane
 wholesale with `A`, which lasts until the daemon stops. The subagent runs as a
 pane under the one that asked, and the caller gets its output and exit code when
-it finishes.
+it finishes. Focus stays where it was: open the subagent with `Ctrl p s` (or
+`^a s`) to watch it.
 
 Delegation needs two things. The daemon must own the panes (`--attach`), because
 it is what starts the subagent; and the harness must declare a non-interactive
