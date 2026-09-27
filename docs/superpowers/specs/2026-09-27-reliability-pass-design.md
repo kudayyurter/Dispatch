@@ -26,14 +26,17 @@ Every item below is pinned by a test that fails before its fix and passes after.
 
 **Today.** `dispatch-os/src/ipc.rs`, `accept_all`: any error from the platform's accept is sent to the listener's queue, and the accepting thread returns. `Listener::accept` then reports `BrokenPipe` for ever, and the daemon's `serve` loop (`dispatch-daemon/src/session.rs`) logs "failed to accept a connection" and stops accepting. A daemon that ran out of file descriptors for a moment keeps its panes running, but no client can reach it again.
 
-**Change.** The platform layer sorts each accept error as passing or fatal:
-- **Unix, passing:** `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EPROTO`, `EINTR`.
-- **Windows, passing:** `ERROR_NOT_ENOUGH_MEMORY`, `ERROR_OUTOFMEMORY`, `ERROR_NO_SYSTEM_RESOURCES`, `ERROR_TOO_MANY_OPEN_FILES`. That covers both `ConnectNamedPipe` and creating the next pipe instance.
+**Change.** The platform layer sorts each accept error into one of three kinds:
+- **Unix, one connection's own trouble:** `ECONNABORTED`, `EPROTO`, `EINTR`. A client that hung up while it was being accepted, or a signal that interrupted the call. Clients probe whether a daemon is listening by connecting and dropping at once, and on macOS and BSD that gives `ECONNABORTED` if the drop lands before `accept` reaches it -- a routine event, not a shortage.
+- **Unix, a shortage:** `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`. Descriptors, buffers or memory short for a moment.
+- **Windows, a shortage:** `ERROR_NOT_ENOUGH_MEMORY`, `ERROR_OUTOFMEMORY`, `ERROR_NO_SYSTEM_RESOURCES`, `ERROR_TOO_MANY_OPEN_FILES`. That covers both `ConnectNamedPipe` and creating the next pipe instance. Windows has no code of its own connecting probes trip, so it sorts nothing as one connection's own trouble.
 - Everything else is fatal.
 
-After a passing error:
+After one connection's own trouble: retried at once, with no backoff, logged at `debug`, and not counted toward a run -- a probe costs nothing.
+
+After a shortage:
 - **Backoff:** the accepting thread waits and tries again. The wait starts at 10 ms and doubles up to 1 s. Any successful accept resets it.
-- **Logging:** the first passing error of a run is logged at `warn`. Further errors in the same run are counted and not logged one by one. When accepting recovers, one line says how many were skipped.
+- **Logging:** the first shortage of a run is logged at `warn`. Further ones in the same run are counted and not logged one by one. When accepting recovers, one line says how many were skipped.
 - **Stopping:** the `stopping` flag is still checked after every wait, so a listener being dropped is not held up by a backoff.
 
 A fatal error behaves as today: reported once, then the thread stops.
@@ -42,10 +45,11 @@ On Windows, a failure to create the next instance must leave the listener able t
 
 **Test.** The loop takes its accept step as a parameter (a closure or a small trait), so a test can script it:
 - two `EMFILE` errors, then a real connection: the connection is delivered;
+- a scripted `ECONNABORTED` (Unix only), then a real connection: delivered with no backoff;
 - a fatal error: the loop stops;
 - a drop during a backoff: the loop stops promptly.
 
-The error classification gets a table test on each platform.
+The error classification gets a table test on each platform, covering all three kinds.
 
 ## 2. Pane output bounded by bytes, not by reads
 
