@@ -10768,14 +10768,15 @@ mod tests {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
         let mut keys = dispatch_config::KeysConfig::default();
-        keys.0.insert(
+        keys.modes.insert(
             "pane".into(),
-            [(
-                "w".to_string(),
-                dispatch_config::KeyValue::Command("close_pane".into()),
-            )]
-            .into_iter()
-            .collect(),
+            dispatch_config::KeyTable::Table(
+                [(
+                    "w".to_string(),
+                    dispatch_config::KeyValue::Command("close_pane".into()),
+                )]
+                .into(),
+            ),
         );
         app.set_keymap(dispatch_tui::Keymap::with_overrides(&keys).0);
         let mut terminal = a_wide_terminal();

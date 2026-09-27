@@ -247,13 +247,16 @@ fn a_keys_section_is_kept_as_written() {
         "[keys.pane]\n\"w\" = \"close_pane\"\nclear = true\n\n[keys.normal]\n\"Ctrl q\" = \"quit\"\n",
     );
 
-    let pane = &config.keys.0["pane"];
+    let KeyTable::Table(pane) = &config.keys.modes["pane"] else {
+        panic!("a mode's table is kept as one");
+    };
     assert_eq!(pane["w"], KeyValue::Command("close_pane".into()));
     assert_eq!(pane["clear"], KeyValue::Flag(true));
     assert_eq!(
-        config.keys.0["normal"]["Ctrl q"],
-        KeyValue::Command("quit".into())
+        config.keys.modes["normal"],
+        KeyTable::Table([("Ctrl q".to_string(), KeyValue::Command("quit".into()))].into())
     );
+    assert!(!config.keys.not_a_table);
 }
 
 #[test]
@@ -263,14 +266,14 @@ fn a_key_given_the_wrong_kind_of_value_is_kept_to_be_reported() {
     let config = load("keys-type", "[keys.pane]\nx = 3\n");
 
     assert_eq!(
-        config.keys.0["pane"]["x"],
-        KeyValue::Other("integer".into())
+        config.keys.modes["pane"],
+        KeyTable::Table([("x".to_string(), KeyValue::Other("integer".into()))].into())
     );
 }
 
 #[test]
 fn without_a_keys_section_nothing_is_rebound() {
-    assert!(load("no-keys", "").keys.0.is_empty());
+    assert_eq!(load("no-keys", "").keys, KeysConfig::default());
 }
 
 #[test]
@@ -281,4 +284,52 @@ fn the_keys_section_is_judged_by_the_interface_not_reported_unknown() {
     let loaded = Config::load_reporting(&path).expect("the file loads");
 
     assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+}
+
+/// Loads `text` as a `config.toml` through the path both binaries use, which
+/// must not fail on anything `[keys]` says.
+fn load_keys(label: &str, text: &str) -> LoadedConfig {
+    let dir = TempDir::new(label);
+    Config::load_reporting(&dir.config(text))
+        .unwrap_or_else(|error| panic!("a mistake in [keys] stops nothing: {error}"))
+}
+
+#[test]
+fn a_binding_written_straight_under_keys_does_not_stop_the_file_loading() {
+    let loaded = load_keys("keys-bare", "[keys]\n\"Ctrl q\" = \"quit\"\n");
+
+    assert_eq!(
+        loaded.config.keys.modes["Ctrl q"],
+        KeyTable::Other("string".into()),
+        "kept for the interface to name"
+    );
+    assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+}
+
+#[test]
+fn clear_written_straight_under_keys_does_not_stop_the_file_loading() {
+    let loaded = load_keys("keys-clear", "[keys]\nclear = true\n");
+
+    assert_eq!(
+        loaded.config.keys.modes["clear"],
+        KeyTable::Other("boolean".into())
+    );
+}
+
+#[test]
+fn keys_that_is_not_a_table_does_not_stop_the_file_loading() {
+    let loaded = load_keys("keys-string", "keys = \"vim\"\n");
+
+    assert!(loaded.config.keys.not_a_table, "noted, to be reported");
+    assert!(loaded.config.keys.modes.is_empty(), "and binds nothing");
+}
+
+#[test]
+fn a_mode_written_as_an_array_of_tables_does_not_stop_the_file_loading() {
+    let loaded = load_keys("keys-array", "[[keys.normal]]\n\"Ctrl q\" = \"quit\"\n");
+
+    assert_eq!(
+        loaded.config.keys.modes["normal"],
+        KeyTable::Other("array".into())
+    );
 }

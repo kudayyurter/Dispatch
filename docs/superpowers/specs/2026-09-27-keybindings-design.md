@@ -305,6 +305,7 @@ wording changes slightly, and the tests that pin it move with it.
 |---|---|
 | A chord in `[keys]` that does not parse | logged by name, skipped |
 | An unknown command or mode in `[keys]` | logged by name, skipped |
+| `[keys]`, or an entry in it, that is not a table (`"Ctrl q" = "quit"` straight under `[keys]`) | logged by name, skipped; the file still loads |
 | `[keys]` leaves lock with no unlock | default `Ctrl g` unlock kept, logged |
 | `[keys]` unbinds `Esc` in a mode | `Esc` still leaves it |
 | A mode-entering command bound inside a mode | refused, logged |

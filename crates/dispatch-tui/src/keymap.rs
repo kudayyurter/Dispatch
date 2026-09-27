@@ -8,7 +8,7 @@ use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use dispatch_config::{KeyValue, KeysConfig};
+use dispatch_config::{KeyTable, KeyValue, KeysConfig};
 
 use crate::input::{Action, Direction};
 
@@ -870,7 +870,18 @@ impl Keymap {
         let mut keymap = Self::defaults();
         let mut warnings = Vec::new();
 
-        for (mode_name, table) in &keys.0 {
+        if keys.not_a_table {
+            warnings.push("keys: a table of modes".to_string());
+        }
+
+        for (mode_name, table) in &keys.modes {
+            // Asked before whether the mode exists: `"Ctrl q" = "quit"`
+            // straight under `[keys]` is a key missing its mode, and saying
+            // "not a mode" would point at the wrong mistake.
+            let KeyTable::Table(table) = table else {
+                warnings.push(format!("keys.{mode_name}: a table of keys"));
+                continue;
+            };
             let Some(mode) = KeyMode::from_name(mode_name) else {
                 warnings.push(format!("keys.{mode_name}: not a mode"));
                 continue;

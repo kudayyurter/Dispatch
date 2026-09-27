@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 
-use dispatch_config::{KeyValue, KeysConfig};
+use dispatch_config::{KeyTable, KeyValue, KeysConfig};
 
 fn parsed(text: &str) -> Chord {
     Chord::parse(text).unwrap_or_else(|error| panic!("{text:?} parses: {error}"))
@@ -14,14 +14,20 @@ fn parsed(text: &str) -> Chord {
 
 /// A `[keys]` holding `entries`, each (mode, key, value).
 fn keys(entries: &[(&str, &str, KeyValue)]) -> KeysConfig {
-    let mut keys = KeysConfig::default();
+    let mut modes: BTreeMap<String, BTreeMap<String, KeyValue>> = BTreeMap::new();
     for (mode, chord, value) in entries {
-        keys.0
+        modes
             .entry((*mode).to_string())
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert((*chord).to_string(), value.clone());
     }
-    keys
+    KeysConfig {
+        modes: modes
+            .into_iter()
+            .map(|(mode, table)| (mode, KeyTable::Table(table)))
+            .collect(),
+        not_a_table: false,
+    }
 }
 
 fn named(name: &str) -> KeyValue {
@@ -596,5 +602,42 @@ fn only_lock_mode_unlocks_and_lock_mode_only_unlocks() {
             "keys.lock.\"x\": lock mode only unlocks".to_string(),
             "keys.normal.\"Ctrl u\": only lock mode unlocks".to_string(),
         ]
+    );
+}
+
+#[test]
+fn keys_that_is_not_a_table_is_reported() {
+    let (keymap, warnings) = Keymap::with_overrides(&KeysConfig {
+        modes: BTreeMap::new(),
+        not_a_table: true,
+    });
+
+    assert_eq!(keymap, Keymap::defaults());
+    assert_eq!(warnings, vec!["keys: a table of modes".to_string()]);
+}
+
+#[test]
+fn a_binding_written_straight_under_keys_is_named_for_what_it_is() {
+    // `"Ctrl q" = "quit"` under `[keys]` rather than `[keys.normal]` is a
+    // key missing its mode, not a mode Dispatch lacks.
+    let mut keys = keys(&[("pane", "w", named("close_pane"))]);
+    keys.modes
+        .insert("Ctrl q".into(), KeyTable::Other("string".into()));
+    keys.modes
+        .insert("normal".into(), KeyTable::Other("array".into()));
+
+    let (keymap, warnings) = Keymap::with_overrides(&keys);
+
+    assert_eq!(
+        warnings,
+        vec![
+            "keys.Ctrl q: a table of keys".to_string(),
+            "keys.normal: a table of keys".to_string(),
+        ]
+    );
+    assert_eq!(
+        keymap.lookup(KeyMode::Pane, &parsed("w")),
+        Some(Command::ClosePane),
+        "the rest still applies"
     );
 }

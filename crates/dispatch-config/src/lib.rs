@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use config::{
-    Config, DelegationLimits, InterfaceConfig, KeyValue, KeysConfig, LoadedConfig, LoginShell,
-    ShellConfig,
+    Config, DelegationLimits, InterfaceConfig, KeyTable, KeyValue, KeysConfig, LoadedConfig,
+    LoginShell, ShellConfig,
 };
 pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 pub use status::{RuleState, StatusInput, StatusRules};

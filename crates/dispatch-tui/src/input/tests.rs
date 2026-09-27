@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use dispatch_core::PaneId;
 
-use dispatch_config::{KeyValue, KeysConfig};
+use dispatch_config::{KeyTable, KeyValue, KeysConfig};
 
 use crate::keymap::Keymap;
 
@@ -415,13 +415,20 @@ fn in_mode(entering: Event) -> InputRouter {
 
 /// A router whose keys have `entries` laid over the defaults.
 fn router_with(entries: &[(&str, &str, &str)]) -> InputRouter {
-    let mut keys = KeysConfig::default();
+    let mut modes: BTreeMap<String, BTreeMap<String, KeyValue>> = BTreeMap::new();
     for (mode, chord, name) in entries {
-        keys.0
+        modes
             .entry((*mode).to_string())
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert((*chord).to_string(), KeyValue::Command((*name).to_string()));
     }
+    let keys = KeysConfig {
+        modes: modes
+            .into_iter()
+            .map(|(mode, table)| (mode, KeyTable::Table(table)))
+            .collect(),
+        not_a_table: false,
+    };
     let (keymap, warnings) = Keymap::with_overrides(&keys);
     assert!(warnings.is_empty(), "{warnings:?}");
     InputRouter::with_keymap(keymap)
