@@ -706,3 +706,22 @@ fn a_prefix_moved_in_keys_is_honoured_and_the_old_key_goes_to_the_pane() {
         Action::NewPane
     );
 }
+
+#[test]
+fn moving_the_pointer_in_scroll_mode_focuses_nothing() {
+    // Scroll mode's keys read the pane it was entered on; a nudge of the
+    // mouse must not hand them to another.
+    let pane = PaneId::new();
+    let panes = [(pane, Rect::new(0, 0, 10, 10))];
+    let mut router = in_mode(ctrl('s'));
+
+    assert_eq!(router.handle(&moved(5, 5), &panes), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Scroll);
+
+    router.handle(&press(KeyCode::Esc), &panes);
+    assert_eq!(
+        router.handle(&moved(5, 5), &panes),
+        Action::FocusPane(pane),
+        "focus follows the pointer again once the mode is left"
+    );
+}

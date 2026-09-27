@@ -291,7 +291,10 @@ impl InputRouter {
 
         let (action, button) = match event.kind {
             // Focus follows the pointer, so moving the mouse over a pane is
-            // enough to type into it.
+            // enough to type into it. Not in scroll mode: its keys read the
+            // pane it was entered on, and a nudge of the mouse would hand
+            // them to another.
+            MouseEventKind::Moved if self.mode == KeyMode::Scroll => return Action::None,
             MouseEventKind::Moved => return Action::FocusPane(*id),
             MouseEventKind::Down(button) => (MouseAction::Press, translate_button(button)),
             MouseEventKind::Up(button) => (MouseAction::Release, translate_button(button)),

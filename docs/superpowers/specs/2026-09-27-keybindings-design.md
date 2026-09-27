@@ -113,9 +113,13 @@ previous tab, as in the user's zellij config.
 
 ### Scroll mode (`Ctrl s`)
 
-Scrolls the focused pane's scrollback. On the alternate screen (a program
-that owns the whole screen, such as vim) there is no scrollback and the keys
-change nothing; the mode can still be left the usual way.
+Scrolls the scrollback of the pane focused when the mode began. On the
+alternate screen (a program that owns the whole screen, such as vim) there is
+no scrollback and the keys change nothing; the mode can still be left the
+usual way. While it is on, moving the pointer does not move focus, and if
+focus leaves the pane anyway (it closes, say) the mode ends. However the mode
+ends — a key, a click, a paste, the pane going — that pane returns to live
+output.
 
 | Chord | Command | Mode after |
 |---|---|---|
@@ -310,7 +314,7 @@ wording changes slightly, and the tests that pin it move with it.
 | `[keys]` unbinds `Esc` in a mode | `Esc` still leaves it |
 | A mode-entering command bound inside a mode | refused, logged |
 | Scroll mode on the alternate screen | keys change nothing; the mode still leaves |
-| The focused pane closes while in scroll mode | the mode ends |
+| The pane scroll mode reads closes, or focus leaves it | the mode ends, and the pane returns to live output |
 | A mode is on and an overlay opens (picker, prompt) | the command that opened it ended the mode first, so keys go to the overlay |
 
 ## Testing
@@ -325,9 +329,10 @@ wording changes slightly, and the tests that pin it move with it.
   everything but unlock; prefix is one key; click and paste end a mode;
   a custom binding from `[keys]` takes effect.
 - **App**: each scroll command's effect on the focused pane's viewport,
-  leaving jumps back to live output, the mode ends when the focused pane
-  closes; the generated status row for each mode, including a status
-  message and the highlighted style; `^a [` enters scroll mode.
+  leaving by any route jumps back to live output, the mode ends when its
+  pane closes and focus passes to another; the generated status row for
+  each mode, including a status message and the highlighted style; `^a [`
+  enters scroll mode.
 - **Config**: `[keys]` parses, unknown modes are reported, the daemon
   ignores it.
 - **End to end**: `Ctrl s` then `k` scrolls a shell's output back and `Esc`

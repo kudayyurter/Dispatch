@@ -513,6 +513,13 @@ pub struct App {
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
     router: InputRouter,
+    /// The pane scroll mode reads, while it is on: the one focused when it
+    /// began.
+    ///
+    /// Kept rather than read from the focus each time, so that whenever the
+    /// mode ends — however it ends — this pane, and no other, goes back to
+    /// live output. A pane left scrolled back is never marked blocked.
+    scrolling: Option<PaneId>,
     /// Each pane's content rectangle last frame — inside its border.
     ///
     /// This is what a pointer is resolved against and what a pane is resized
@@ -685,6 +692,7 @@ impl App {
             panes: HashMap::new(),
             harnesses,
             router: InputRouter::new(),
+            scrolling: None,
             frames: Vec::new(),
             frames_area: Rect::default(),
             frames_project: None,
@@ -1452,6 +1460,13 @@ impl App {
     /// Returns whether anything needs redrawing. Standalone, there is nothing
     /// to hear and this does nothing.
     pub fn poll_daemon(&mut self) -> bool {
+        let changed = self.take_in_daemon();
+        // A pane the daemon closed may be the one scroll mode was reading.
+        self.settle_scroll_mode() || changed
+    }
+
+    /// [`App::poll_daemon`]'s messages, before scroll mode is settled.
+    fn take_in_daemon(&mut self) -> bool {
         let added = self.poll_add_machine();
 
         let Mode::Attached(attachments) = &self.mode else {
@@ -2287,6 +2302,49 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        let handled = self.act_on(event, area);
+        // Settled after the event, whichever way it went: a click, a paste
+        // or a key can end scroll mode, or close or move focus off the pane
+        // it reads, and a key can start it.
+        self.settle_scroll_mode();
+        handled
+    }
+
+    /// Keeps scroll mode and the pane it reads in step. Returns whether the
+    /// mode ended.
+    ///
+    /// The mode takes the focused pane when it starts, and needs one: with
+    /// nothing focused it has nothing to read, and would only hold keys. It
+    /// ends when focus leaves that pane — the pane closing hands focus on —
+    /// since its keys would otherwise scroll a pane it was never entered on.
+    /// However it ends, the pane goes back to live output.
+    fn settle_scroll_mode(&mut self) -> bool {
+        let focused = self
+            .state
+            .focused_pane()
+            .filter(|id| self.panes.contains_key(id));
+
+        if self.router.key_mode() == KeyMode::Scroll {
+            match self.scrolling {
+                None if focused.is_some() => {
+                    self.scrolling = focused;
+                    return false;
+                }
+                Some(target) if focused == Some(target) => return false,
+                _ => self.router.leave_mode(),
+            }
+        } else if self.scrolling.is_none() {
+            return false;
+        }
+
+        if let Some(target) = self.scrolling.take() {
+            self.scroll_to_bottom(target);
+        }
+        true
+    }
+
+    /// [`App::handle`]'s work, before scroll mode is settled.
+    fn act_on(&mut self, event: &Event, area: Size) -> Result<()> {
         // A click ends tab mode whatever it lands on. The sidebar and the tab
         // row are resolved here, before the router sees the event, so the
         // router cannot end it for them.
@@ -2427,7 +2485,7 @@ impl App {
             Action::ScrollPages(pages) => self.scroll_pages(pages, false),
             Action::ScrollToTop => self.scroll_view(ScrollTo::Top),
             Action::ScrollToBottom => {
-                if let Some(id) = self.state.focused_pane() {
+                if let Some(id) = self.scroll_target() {
                     self.scroll_to_bottom(id);
                 }
             }
@@ -3460,12 +3518,18 @@ impl App {
         self.focus_pane(panes[next]);
     }
 
-    /// Moves the focused pane's view over its scrollback, for scroll mode.
+    /// The pane a scroll command moves: the one scroll mode is reading, or
+    /// the focused one for a scroll key bound outside the mode.
+    fn scroll_target(&self) -> Option<PaneId> {
+        self.scrolling.or_else(|| self.state.focused_pane())
+    }
+
+    /// Moves a pane's view over its scrollback, for scroll mode.
     ///
     /// Says nothing on the status row, unlike a wheel scroll: the mode's own
     /// row already says where the user is and how to get back.
     fn scroll_view(&mut self, to: ScrollTo) {
-        let Some(id) = self.state.focused_pane() else {
+        let Some(id) = self.scroll_target() else {
             return;
         };
         let Some(pane) = self.panes.get_mut(&id) else {
@@ -3480,12 +3544,11 @@ impl App {
         }
     }
 
-    /// Scrolls the focused pane by `pages` of its own height, or of half its
-    /// height; negative towards older output.
+    /// Scrolls a pane by `pages` of its own height, or of half its height;
+    /// negative towards older output.
     fn scroll_pages(&mut self, pages: isize, half: bool) {
         let Some(rows) = self
-            .state
-            .focused_pane()
+            .scroll_target()
             .and_then(|id| self.panes.get(&id))
             .map(|pane| pane.backend.size().rows)
         else {
@@ -3616,18 +3679,6 @@ impl App {
         let now = self.now();
         self.animations.sweep(now);
         self.notice_focus(now);
-
-        // Scroll mode reads the focused pane's scrollback; with that pane gone
-        // there is nothing left to read, and the mode would hold keys for
-        // nothing.
-        if self.router.key_mode() == KeyMode::Scroll
-            && self
-                .state
-                .focused_pane()
-                .is_none_or(|id| !self.panes.contains_key(&id))
-        {
-            self.router.leave_mode();
-        }
 
         // Remembered once a frame rather than on each way focus can move:
         // there are many ways, and the frame sees the result of all of them.
@@ -10821,6 +10872,127 @@ mod tests {
         drawn(&mut app, &mut terminal);
 
         assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    /// A pane with scrollback and a second beside it, drawn once so the
+    /// pointer has somewhere to land, with scroll mode on the first and its
+    /// view at the oldest output.
+    fn scrolled_back_beside_another() -> (App, PaneId, PaneId, Sender<ServerMessage>) {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let target = pane_with_history(&mut app, &daemon, project);
+        let other = spawn_several(&mut app, &daemon, project, 1)[0];
+        drawn(&mut app, &mut a_terminal());
+        app.focus_pane(target);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back, "read back to the start");
+
+        (app, target, other, daemon)
+    }
+
+    /// The middle of the cell block `pane` was last drawn in.
+    fn middle_of(app: &App, pane: PaneId) -> (u16, u16) {
+        let (_, rect) = app
+            .layout
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane is drawn");
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_closes_and_focus_goes_to_another() {
+        // Closing the pane hands focus to the one beside it, and scroll mode
+        // must not carry on over a pane it was never entered on.
+        let (mut app, target, other, daemon) = scrolled_back_beside_another();
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane: target })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut a_terminal());
+
+        assert_eq!(app.state.focused_pane(), Some(other));
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn moving_the_pointer_in_scroll_mode_keeps_focus_and_the_mode() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        app.handle(
+            &Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Size::new(100, 30),
+        )
+        .expect("the pointer is handled");
+
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(target),
+            "a nudge moves nothing"
+        );
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.panes[&target].scrolled_back, "still reading back");
+    }
+
+    #[test]
+    fn a_click_on_another_pane_ends_scroll_mode_and_returns_to_live_output() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        click(&mut app, column, row);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            !app.panes[&target].scrolled_back,
+            "the pane scroll mode read is live again"
+        );
+    }
+
+    #[test]
+    fn a_paste_in_scroll_mode_returns_its_pane_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+
+        app.handle(&Event::Paste("hi".into()), Size::new(100, 30))
+            .expect("the paste is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
+    }
+
+    #[test]
+    fn a_key_bound_to_leave_mode_in_scroll_mode_returns_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        press(&mut app, KeyCode::Esc);
+        let mut keys = dispatch_config::KeysConfig::default();
+        keys.modes.insert(
+            "scroll".into(),
+            dispatch_config::KeyTable::Table(
+                [(
+                    "q".to_string(),
+                    dispatch_config::KeyValue::Command("leave_mode".into()),
+                )]
+                .into(),
+            ),
+        );
+        let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        app.set_keymap(keymap);
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back);
+
+        press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
     }
 
     #[test]
