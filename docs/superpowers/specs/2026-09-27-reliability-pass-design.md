@@ -78,13 +78,14 @@ This is the same code in the daemon and in a standalone interface, which both us
 
 - **Reporting the exit.** The waiter learns the exit status with `waitid(P_PID, pid, WEXITED | WNOWAIT)`, which does not reap, and reports `Exited(code)` exactly as today. The code is reported exactly once, whichever of the waiter and the closing path sees the exit first. Only `CLD_EXITED`, `CLD_KILLED` and `CLD_DUMPED` count as an exit, because macOS has been seen to answer `WEXITED` for a child that has only stopped (golang/go#19314), and a stopped leader taken for exited would be reaped while it was still going.
 - **Ending the tree on close.** Close and drop end the tree in this order:
-  1. `SIGTERM` the group. The leader is still pinned, so the group is certainly ours.
+  1. `SIGTERM` the group while the leader is unreaped. The leader is still pinned, so the group is certainly ours.
   2. Wait up to the grace period for the leader to exit, without reaping.
-  3. Reap the leader.
-  4. Wait out the rest of the grace for any remaining members, using the existing `killpg(pgid, 0)` probe.
-  5. If members remain, `SIGKILL` the group and wait up to `KILL_TIMEOUT`, as today.
-- **Why reap in step 3.** Step 4's probe counts a zombie leader as a member. Without step 3, every close would wait out the whole grace period and then force-kill.
-- **Never signal an emptied group.** Once any probe reports the group gone (`ESRCH`), nothing signals that number again. After step 3, the number is held by any members still alive. The only window left is between a probe that found members and the `SIGKILL` straight after it, which is microseconds, and is documented where it is.
+  3. `SIGKILL` the group if the leader ignored `SIGTERM`.
+  4. Reap the leader.
+  5. Wait out the rest of the grace period for any remaining members, using the existing `killpg(pgid, 0)` probe.
+  6. `SIGKILL` the group if members remain, and wait up to `KILL_TIMEOUT`.
+- **Why reap in step 4.** Step 5's probe counts a zombie leader as a member. Without step 4, every close would wait out the whole grace period and then force-kill.
+- **Never signal an emptied group.** Once any probe reports the group gone (`ESRCH`), nothing signals that number again. After step 4, the number is held by any members still alive. The windows left are microseconds -- between the reap and the first probe after it, and between a probe that found members and the `SIGKILL` straight after it -- and are documented where they are.
 - **Where the code goes.**
   - **`dispatch-os/src/pty.rs`:** this sequence lives here, since it is platform code. `Child` gains a way to learn the exit without reaping, and a way to end its tree and reap, and it can be shared with the waiter thread.
   - **`dispatch-pty`:** the pane's close and drop use the new tree-ending instead of `process::terminate_tree`.

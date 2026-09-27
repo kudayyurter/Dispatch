@@ -76,6 +76,10 @@ A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
 what it printed — `Ctrl p x` (or `^a x`) is what removes it for good.
 
+On Linux and macOS, a pane whose program has exited keeps its process as a
+`<defunct>` entry under `dispatchd` until you close the pane; closing it
+clears the entry.
+
 ## Tabs
 
 The row across the top names each tab after its first pane's title, or the
