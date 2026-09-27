@@ -75,8 +75,9 @@ impl Chord {
     ///
     /// A character's case carries shift, and terminals disagree on whether
     /// they also set the modifier for it, so it is dropped: a binding
-    /// written `H` fires however the capital arrived. Back-tab is `Shift
-    /// Tab`, as it is written.
+    /// written `H` fires however the capital arrived. A letter held with
+    /// Ctrl is always its lowercase, as [`Chord::parse`] reads it. Back-tab
+    /// is `Shift Tab`, as it is written.
     #[must_use]
     pub fn from_event(event: &KeyEvent) -> Self {
         let mut modifiers = event.modifiers & MODIFIERS;
@@ -90,7 +91,10 @@ impl Chord {
         if matches!(code, KeyCode::Char(_)) {
             modifiers.remove(KeyModifiers::SHIFT);
         }
-        Self { code, modifiers }
+        Self {
+            code: lower_under_ctrl(code, modifiers),
+            modifiers,
+        }
     }
 
     /// Reads a chord written as a user writes one: `"Ctrl t"`, `"Alt n"`,
@@ -123,16 +127,23 @@ impl Chord {
         };
 
         // Shift on a letter is its capital, the same chord a terminal
-        // reports for it.
+        // reports for it. On anything else it names a key no terminal
+        // sends: `Shift 1` arrives as `!`, and `Shift Space` as Space.
         let code = match code {
             KeyCode::Char(c) if modifiers.contains(KeyModifiers::SHIFT) => {
+                if !c.is_ascii_alphabetic() {
+                    return Err(refuse());
+                }
                 modifiers.remove(KeyModifiers::SHIFT);
                 KeyCode::Char(c.to_ascii_uppercase())
             }
             code => code,
         };
 
-        Ok(Self { code, modifiers })
+        Ok(Self {
+            code: lower_under_ctrl(code, modifiers),
+            modifiers,
+        })
     }
 
     /// How the status row writes this chord: as it is written, with the
@@ -176,6 +187,18 @@ impl fmt::Display for Chord {
             KeyCode::F(n) => write!(f, "F{n}"),
             other => write!(f, "{other:?}"),
         }
+    }
+}
+
+/// A letter held with Ctrl as its lowercase: a terminal sends the same byte
+/// for Ctrl t, Ctrl T and Ctrl Shift t, so a binding written any of those
+/// ways has to be the chord that byte arrives as.
+fn lower_under_ctrl(code: KeyCode, modifiers: KeyModifiers) -> KeyCode {
+    match code {
+        KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c.to_ascii_lowercase())
+        }
+        code => code,
     }
 }
 

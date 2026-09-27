@@ -245,10 +245,20 @@ impl InputRouter {
                     self.mode = KeyMode::Normal;
                 }
 
+                // After the prefix, a key typed with Ctrl still held is read
+                // as the key alone when that is all that is bound: `^a ^x`
+                // for `^a x`, as screen's users type it, and as the prefix
+                // read keys before the keymap.
+                let command = self.keymap.lookup(mode, &chord).or_else(|| {
+                    (mode == KeyMode::Prefix && chord.modifiers.contains(KeyModifiers::CONTROL))
+                        .then(|| Chord::new(chord.code, chord.modifiers - KeyModifiers::CONTROL))
+                        .and_then(|bare| self.keymap.lookup(mode, &bare))
+                });
+
                 // An unbound key does nothing rather than reaching the pane,
                 // so a stray key cannot run something in an agent, and a mode
                 // stays on through it.
-                let Some(command) = self.keymap.lookup(mode, &chord) else {
+                let Some(command) = command else {
                     return Action::None;
                 };
                 let action = self.run(command);

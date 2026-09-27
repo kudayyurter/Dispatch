@@ -173,9 +173,12 @@ A new module, `crates/dispatch-tui/src/keymap.rs`.
   `"Up"` `"Down"`, `"PageUp"` `"PageDown"`, `"Home"` `"End"`, `"Delete"`
   `"Insert"`, `"F1"`–`"F12"`, and `Ctrl`/`Alt`/`Shift` combined with any of
   them (`"Ctrl Alt x"`). Parsing is case-insensitive for modifier and
-  named-key words, case-sensitive for a single character. A chord prints
-  back as it is written; the status row uses a short form of the same text
-  that shows the arrow keys as `←` `→` `↑` `↓`.
+  named-key words, case-sensitive for a single character — except with
+  `Ctrl`, where a terminal sends the same byte for either case, so
+  `"Ctrl T"` and `"Ctrl Shift t"` are `"Ctrl t"`. `Shift` goes with a
+  letter or a named key only: `"Shift 1"` is really `!`, and is refused. A
+  chord prints back as it is written; the status row uses a short form of
+  the same text that shows the arrow keys as `←` `→` `↑` `↓`.
 - **`Command`** — every named thing a key can do, each with a snake_case
   name used in `[keys]`, a short label for the status row, and whether it
   keeps its mode on:

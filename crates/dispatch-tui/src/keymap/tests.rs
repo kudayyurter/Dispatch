@@ -72,10 +72,37 @@ fn modifier_words_are_read_in_any_case() {
 #[test]
 fn shift_on_a_letter_is_its_capital() {
     assert_eq!(parsed("Shift h"), parsed("H"));
+}
+
+#[test]
+fn a_letter_held_with_ctrl_is_the_one_key_a_terminal_sends_for_it() {
+    // A terminal sends the same byte for Ctrl t, Ctrl T and Ctrl Shift t,
+    // so a binding written any of those ways has to be the one that fires.
+    assert_eq!(parsed("Ctrl T"), Chord::ctrl('t'));
+    assert_eq!(parsed("Ctrl Shift t"), Chord::ctrl('t'));
     assert_eq!(
-        parsed("Ctrl Shift t"),
-        Chord::new(KeyCode::Char('T'), KeyModifiers::CONTROL)
+        parsed("Ctrl Alt Shift x"),
+        Chord::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )
     );
+    // Not taken for Tab and Enter, which some terminals can tell apart.
+    assert_eq!(parsed("Ctrl i"), Chord::ctrl('i'));
+    assert_eq!(parsed("Ctrl m"), Chord::ctrl('m'));
+}
+
+#[test]
+fn shift_on_anything_but_a_letter_is_not_a_key() {
+    // `Shift 1` is `!`, and `Shift Space` is Space: neither could ever be
+    // what a terminal reports.
+    for text in ["Shift 1", "Shift Space", "Ctrl Shift 1", "Shift ["] {
+        assert_eq!(
+            Chord::parse(text),
+            Err(ChordError(text.to_string())),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -181,6 +208,19 @@ fn a_key_event_becomes_the_chord_it_is_written_as() {
     assert_eq!(
         Chord::from_event(&event(KeyCode::Char('['), KeyModifiers::SHIFT)),
         parsed("[")
+    );
+    // However a terminal reports a capital held with Ctrl, it is Ctrl and
+    // the letter.
+    assert_eq!(
+        Chord::from_event(&event(KeyCode::Char('T'), KeyModifiers::CONTROL)),
+        parsed("Ctrl t")
+    );
+    assert_eq!(
+        Chord::from_event(&event(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        parsed("Ctrl t")
     );
 }
 

@@ -725,3 +725,26 @@ fn moving_the_pointer_in_scroll_mode_focuses_nothing() {
         "focus follows the pointer again once the mode is left"
     );
 }
+
+#[test]
+fn the_prefix_reads_a_command_key_typed_with_ctrl_still_held() {
+    // GNU screen's habit: `^a ^x` for `^a x`, never letting go of Ctrl.
+    let mut router = router();
+    router.handle(&ctrl_a(), &[]);
+    assert_eq!(router.handle(&ctrl('x'), &[]), Action::ClosePane);
+    assert!(!router.is_armed());
+
+    // The prefix's own key twice still gives the pane that key.
+    router.handle(&ctrl_a(), &[]);
+    assert_eq!(
+        router.handle(&ctrl_a(), &[]),
+        Action::SendKey(
+            Key::Char('a'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            }
+        )
+    );
+    assert!(!router.is_armed());
+}
