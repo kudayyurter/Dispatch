@@ -4992,6 +4992,112 @@ fn a_pane_that_exits_leaves_its_tab() {
     assert_eq!(daemon.pane_count(), 1, "the pane itself stays until closed");
 }
 
+/// Every tab snapshot among `messages`, whole, names and all.
+fn tab_snapshots(messages: &[ServerMessage]) -> Vec<ServerMessage> {
+    messages
+        .iter()
+        .filter(|m| matches!(m, ServerMessage::Tabs { .. }))
+        .cloned()
+        .collect()
+}
+
+/// Each command tabs brought, aimed at real panes and tabs: a placed spawn,
+/// a move, a rename, a reorder and a close.
+fn tab_commands(
+    project: ProjectId,
+    pane: PaneId,
+    first: TabId,
+    second: TabId,
+) -> [ClientMessage; 5] {
+    [
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+            place: Placement::Into { tab: first },
+        },
+        ClientMessage::MovePane {
+            pane,
+            to: Placement::Into { tab: second },
+        },
+        ClientMessage::RenameTab {
+            tab: first,
+            name: "taken".into(),
+        },
+        ClientMessage::MoveTab {
+            tab: second,
+            index: 0,
+        },
+        ClientMessage::CloseTab { tab: first },
+    ]
+}
+
+#[test]
+fn no_tab_command_is_acted_on_before_a_hello_or_after_a_refusal() {
+    // The tab commands pass through the same gate as every other request:
+    // a client that has not been welcomed, or was refused, moves, names,
+    // reorders, closes and places nothing.
+    let (mut daemon, project, _dir) = daemon("tabs-unwelcome");
+    let ui = subscribed(&mut daemon, 1);
+    let (pane, _) = spawn_placed(&mut daemon, &ui, project, Placement::Auto);
+    let (_, seen) = spawn_placed(&mut daemon, &ui, project, Placement::NewAfter { tab: None });
+    let before = tab_snapshots(&seen).pop().expect("the tabs were sent");
+    let first = tab_at(&seen, project, 0);
+    let second = tab_at(&seen, project, 1);
+
+    let mut id = 10;
+    for command in tab_commands(project, pane, first, second) {
+        let unwelcome = daemon.attach_for_test(id);
+        daemon.request_for_test(id, command.clone());
+        assert!(
+            drain(&unwelcome)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Error { .. })),
+            "{command:?} before a Hello is refused, and says why"
+        );
+        id += 1;
+
+        let refused = daemon.attach_for_test(id);
+        daemon.request_for_test(
+            id,
+            ClientMessage::Hello {
+                version: dispatch_proto::Version {
+                    major: 99,
+                    minor: 0,
+                },
+                client: "incompatible".into(),
+                role: dispatch_proto::Role::Interface,
+            },
+        );
+        daemon.request_for_test(id, command);
+        assert!(
+            drain(&refused).iter().all(|m| matches!(
+                m,
+                ServerMessage::Error {
+                    error: ProtocolError::IncompatibleVersion { .. }
+                }
+            )),
+            "a refused client is told only why"
+        );
+        id += 1;
+    }
+    daemon.tick();
+
+    assert_eq!(daemon.pane_count(), 2, "nothing was started or closed");
+    assert!(
+        tab_snapshots(&drain(&ui)).is_empty(),
+        "no tab changed, so none was sent"
+    );
+    let late = daemon.attach_for_test(3);
+    daemon.request_for_test(3, hello());
+    daemon.request_for_test(3, ClientMessage::Subscribe);
+    assert_eq!(
+        tab_snapshots(&drain(&late)),
+        vec![before],
+        "the tabs are as they were, names and all"
+    );
+}
+
 #[test]
 fn a_client_that_never_reads_is_let_go_of_over_tab_snapshots_too() {
     // Every change to a tab sends every tab the project has to every
@@ -5049,5 +5155,86 @@ fn a_client_that_never_reads_is_let_go_of_over_tab_snapshots_too() {
     assert!(
         queued < 2 * BUDGET,
         "{queued} bytes were queued for a client that never read, against a budget of {BUDGET}"
+    );
+}
+
+#[test]
+fn a_pane_placed_on_a_tab_delegates_under_the_same_cap() {
+    // Where a pane sits changes nothing about what it may start. Two
+    // requests are asked about while nothing runs, a pane of the user's own
+    // is placed beside the asker meanwhile, and approving both still starts
+    // one subagent: a placed pane is nobody's subagent and frees no slot,
+    // and a subagent takes no place on a tab.
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "cap-placed",
+        DelegationLimits {
+            max_depth: 1,
+            max_live_per_parent: 1,
+            request_timeout_secs: 600,
+        },
+    );
+    let ui = subscribed(&mut daemon, 1);
+    let (parent, seen) = spawn_placed(&mut daemon, &ui, project, Placement::NewAfter { tab: None });
+    let tab = tab_at(&seen, project, 0);
+
+    let first = ask_as(&mut daemon, 8, parent, long_task());
+    let second = ask_as(&mut daemon, 9, parent, long_task());
+    let requests: Vec<RequestId> = drain(&ui)
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 2, "both fit while nothing runs yet");
+
+    let (beside, seen) = spawn_placed(&mut daemon, &ui, project, Placement::Into { tab });
+    assert!(
+        !seen.iter().any(m_is_child),
+        "a placed pane is not anyone's subagent"
+    );
+
+    for request in requests {
+        daemon.request_for_test(
+            1,
+            ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: false,
+            },
+        );
+    }
+
+    assert_eq!(
+        daemon.pane_count(),
+        3,
+        "the parent, the pane beside it, and exactly one subagent"
+    );
+    let mut told = outcomes(&drain(&first));
+    told.extend(outcomes(&drain(&second)));
+    assert_eq!(
+        told.iter()
+            .filter(|o| matches!(o, DelegateOutcome::Approved { .. }))
+            .count(),
+        1,
+        "one caller is told it runs: {told:?}"
+    );
+    assert!(
+        told.iter()
+            .any(|o| matches!(o, DelegateOutcome::Refused { reason } if reason.contains("cap"))),
+        "the other is told why it does not: {told:?}"
+    );
+
+    let after = drain(&ui);
+    assert!(after.iter().any(m_is_child), "the subagent is announced");
+    assert_eq!(
+        last_tabs(&after, project),
+        None,
+        "starting a subagent moves no tab"
+    );
+    assert_eq!(
+        last_tabs(&seen, project),
+        Some(vec![vec![parent, beside]]),
+        "the tab holds the two placed panes"
     );
 }

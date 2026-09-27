@@ -1160,6 +1160,30 @@ fn every_registry_can_offer_the_users_shell() {
 }
 
 #[test]
+fn the_task_form_rules_leave_the_users_shell_alone() {
+    // A shell pane is typed into, never handed a task, so the rules for
+    // what a one-shot form may put on cmd.exe's command line have nothing
+    // to judge in it -- even a shell that is cmd.exe -- and take nothing
+    // from its environment.
+    let registry = HarnessRegistry::default().with_shell(&ShellConfig {
+        command: Some("cmd.exe".into()),
+        login: crate::LoginShell::Never,
+        ..ShellConfig::default()
+    });
+    let shell = registry.get(SHELL).expect("the shell is registered");
+
+    for os in ["windows", "linux", "macos"] {
+        assert_eq!(shell.task_refusal_for(os), None, "refused on {os}");
+        assert_eq!(shell.task_launch_for(os, "x & del"), None, "{os}");
+    }
+    let launch = shell.launch_for("windows");
+    assert_eq!(launch.command, "cmd.exe");
+    assert!(launch.args.is_empty(), "{:?}", launch.args);
+    assert!(launch.env.is_empty(), "{:?}", launch.env);
+    assert!(launch.unset.is_empty(), "{:?}", launch.unset);
+}
+
+#[test]
 fn a_harness_file_named_shell_wins_over_the_built_in_one() {
     let dir = TempDir::new("shell-file");
     std::fs::write(
