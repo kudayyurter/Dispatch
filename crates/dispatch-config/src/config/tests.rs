@@ -239,3 +239,46 @@ fn a_blank_command_counts_as_none() {
         "/bin/sh"
     );
 }
+
+#[test]
+fn a_keys_section_is_kept_as_written() {
+    let config = load(
+        "keys",
+        "[keys.pane]\n\"w\" = \"close_pane\"\nclear = true\n\n[keys.normal]\n\"Ctrl q\" = \"quit\"\n",
+    );
+
+    let pane = &config.keys.0["pane"];
+    assert_eq!(pane["w"], KeyValue::Command("close_pane".into()));
+    assert_eq!(pane["clear"], KeyValue::Flag(true));
+    assert_eq!(
+        config.keys.0["normal"]["Ctrl q"],
+        KeyValue::Command("quit".into())
+    );
+}
+
+#[test]
+fn a_key_given_the_wrong_kind_of_value_is_kept_to_be_reported() {
+    // A number where a command's name goes costs that one binding, not the
+    // whole file: the interface says what it cannot use.
+    let config = load("keys-type", "[keys.pane]\nx = 3\n");
+
+    assert_eq!(
+        config.keys.0["pane"]["x"],
+        KeyValue::Other("integer".into())
+    );
+}
+
+#[test]
+fn without_a_keys_section_nothing_is_rebound() {
+    assert!(load("no-keys", "").keys.0.is_empty());
+}
+
+#[test]
+fn the_keys_section_is_judged_by_the_interface_not_reported_unknown() {
+    let dir = TempDir::new("keys-known");
+    let path = dir.config("[keys.whatever]\nx = \"none\"\n");
+
+    let loaded = Config::load_reporting(&path).expect("the file loads");
+
+    assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+}

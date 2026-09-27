@@ -8,6 +8,8 @@ use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use dispatch_config::{KeyValue, KeysConfig};
+
 use crate::input::{Action, Direction};
 
 /// The modifiers a chord can name. Anything else a terminal reports (hyper,
@@ -775,7 +777,6 @@ impl Keymap {
 
     /// Binds `chord` in `mode`: in place of what it was bound to, or at the
     /// end.
-    #[allow(dead_code)] // used by [keys] overrides in the next change
     pub(crate) fn bind(&mut self, mode: KeyMode, chord: Chord, command: Command) {
         let keys = &mut self.modes[mode.index()];
         match keys.iter_mut().find(|(bound, _)| *bound == chord) {
@@ -785,13 +786,11 @@ impl Keymap {
     }
 
     /// Unbinds `chord` in `mode`.
-    #[allow(dead_code)] // used by [keys] overrides in the next change
     pub(crate) fn unbind(&mut self, mode: KeyMode, chord: &Chord) {
         self.modes[mode.index()].retain(|(bound, _)| bound != chord);
     }
 
     /// Drops every key in `mode`.
-    #[allow(dead_code)] // used by [keys] overrides in the next change
     pub(crate) fn clear(&mut self, mode: KeyMode) {
         self.modes[mode.index()].clear();
     }
@@ -860,6 +859,104 @@ impl Keymap {
             None => "LOCKED".to_string(),
         }
     }
+
+    /// The defaults with the user's `[keys]` laid over them, and what could
+    /// not be used, one line each, for the log.
+    ///
+    /// Nothing in `[keys]` stops Dispatch: a mistake costs its own binding,
+    /// and whatever would leave the user stuck in a mode is put back.
+    #[must_use]
+    pub fn with_overrides(keys: &KeysConfig) -> (Self, Vec<String>) {
+        let mut keymap = Self::defaults();
+        let mut warnings = Vec::new();
+
+        for (mode_name, table) in &keys.0 {
+            let Some(mode) = KeyMode::from_name(mode_name) else {
+                warnings.push(format!("keys.{mode_name}: not a mode"));
+                continue;
+            };
+
+            // First, so the mode's own keys in the same table are added to
+            // an empty mode rather than cleared with the defaults.
+            match table.get("clear") {
+                Some(KeyValue::Flag(true)) => keymap.clear(mode),
+                Some(KeyValue::Flag(false)) | None => {}
+                Some(_) => warnings.push(format!("keys.{mode_name}.clear: true or false")),
+            }
+
+            for (text, value) in table {
+                if text == "clear" {
+                    continue;
+                }
+                let place = format!("keys.{mode_name}.{text:?}");
+
+                let Ok(chord) = Chord::parse(text) else {
+                    warnings.push(format!("{place}: not a key"));
+                    continue;
+                };
+                let KeyValue::Command(name) = value else {
+                    warnings.push(format!("{place}: a command's name, in quotes"));
+                    continue;
+                };
+                let Some(command) = Command::from_name(name) else {
+                    warnings.push(format!("{place}: no command {name:?}"));
+                    continue;
+                };
+
+                if command == Command::None {
+                    keymap.unbind(mode, &chord);
+                    continue;
+                }
+                if let Err(reason) = allowed(mode, command) {
+                    warnings.push(format!("{place}: {reason}"));
+                    continue;
+                }
+                keymap.bind(mode, chord, command);
+            }
+        }
+
+        keymap.keep_a_way_out(&mut warnings);
+        (keymap, warnings)
+    }
+
+    /// Puts back what a config took away that would leave the user stuck:
+    /// lock's unlock, and `Esc` out of every mode that stays on.
+    fn keep_a_way_out(&mut self, warnings: &mut Vec<String>) {
+        if self.chords_for(KeyMode::Lock, Command::Unlock).is_empty() {
+            self.bind(KeyMode::Lock, Chord::ctrl('g'), Command::Unlock);
+            warnings.push("keys.lock: nothing unlocks, so Ctrl g still does".to_string());
+        }
+
+        let esc = Chord::key(KeyCode::Esc);
+        for mode in KeyMode::ALL.into_iter().filter(|mode| mode.is_modal()) {
+            let leave = if mode == KeyMode::Scroll {
+                Command::LeaveScroll
+            } else {
+                Command::LeaveMode
+            };
+            if self.lookup(mode, &esc) != Some(leave) {
+                self.bind(mode, esc, leave);
+                warnings.push(format!("keys.{}: Esc always leaves the mode", mode.name()));
+            }
+        }
+    }
+}
+
+/// Why `command` cannot be bound in `mode`, when it cannot.
+///
+/// Modes are entered from normal mode, or through the prefix as `^a [`
+/// enters scroll mode; lock looks up nothing but its unlock.
+fn allowed(mode: KeyMode, command: Command) -> Result<(), &'static str> {
+    if command.enters().is_some() && !matches!(mode, KeyMode::Normal | KeyMode::Prefix) {
+        return Err("a mode is entered from normal mode or the prefix");
+    }
+    if mode == KeyMode::Lock && command != Command::Unlock {
+        return Err("lock mode only unlocks");
+    }
+    if command == Command::Unlock && mode != KeyMode::Lock {
+        return Err("only lock mode unlocks");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

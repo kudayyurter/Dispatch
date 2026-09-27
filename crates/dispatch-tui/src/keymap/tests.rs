@@ -2,10 +2,30 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
+
 use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+
+use dispatch_config::{KeyValue, KeysConfig};
 
 fn parsed(text: &str) -> Chord {
     Chord::parse(text).unwrap_or_else(|error| panic!("{text:?} parses: {error}"))
+}
+
+/// A `[keys]` holding `entries`, each (mode, key, value).
+fn keys(entries: &[(&str, &str, KeyValue)]) -> KeysConfig {
+    let mut keys = KeysConfig::default();
+    for (mode, chord, value) in entries {
+        keys.0
+            .entry((*mode).to_string())
+            .or_insert_with(BTreeMap::new)
+            .insert((*chord).to_string(), value.clone());
+    }
+    keys
+}
+
+fn named(name: &str) -> KeyValue {
+    KeyValue::Command(name.to_string())
 }
 
 fn event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -385,5 +405,196 @@ fn a_chord_bound_twice_answers_with_its_first_binding() {
             .count(),
         1,
         "binding a chord again replaces it rather than adding a second"
+    );
+}
+
+#[test]
+fn no_keys_is_the_defaults() {
+    assert_eq!(
+        Keymap::with_overrides(&KeysConfig::default()),
+        (Keymap::defaults(), Vec::new())
+    );
+}
+
+#[test]
+fn a_binding_replaces_adds_and_unbinds() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("pane", "x", named("zoom")),
+        ("pane", "w", named("close_pane")),
+        ("pane", "n", named("none")),
+        ("normal", "Ctrl q", named("quit")),
+    ]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        keymap.lookup(KeyMode::Pane, &parsed("x")),
+        Some(Command::Zoom)
+    );
+    assert_eq!(
+        keymap.lookup(KeyMode::Pane, &parsed("w")),
+        Some(Command::ClosePane)
+    );
+    assert_eq!(keymap.lookup(KeyMode::Pane, &parsed("n")), None);
+    assert_eq!(
+        keymap.lookup(KeyMode::Normal, &parsed("Ctrl q")),
+        Some(Command::Quit)
+    );
+    assert_eq!(
+        keymap.bindings(KeyMode::Pane).last(),
+        Some(&(parsed("w"), Command::ClosePane)),
+        "a new key goes after the defaults"
+    );
+}
+
+#[test]
+fn the_prefix_can_move_to_another_key() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("normal", "Ctrl a", named("none")),
+        ("normal", "Ctrl b", named("prefix")),
+    ]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(keymap.lookup(KeyMode::Normal, &parsed("Ctrl a")), None);
+    assert_eq!(
+        keymap.lookup(KeyMode::Normal, &parsed("Ctrl b")),
+        Some(Command::Prefix)
+    );
+}
+
+#[test]
+fn clearing_a_mode_drops_its_defaults() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("session", "clear", KeyValue::Flag(true)),
+        ("session", "q", named("quit")),
+    ]));
+
+    assert_eq!(
+        keymap.bindings(KeyMode::Session),
+        &[
+            (parsed("q"), Command::Quit),
+            (parsed("Esc"), Command::LeaveMode)
+        ]
+    );
+    assert_eq!(
+        warnings,
+        vec!["keys.session: Esc always leaves the mode".to_string()]
+    );
+}
+
+#[test]
+fn mistakes_are_reported_by_name_and_the_rest_still_applies() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("panes", "x", named("zoom")),
+        ("pane", "Ctrl ?x", named("zoom")),
+        ("pane", "y", named("explode")),
+        ("pane", "u", KeyValue::Other("integer".into())),
+        ("pane", "v", KeyValue::Flag(true)),
+        ("tab", "clear", named("yes")),
+        ("pane", "w", named("close_pane")),
+    ]));
+
+    assert_eq!(
+        keymap.lookup(KeyMode::Pane, &parsed("w")),
+        Some(Command::ClosePane),
+        "the rest still applies"
+    );
+    assert_eq!(
+        warnings,
+        vec![
+            "keys.pane.\"Ctrl ?x\": not a key".to_string(),
+            "keys.pane.\"u\": a command's name, in quotes".to_string(),
+            "keys.pane.\"v\": a command's name, in quotes".to_string(),
+            "keys.pane.\"y\": no command \"explode\"".to_string(),
+            "keys.panes: not a mode".to_string(),
+            "keys.tab.clear: true or false".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn lock_always_unlocks() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[("lock", "Ctrl g", named("none"))]));
+
+    assert_eq!(
+        keymap.chords_for(KeyMode::Lock, Command::Unlock),
+        vec![parsed("Ctrl g")]
+    );
+    assert_eq!(
+        warnings,
+        vec!["keys.lock: nothing unlocks, so Ctrl g still does".to_string()]
+    );
+}
+
+#[test]
+fn lock_can_unlock_on_another_key() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("lock", "Ctrl g", named("none")),
+        ("lock", "Ctrl l", named("unlock")),
+    ]));
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        keymap.chords_for(KeyMode::Lock, Command::Unlock),
+        vec![parsed("Ctrl l")]
+    );
+}
+
+#[test]
+fn esc_always_leaves_a_mode() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("pane", "Esc", named("none")),
+        ("scroll", "Esc", named("scroll_down")),
+    ]));
+
+    assert_eq!(
+        keymap.lookup(KeyMode::Pane, &parsed("Esc")),
+        Some(Command::LeaveMode)
+    );
+    assert_eq!(
+        keymap.lookup(KeyMode::Scroll, &parsed("Esc")),
+        Some(Command::LeaveScroll)
+    );
+    assert_eq!(
+        warnings,
+        vec![
+            "keys.pane: Esc always leaves the mode".to_string(),
+            "keys.scroll: Esc always leaves the mode".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_mode_is_entered_only_from_normal_mode_or_the_prefix() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("pane", "t", named("tab_mode")),
+        ("prefix", "t", named("tab_mode")),
+    ]));
+
+    assert_eq!(keymap.lookup(KeyMode::Pane, &parsed("t")), None);
+    assert_eq!(
+        keymap.lookup(KeyMode::Prefix, &parsed("t")),
+        Some(Command::TabMode)
+    );
+    assert_eq!(
+        warnings,
+        vec!["keys.pane.\"t\": a mode is entered from normal mode or the prefix".to_string()]
+    );
+}
+
+#[test]
+fn only_lock_mode_unlocks_and_lock_mode_only_unlocks() {
+    let (keymap, warnings) = Keymap::with_overrides(&keys(&[
+        ("lock", "x", named("new_pane")),
+        ("normal", "Ctrl u", named("unlock")),
+    ]));
+
+    assert_eq!(keymap.lookup(KeyMode::Lock, &parsed("x")), None);
+    assert_eq!(keymap.lookup(KeyMode::Normal, &parsed("Ctrl u")), None);
+    assert_eq!(
+        warnings,
+        vec![
+            "keys.lock.\"x\": lock mode only unlocks".to_string(),
+            "keys.normal.\"Ctrl u\": only lock mode unlocks".to_string(),
+        ]
     );
 }
