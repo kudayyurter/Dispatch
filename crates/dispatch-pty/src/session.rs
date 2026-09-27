@@ -201,6 +201,9 @@ pub struct Pty {
     /// Process id of the child, used to terminate its whole tree, and
     /// taken when it does.
     pid: Option<u32>,
+    /// The process, shared with the waiter thread, which is what ends the
+    /// tree.
+    child: Arc<dispatch_os::pty::Child>,
     state: RunState,
     /// Whether everything the child printed has been delivered.
     finished: bool,
@@ -340,7 +343,8 @@ impl Pty {
         let (tx, events) = channel();
         let backlog = Arc::new(Backlog::default());
         spawn_reader(process.reader, tx.clone(), Arc::clone(&backlog));
-        spawn_waiter(process.child, tx);
+        let child = Arc::new(process.child);
+        spawn_waiter(Arc::clone(&child), tx);
 
         Ok(Self {
             input,
@@ -349,6 +353,7 @@ impl Pty {
             backlog,
             size,
             pid: process.pid,
+            child,
             state: RunState::Running,
             finished: false,
             terminal: process.terminal,
@@ -467,9 +472,9 @@ impl Pty {
     /// the pane is terminated.
     ///
     /// `None` once it has been, or where the platform did not report one.
-    /// Still returned after the child has exited, when the number may
-    /// already belong to some other process: check [`Pty::state`] before
-    /// looking it up.
+    /// Still returned after the child has exited, when the number is still
+    /// the pane's but names a process that has gone: check [`Pty::state`]
+    /// before looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -486,17 +491,15 @@ impl Pty {
     /// Agents start subprocesses, so killing only the direct child would leave
     /// them holding this pane's file descriptors.
     ///
-    /// Only the first call does anything. Once the tree has been ended,
-    /// nothing keeps its pid from being given to another process, which a
-    /// second ending by that pid could reach.
+    /// Only the first call does anything. On Unix the pane's process is kept
+    /// unreaped until here, so its pid cannot be given to another process
+    /// before the tree is ended by it.
     pub fn terminate(&mut self) {
         let Some(pid) = self.pid.take() else {
             return;
         };
 
-        if let Err(error) =
-            dispatch_os::process::terminate_tree(pid, dispatch_os::process::DEFAULT_GRACE)
-        {
+        if let Err(error) = self.child.end_tree(dispatch_os::process::DEFAULT_GRACE) {
             tracing::warn!(%pid, %error, "failed to terminate the pane's process tree");
         }
     }
@@ -605,9 +608,9 @@ impl PtySession {
     /// the pane is terminated.
     ///
     /// `None` once it has been, or where the platform did not report one.
-    /// Still returned after the child has exited, when the number may
-    /// already belong to some other process: check [`PtySession::state`]
-    /// before looking it up.
+    /// Still returned after the child has exited, when the number is still
+    /// the pane's but names a process that has gone: check
+    /// [`PtySession::state`] before looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pty.pid()
@@ -734,10 +737,11 @@ fn spawn_writer(
     });
 }
 
-/// Waits for the child and reports its exit status.
-fn spawn_waiter(child: dispatch_os::pty::Child, tx: Sender<PtyEvent>) {
+/// Waits for the child and reports its exit status, leaving it unreaped for
+/// the pane's close.
+fn spawn_waiter(child: Arc<dispatch_os::pty::Child>, tx: Sender<PtyEvent>) {
     std::thread::spawn(move || {
-        let _ = tx.send(PtyEvent::Exited(child.wait()));
+        let _ = tx.send(PtyEvent::Exited(child.wait_exit()));
     });
 }
 

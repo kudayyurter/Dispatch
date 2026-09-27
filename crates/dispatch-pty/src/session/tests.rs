@@ -669,6 +669,20 @@ fn dropping_a_pane_that_has_exited_ends_what_it_left_running() {
         left.iter().all(|p| !dispatch_os::process::is_running(*p)),
         "what an exited pane left running outlived the pane: {left:?}"
     );
+
+    // The shell itself was kept unreaped until the drop, and the drop let it
+    // go.
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while dispatch_os::process::is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane's shell was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]

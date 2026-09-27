@@ -56,12 +56,17 @@ impl Drop for Terminal {
     }
 }
 
-/// A process to wait on.
-pub(super) struct Child(OwnedHandle);
+/// A pane's process. Its job ends its tree; its handle keeps its pid its own
+/// until the handle is closed.
+pub(super) struct Child {
+    handle: OwnedHandle,
+    pid: u32,
+    ended: std::sync::atomic::AtomicBool,
+}
 
 impl Child {
-    pub(super) fn wait(self) -> i32 {
-        let handle = self.0.as_raw_handle() as HANDLE;
+    pub(super) fn wait_exit(&self) -> i32 {
+        let handle = self.handle.as_raw_handle() as HANDLE;
         // SAFETY: a live process handle; waiting on one is always defined.
         unsafe { WaitForSingleObject(handle, INFINITE) };
 
@@ -75,6 +80,16 @@ impl Child {
         } else {
             i32::try_from(code).unwrap_or(1)
         }
+    }
+
+    pub(super) fn end_tree(
+        &self,
+        grace: std::time::Duration,
+    ) -> Result<(), crate::process::ProcessError> {
+        if self.ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::process::terminate_tree(self.pid, grace)
     }
 }
 
@@ -132,7 +147,11 @@ pub(super) fn spawn(
         reader: Box::new(std::fs::File::from(output_read)),
         writer: Box::new(writer),
         terminal: super::Terminal(terminal),
-        child: super::Child(Child(process)),
+        child: super::Child(Child {
+            handle: process,
+            pid,
+            ended: std::sync::atomic::AtomicBool::new(false),
+        }),
         pid: Some(pid),
     })
 }
