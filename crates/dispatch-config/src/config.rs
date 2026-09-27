@@ -131,6 +131,7 @@ impl ShellConfig {
             command,
             args,
             env: BTreeMap::new(),
+            ..Launch::default()
         }
     }
 }

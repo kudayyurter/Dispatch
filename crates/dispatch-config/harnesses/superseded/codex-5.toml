@@ -1,0 +1,27 @@
+id = "codex"
+icon = ""
+display_name = "Codex"
+command = "codex"
+args = []
+
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "codex"]
+
+[task]
+args = ["exec", "{task}"]
+
+[task.platform.windows]
+args = ["/c", "codex", "exec", "{task}"]
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "text"
+
+[[settings]]
+key = "effort"
+label = "Reasoning effort"
+kind = "choice"
+options = ["low", "medium", "high"]
+default = "medium"

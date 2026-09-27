@@ -3357,10 +3357,8 @@ impl App {
             .iter()
             .map(|p| {
                 let mut detail = p.root.display().to_string();
-                if multiple_devices {
-                    if let Some(device) = self.state.device(p.device) {
-                        detail = format!("{detail} ({})", device.name);
-                    }
+                if multiple_devices && let Some(device) = self.state.device(p.device) {
+                    detail = format!("{detail} ({})", device.name);
                 }
                 Item::new(p.id.to_string(), &p.name).with_detail(detail)
             })
@@ -9314,6 +9312,7 @@ mod tests {
                 command: "sh".to_string(),
                 args: Vec::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -9358,6 +9357,7 @@ mod tests {
                 command: "sh".to_string(),
                 args: Vec::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -9428,6 +9428,7 @@ mod tests {
                 command: "sh".to_string(),
                 args: Vec::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             ..Default::default()
         };

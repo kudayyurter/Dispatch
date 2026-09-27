@@ -13,12 +13,14 @@ fn shell(script: &str) -> Launch {
             command: "cmd.exe".into(),
             args: vec!["/c".into(), script.into()],
             env: Default::default(),
+            ..Default::default()
         }
     } else {
         Launch {
             command: "sh".into(),
             args: vec!["-c".into(), script.into()],
             env: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -30,12 +32,14 @@ fn interactive_shell() -> Launch {
             command: "cmd.exe".into(),
             args: Vec::new(),
             env: Default::default(),
+            ..Default::default()
         }
     } else {
         Launch {
             command: "sh".into(),
             args: Vec::new(),
             env: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -233,6 +237,7 @@ fn a_missing_command_is_reported_rather_than_panicking() {
         command: "dispatch-no-such-binary".into(),
         args: Vec::new(),
         env: Default::default(),
+        ..Default::default()
     };
 
     let error = PtySession::spawn(&launch, &cwd(), Size::new(80, 24))
@@ -281,6 +286,34 @@ fn a_bare_pty_hands_over_bytes() {
     assert!(
         String::from_utf8_lossy(&output).contains("hello-from-a-pty"),
         "expected the child's output, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn a_variable_the_launch_unsets_is_not_inherited() {
+    // Removed from what the child would inherit from this process, not just
+    // left unset by the launch: a stale value is exactly what inheriting
+    // brings.
+    let (variable, script, absent) = if cfg!(windows) {
+        ("USERPROFILE", "echo [%USERPROFILE%]", "[%USERPROFILE%]")
+    } else {
+        ("HOME", "echo \"[${HOME-unset}]\"", "[unset]")
+    };
+    assert!(
+        std::env::var_os(variable).is_some(),
+        "{variable} is set here, so the child would inherit it"
+    );
+    let mut launch = shell(script);
+    launch.unset.insert(variable.to_string());
+
+    let mut pty = Pty::spawn(&launch, &cwd(), Size::new(80, 24)).expect("the shell starts");
+    let (state, output) = pty.drain_until_exit(Duration::from_secs(10));
+
+    assert_eq!(state, RunState::Exited(0));
+    assert!(
+        String::from_utf8_lossy(&output).contains(absent),
+        "{variable} reached the child: {:?}",
         String::from_utf8_lossy(&output)
     );
 }
@@ -364,18 +397,68 @@ fn a_pty_delivers_what_a_child_printed_after_reporting_its_exit() {
     );
 }
 
+/// Drains until `needle` has been printed, or panics.
+#[cfg(unix)]
+fn drain_until(pty: &mut Pty, needle: &str) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw {needle:?}; saw {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        seen.extend(pty.drain());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+#[test]
+#[cfg(unix)]
+fn a_pane_that_stops_reading_does_not_block_its_writer() {
+    // Raw mode so the terminal buffers what it is sent rather than
+    // processing lines, then never read: the shape of an agent busy with
+    // something else when a paste arrives.
+    let mut pty = Pty::spawn(
+        &shell("stty raw -echo; echo READY; sleep 30"),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+    drain_until(&mut pty, "READY");
+
+    // Larger than the budget, into an empty queue: accepted, and at once.
+    let started = std::time::Instant::now();
+    pty.write(&vec![b'x'; INPUT_BUDGET + 1])
+        .expect("a paste into an empty queue is accepted whatever its size");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "the write waited {:?} for a pane that is not reading",
+        started.elapsed()
+    );
+
+    // Anything more is refused whole, and says why.
+    let refused = pty.write(b"y");
+    assert!(
+        matches!(refused, Err(PtyError::InputFull { .. })),
+        "expected the input to be full, got {refused:?}"
+    );
+
+    pty.terminate();
+}
+
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "the pseudoconsole is held open on purpose, so the master never reaches end-of-file"
+    ignore = "the pseudoconsole is held open on purpose, so its output never reaches end-of-file"
 )]
 fn a_finished_pty_is_one_whose_output_is_complete() {
     // `is_finished` is the honest signal: both senders gone means the reader
     // reached end-of-file and the waiter reported the exit. Windows cannot give
-    // it -- `Pty` holds the slave so the pseudoconsole stays alive, which is what
-    // keeps a child from writing into a dead console -- so there the daemon's
-    // grace period is the only rule, and the test above is the one that covers
-    // it.
+    // it -- `Pty` holds the pseudoconsole open, which is what keeps a child from
+    // writing into a dead console -- so there the daemon's grace period is the
+    // only rule, and the test above is the one that covers it.
     let mut pty = Pty::spawn(&shell("echo complete-marker"), &cwd(), Size::new(80, 24))
         .expect("spawning succeeds");
 
@@ -396,39 +479,339 @@ fn a_finished_pty_is_one_whose_output_is_complete() {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_flood_is_handed_over_a_budget_at_a_time() {
+    // A megabyte, enough to cross DRAIN_BUDGET (128 KiB) many times over,
+    // printed as fast as the shell can and drained slowly. Before, the first
+    // drain took whatever had piled up in an unbounded channel; now each
+    // takes a bounded slice, and nothing is lost. The loop gets its own
+    // deadline instead of the shared 10 s TIMEOUT: macOS CI runners push PTY
+    // output slowly, and 30 s is generous enough to outlast that without
+    // masking a real regression.
+    const TOTAL: usize = 1_000_000;
+    const LOOP_DEADLINE: Duration = Duration::from_secs(30);
+    let mut pty = Pty::spawn(
+        &shell(&format!("head -c {TOTAL} /dev/zero | tr '\\0' x")),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+
+    let deadline = std::time::Instant::now() + LOOP_DEADLINE;
+    let mut received = 0;
+    while received < TOTAL {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {received} of {TOTAL} bytes arrived"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let chunk = pty.drain();
+        assert!(
+            chunk.len() <= DRAIN_BUDGET + 8192,
+            "one drain handed over {} bytes",
+            chunk.len()
+        );
+        received += chunk.iter().filter(|&&b| b == b'x').count();
+    }
+
+    assert_eq!(received, TOTAL, "every byte arrived, none twice");
+}
+
+#[test]
+fn a_drain_stops_at_its_budget_and_the_next_takes_the_rest() {
+    // The flood test above cannot tell a drain that keeps to its budget from
+    // one that takes everything: a real pane seldom has more than a budget
+    // waiting at the moment it is drained. Here the channel is filled before
+    // anything drains it. Chunks of 5000 bytes, so one of them crosses the
+    // budget rather than landing on it.
+    const CHUNK: usize = 5000;
+    const CHUNKS: usize = 30;
+
+    let (tx, events) = sync_channel(OUTPUT_CHUNKS);
+    let mut sent = Vec::new();
+    for i in 0..CHUNKS {
+        let chunk = vec![u8::try_from(i).expect("few chunks"); CHUNK];
+        sent.extend_from_slice(&chunk);
+        tx.try_send(PtyEvent::Output(chunk))
+            .expect("the channel has room for every chunk");
+    }
+    assert!(
+        sent.len() > DRAIN_BUDGET + CHUNK,
+        "more than one drain's worth is waiting"
+    );
+
+    let first = drain_from(&events, DRAIN_BUDGET).output;
+    assert!(
+        (DRAIN_BUDGET..=DRAIN_BUDGET + CHUNK).contains(&first.len()),
+        "one drain handed over {} of {} bytes",
+        first.len(),
+        sent.len()
+    );
+
+    let second = drain_from(&events, DRAIN_BUDGET).output;
+    assert_eq!(
+        [first, second].concat(),
+        sent,
+        "the next drain hands over the rest, in order"
+    );
+}
+
+/// A script that starts something and waits, on every platform: a pane
+/// with a grandchild.
+fn a_tree() -> &'static str {
+    if cfg!(windows) {
+        "ping -n 30 127.0.0.1 >nul"
+    } else {
+        "sleep 30 & sleep 30"
+    }
+}
+
+/// How many processes below the pane `a_tree` starts.
+fn tree_size() -> usize {
+    if cfg!(windows) { 1 } else { 2 }
+}
+
+#[test]
+fn terminating_a_pane_ends_everything_it_started() {
+    let mut pty =
+        Pty::spawn(&shell(a_tree()), &cwd(), Size::new(80, 24)).expect("the shell starts");
+    let pid = pty.pid().expect("a running pane has a pid");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while dispatch_os::process::descendants(pid).len() < tree_size() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never started its children"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let everyone: Vec<u32> = std::iter::once(pid)
+        .chain(dispatch_os::process::descendants(pid))
+        .collect();
+
+    pty.terminate();
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while everyone
+        .iter()
+        .any(|p| dispatch_os::process::is_running(*p))
+        && std::time::Instant::now() < deadline
+    {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        everyone
+            .iter()
+            .all(|p| !dispatch_os::process::is_running(*p)),
+        "a process the pane started outlived it: {everyone:?}"
+    );
+}
+
+/// A script that exits leaving a grandchild running, a moment after
+/// starting it: long enough for a test to see both.
+fn a_tree_that_outlives_its_shell() -> &'static str {
+    if cfg!(windows) {
+        // `start /b` runs the first ping beside cmd rather than waiting for
+        // it.
+        "start /b ping -n 30 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul"
+    } else {
+        // SIGHUP ignored, so the first sleep outlives its terminal's session
+        // leader.
+        "trap '' HUP; sleep 30 & sleep 2"
+    }
+}
+
+#[test]
+fn dropping_a_pane_that_has_exited_ends_what_it_left_running() {
+    let mut pty = Pty::spawn(
+        &shell(a_tree_that_outlives_its_shell()),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+    let pid = pty.pid().expect("a running pane has a pid");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while dispatch_os::process::descendants(pid).len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never started its children"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let below = dispatch_os::process::descendants(pid);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while pty.state() == RunState::Running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never exited"
+        );
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left: Vec<u32> = below
+        .into_iter()
+        .filter(|p| dispatch_os::process::is_running(*p))
+        .collect();
+    assert!(!left.is_empty(), "nothing outlived the pane's shell");
+
+    drop(pty);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while left.iter().any(|p| dispatch_os::process::is_running(*p))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        left.iter().all(|p| !dispatch_os::process::is_running(*p)),
+        "what an exited pane left running outlived the pane: {left:?}"
+    );
+}
+
+#[test]
+fn a_failed_resize_says_it_was_a_resize() {
+    // Opening failures are reported as failures to start; only a resize
+    // raises this, and a message about opening sends whoever reads it the
+    // wrong way.
+    let error = PtyError::Resize(anyhow::anyhow!("HRESULT 0x80070057"));
+
+    assert!(
+        error
+            .to_string()
+            .starts_with("failed to resize the pseudoterminal"),
+        "{error}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dropped_pane_lets_go_of_a_terminal_something_else_still_holds() {
+    // A process that leaves the pane's session -- so ending the pane does not
+    // end it -- and prints to the terminal until printing fails, then says
+    // so. On Linux printing fails only once nothing holds the terminal's
+    // other side. macOS revokes the terminal from everyone as soon as the
+    // pane's session leader exits, so there this passes either way -- and
+    // the shell waits, so that a revoke before the first print cannot fail
+    // the test before the pane is dropped. perl, because macOS has no
+    // setsid(1); it gives up after 20 s regardless.
+    let dir = std::env::temp_dir().join(format!("dispatch-pty-held-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir is writable");
+    let gone = dir.join("gone");
+    let script = format!(
+        "perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); $SIG{{HUP}} = \"IGNORE\"; $| = 1; \
+         for (1..400) {{ unless (print \"tick\\n\") {{ open(my $f, \">\", $ARGV[0]); print $f \"gone\"; exit 0 }} \
+         select(undef, undef, undef, 0.05) }}' \"{}\"; sleep 30",
+        gone.display()
+    );
+
+    let mut pty = Pty::spawn(&shell(&script), &cwd(), Size::new(80, 24)).expect("the shell starts");
+    drain_until(&mut pty, "tick");
+    drop(pty);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !gone.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let let_go = gone.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        let_go,
+        "the pane's side of the terminal was still open after the pane was dropped"
+    );
+}
+
+#[test]
 fn a_pane_is_told_about_dispatchs_terminal_not_the_one_outside() {
     // Dispatch draws the pane with its own emulator. A program told it is in
     // kitty would send kitty's private sequences through, and over SSH a
     // remote side without that terminfo mis-draws.
-    let mut command = CommandBuilder::new("true");
-    command.env("TERM", "xterm-kitty");
-    command.env("KITTY_WINDOW_ID", "7");
-    command.env("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty");
-    // A multiplexer outside counts too: a program that sees `TMUX` wraps its
-    // sequences for a tmux that is not the one drawing it.
-    command.env("TMUX", "/tmp/tmux-1000/default,1234,0");
+    let inherited = [
+        ("TERM", "xterm-kitty"),
+        ("KITTY_WINDOW_ID", "7"),
+        ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
+        // A multiplexer outside counts too: a program that sees `TMUX` wraps
+        // its sequences for a tmux that is not the one drawing it.
+        ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+    ]
+    .map(|(key, value)| (key.into(), value.into()));
 
-    apply_pane_env(&mut command);
+    let (env, remove) = pane_env(&shell("true"));
+    // The environment both spawns build from these: what is inherited, the
+    // variables set on top, and the removals taken out last.
+    let child = dispatch_os::pty::WindowsEnvironment::new(inherited, &env, &remove);
 
     assert_eq!(
-        command.get_env("TERM"),
+        child.get("TERM"),
         Some(std::ffi::OsStr::new("xterm-256color"))
     );
     assert_eq!(
-        command.get_env("COLORTERM"),
+        child.get("COLORTERM"),
         Some(std::ffi::OsStr::new("truecolor"))
     );
     assert_eq!(
-        command.get_env("TERM_PROGRAM"),
+        child.get("TERM_PROGRAM"),
         Some(std::ffi::OsStr::new("dispatch"))
     );
     assert_eq!(
-        command.get_env("TERM_PROGRAM_VERSION"),
+        child.get("TERM_PROGRAM_VERSION"),
         Some(std::ffi::OsStr::new(env!("CARGO_PKG_VERSION")))
     );
-    assert_eq!(command.get_env("KITTY_WINDOW_ID"), None);
-    assert_eq!(command.get_env("GHOSTTY_RESOURCES_DIR"), None);
-    assert_eq!(command.get_env("TMUX"), None);
+    assert_eq!(child.get("KITTY_WINDOW_ID"), None);
+    assert_eq!(child.get("GHOSTTY_RESOURCES_DIR"), None);
+    assert_eq!(child.get("TMUX"), None);
+}
+
+#[test]
+fn a_harnesss_spelling_of_a_pane_variable_is_the_one_its_pane_gets() {
+    // On Windows `Term` and `TERM` are one variable, so the harness's
+    // spelling replaces Dispatch's rather than sitting beside it for the
+    // spawn to choose between, and a host variable it sets itself, however
+    // spelled, is kept. Elsewhere they are different variables.
+    let mut launch = shell("true");
+    launch.env.insert("Term".into(), "vt100".into());
+    launch.env.insert("Tmux".into(), "the harness's".into());
+
+    let (env, remove) = pane_env(&launch);
+    let terms: Vec<&str> = env
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("TERM"))
+        .map(String::as_str)
+        .collect();
+
+    if cfg!(windows) {
+        assert_eq!(terms, ["Term"], "one variable, the harness's");
+        assert!(!remove.contains("TMUX"), "the harness sets it: {remove:?}");
+    } else {
+        assert_eq!(terms, ["TERM", "Term"], "two variables");
+        assert!(remove.contains("TMUX"), "{remove:?}");
+    }
+}
+
+#[test]
+fn a_variable_the_launch_unsets_stays_unset_in_a_pane() {
+    // Whoever starts the launch decides what it must not have, and that
+    // outranks what Dispatch tells every pane.
+    let mut launch = shell("true");
+    launch.unset.insert("TERM_PROGRAM".into());
+    launch.unset.insert("DISPATCH_TASK_FILE".into());
+
+    let (env, remove) = pane_env(&launch);
+    let child = dispatch_os::pty::WindowsEnvironment::new(
+        [("DISPATCH_TASK_FILE".into(), "stale".into())],
+        &env,
+        &remove,
+    );
+
+    assert_eq!(child.get("TERM_PROGRAM"), None);
+    assert_eq!(child.get("DISPATCH_TASK_FILE"), None);
+    assert_eq!(
+        child.get("TERM"),
+        Some(std::ffi::OsStr::new("xterm-256color"))
+    );
 }
 
 #[test]
