@@ -498,26 +498,34 @@ fn reported_size(cols: u16, rows: u16) -> String {
 /// for a moment and gone, and counting it measured the shell rather than the
 /// fleet.
 ///
-/// Counted by the state glyph at the end of a row: every pane carries one and
-/// nothing else in the list does. Indentation cannot tell them apart — a
-/// project with no panes has a blank twisty, so its row starts with spaces
-/// exactly as a pane's does.
+/// Counted by the state glyph at the end of a row: every pane carries one,
+/// whatever it is doing, the spinner's frames included. A project's heading can
+/// carry the working, blocked and finished glyphs too, as a roll-up of its
+/// panes, so it is told apart by its folder mark. Indentation cannot tell them
+/// apart — a project with no panes has a blank twisty, so its row starts with
+/// spaces exactly as a pane's does.
 ///
 /// The last row is the status line, which is not part of the sidebar.
 fn panes_shown(lines: &[String]) -> usize {
-    use dispatch_tui::sidebar::{CLOSED, DONE, FAILED, IDLE, RUNNING, STARTING};
+    use dispatch_tui::sidebar::{
+        BLOCKED, CLOSED, DONE, FAILED, IDLE, REPOSITORY, RUNNING, SHUT_FOLDER, SPINNER, STARTING,
+        UNSEEN,
+    };
 
     let width = dispatch_tui::sidebar::WIDTH as usize;
     let sidebar = lines.split_last().map_or(lines, |(_status, rest)| rest);
+    let states: Vec<&str> = [
+        STARTING, RUNNING, IDLE, BLOCKED, DONE, FAILED, CLOSED, UNSEEN,
+    ]
+    .into_iter()
+    .chain(SPINNER)
+    .collect();
 
     sidebar
         .iter()
         .map(|line| line.chars().take(width).collect::<String>())
-        .filter(|row| {
-            [STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED]
-                .iter()
-                .any(|glyph| row.contains(glyph))
-        })
+        .filter(|row| !row.contains(REPOSITORY) && !row.contains(SHUT_FOLDER))
+        .filter(|row| states.iter().any(|glyph| row.contains(glyph)))
         .count()
 }
 
