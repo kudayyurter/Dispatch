@@ -5070,14 +5070,16 @@ fn no_tab_command_is_acted_on_before_a_hello_or_after_a_refusal() {
             },
         );
         daemon.request_for_test(id, command);
+        let told = drain(&refused);
         assert!(
-            drain(&refused).iter().all(|m| matches!(
-                m,
-                ServerMessage::Error {
-                    error: ProtocolError::IncompatibleVersion { .. }
-                }
-            )),
-            "a refused client is told only why"
+            !told.is_empty()
+                && told.iter().all(|m| matches!(
+                    m,
+                    ServerMessage::Error {
+                        error: ProtocolError::IncompatibleVersion { .. }
+                    }
+                )),
+            "a refused client is told why, and nothing else: {told:?}"
         );
         id += 1;
     }
