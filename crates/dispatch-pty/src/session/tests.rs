@@ -657,6 +657,16 @@ fn dropping_a_pane_that_has_exited_ends_what_it_left_running() {
         .collect();
     assert!(!left.is_empty(), "nothing outlived the pane's shell");
 
+    // The waiter reports the exit without reaping, so the shell itself is
+    // still here, a zombie, right up to the drop below. Without this the
+    // block after the drop would pass even if the waiter reaped it here:
+    // reaped now or reaped by the drop looks the same once the drop returns.
+    #[cfg(unix)]
+    assert!(
+        dispatch_os::process::is_running(pid),
+        "the exited shell is kept unreaped until the pane goes"
+    );
+
     drop(pty);
 
     let deadline = std::time::Instant::now() + TIMEOUT;
@@ -904,9 +914,10 @@ fn a_program_writing_a_line_at_a_time_is_not_held_to_a_few_lines_a_drain() {
         Arc::clone(&backlog),
     );
 
-    eventually("the reader stopped before anything drained it", || {
-        reader.is_finished()
-    });
+    eventually(
+        "the reader was held back before anything drained it",
+        || reader.is_finished(),
+    );
     let drained = drain_from(&events, DRAIN_BUDGET);
     assert_eq!(
         drained.output.len(),

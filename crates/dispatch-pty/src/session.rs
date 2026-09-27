@@ -104,8 +104,8 @@ enum PtyEvent {
 ///
 /// The reader counts a read in the same critical section it sends it in,
 /// and a drain counts what it took under the same lock. So a drain can never
-/// take bytes that were not counted yet, and leave the count too high for
-/// good.
+/// count a read off before the reader has counted it on, and the count can
+/// never be left too high.
 #[derive(Default)]
 struct Backlog {
     state: Mutex<Waiting>,
@@ -198,10 +198,10 @@ pub struct Pty {
     /// How much of `events` is output not yet drained.
     backlog: Arc<Backlog>,
     size: Size,
-    /// Process id of the child, used to terminate its whole tree, and
-    /// taken when it does.
+    /// Process id of the child, for callers that report or look up the
+    /// process. Taken when the tree is ended; `child` is what ends it.
     pid: Option<u32>,
-    /// The process, shared with the waiter thread, which is what ends the
+    /// The process: the waiter thread waits on it, and `terminate` ends its
     /// tree.
     child: Arc<dispatch_os::pty::Child>,
     state: RunState,
@@ -211,10 +211,15 @@ pub struct Pty {
     /// Windows, ending it leaves the child writing into a console that is
     /// gone.
     ///
-    /// Last, so it is dropped after `events`. Closing a Windows
-    /// pseudoconsole waits for what it still has to say to be read, and the
-    /// reader cannot read while it waits for room in a channel someone still
-    /// holds.
+    /// Closing a Windows pseudoconsole waits until what it still has to say
+    /// has been read. `Drop` closes `backlog` before any field of this
+    /// struct drops, which wakes a reader parked waiting for room, so by the
+    /// time this field drops and the pseudoconsole actually closes, that
+    /// reader is already reading on (Windows, where it keeps reading to
+    /// drain what is left) or already gone (Unix, where closing the backlog
+    /// makes it stop and let go of its end of the terminal). Removing that
+    /// `close()` call would bring back a Windows-only hang: the console
+    /// waiting for a read that a reader parked on room will never make.
     terminal: dispatch_os::pty::Terminal,
 }
 

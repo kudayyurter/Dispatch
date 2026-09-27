@@ -469,9 +469,12 @@ mod imp {
             // Reaped before the group is waited on: an unreaped leader counts
             // as a member, and the wait would run out every time. From here
             // the group's id is held by whatever is left in it, and once a
-            // probe finds it gone nothing signals it again. The one window
-            // left is between a probe that found members and the kill straight
-            // after it.
+            // probe finds it gone nothing signals it again. Two windows are
+            // left, both needing the pid space to wrap within microseconds:
+            // one between this reap and the first probe, when the leader was
+            // the group's last member and the id is briefly unheld; the other
+            // between a probe that found members and the kill straight after
+            // it.
             self.reap();
             let rest = deadline.saturating_duration_since(Instant::now());
             if !wait_for_group_to_exit(pid, rest)
@@ -486,7 +489,8 @@ mod imp {
     impl Drop for Child {
         fn drop(&mut self) {
             // A child whose tree was never ended is reaped if it has exited;
-            // one still running is left to whoever else holds it.
+            // one still running when its last holder lets go is left
+            // unreaped, because blocking a drop on it would be worse.
             if let Some(mut handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = handle.try_wait();
             }
@@ -906,7 +910,10 @@ mod tests {
     fn ending_an_exited_panes_tree_reaches_what_it_left_and_returns_promptly() {
         // The unreaped leader still counts as a member of its group. Were it
         // not reaped before the wait for the group, every close would wait out
-        // the grace and the kill timeout too.
+        // the grace and the kill timeout too. A grace much longer than the 1 s
+        // bound below is what makes that failure visible: reaping promptly
+        // finishes in about 0.01 s regardless, but a version that reaps only
+        // after waiting out the group would cost this whole grace, every time.
         let process = sh("trap '' HUP; sleep 30 & echo $!; exit 0");
         let left: u32 = first_line(process.reader)
             .parse()
@@ -920,7 +927,7 @@ mod tests {
         let started = Instant::now();
         process
             .child
-            .end_tree(Duration::from_millis(250))
+            .end_tree(Duration::from_secs(3))
             .expect("ending succeeds");
         assert!(
             started.elapsed() < Duration::from_secs(1),
