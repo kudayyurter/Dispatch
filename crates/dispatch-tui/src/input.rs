@@ -3,7 +3,8 @@
 //! A focused pane receives every key verbatim, so an agent's own full-screen
 //! interface works unchanged. A prefix key escapes to Dispatch's commands,
 //! which is the only way to have both without stealing bindings the agents
-//! already use.
+//! already use. Keys reach Dispatch through the keymap's modes and its
+//! prefix.
 
 use dispatch_core::PaneId;
 use dispatch_pty::{Key, Modifiers, MouseAction, MouseButton, MouseInput};
@@ -17,6 +18,9 @@ pub use crossterm::event::{
 // module converts into.
 use crossterm::event::MouseButton as MouseButton_;
 
+pub use crate::keymap::KeyMode;
+use crate::keymap::{Chord, Command, Keymap};
+
 /// Which way to move focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -28,17 +32,6 @@ pub enum Direction {
     Up,
     /// Right.
     Right,
-}
-
-/// Which keys the router is reading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KeyMode {
-    /// Keys go to the focused pane. The prefix and a few `Alt` keys reach
-    /// Dispatch.
-    #[default]
-    Normal,
-    /// Keys are tab commands, until one of them ends the mode.
-    Tabs,
 }
 
 /// What an input event should cause.
@@ -96,8 +89,18 @@ pub enum Action {
     /// Move focus left or right, going on to the neighbouring tab at the
     /// grid's edge.
     FocusOrTab(Direction),
-    /// Enter scrollback mode.
-    Scrollback,
+    /// Focus the next pane on the tab on screen, wrapping.
+    FocusNext,
+    /// Scroll the focused pane by half its height this many times; negative
+    /// towards older output.
+    ScrollHalfPages(isize),
+    /// Scroll the focused pane by its whole height this many times; negative
+    /// towards older output.
+    ScrollPages(isize),
+    /// Show the oldest output the focused pane still holds.
+    ScrollToTop,
+    /// Return the focused pane to its newest output.
+    ScrollToBottom,
     /// Reopen the approval prompt for whatever delegation requests are queued.
     Approvals,
     /// Focus the focused pane's next child, opening it into the tiled grid.
@@ -123,66 +126,43 @@ pub enum Action {
     Quit,
 }
 
-/// The key that escapes to Dispatch's own commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Prefix {
-    /// The character.
-    pub code: char,
-    /// The modifiers held with it.
-    pub modifiers: KeyModifiers,
-}
-
-impl Default for Prefix {
-    fn default() -> Self {
-        // Ctrl-a, as tmux and screen use. Agents do not bind it, and users
-        // coming from either already have the habit.
-        Self {
-            code: 'a',
-            modifiers: KeyModifiers::CONTROL,
-        }
-    }
-}
-
-impl Prefix {
-    fn matches(&self, event: &KeyEvent) -> bool {
-        event.code == KeyCode::Char(self.code) && event.modifiers == self.modifiers
-    }
-}
-
-/// Routes input to panes or to Dispatch.
+/// Routes input to panes or to Dispatch, reading keys through a keymap.
 #[derive(Debug, Default)]
 pub struct InputRouter {
-    prefix: Prefix,
-    /// Whether the prefix was the previous key, so this one is a command.
-    armed: bool,
+    keymap: Keymap,
     /// Which keys it is reading.
     mode: KeyMode,
 }
 
 impl InputRouter {
-    /// Creates a router using the default prefix.
+    /// A router reading the keys Dispatch ships with.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a router using `prefix`.
+    /// A router reading `keymap`.
     #[must_use]
-    pub fn with_prefix(prefix: Prefix) -> Self {
+    pub fn with_keymap(keymap: Keymap) -> Self {
         Self {
-            prefix,
-            armed: false,
+            keymap,
             mode: KeyMode::Normal,
         }
     }
 
-    /// Whether the next key will be read as a command.
+    /// The keys it reads, for the status row to spell out.
+    #[must_use]
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Whether the next key will be read as a command after the prefix.
     ///
     /// Shown in the status bar: a prefix that armed invisibly is how a
     /// keystroke goes missing with no explanation.
     #[must_use]
     pub fn is_armed(&self) -> bool {
-        self.armed
+        self.mode == KeyMode::Prefix
     }
 
     /// Which keys the router is reading, for the status row to say.
@@ -191,9 +171,14 @@ impl InputRouter {
         self.mode
     }
 
-    /// Leaves tab mode, for a click the router itself never sees.
+    /// Leaves whatever mode it is in, for a click the router never sees.
+    ///
+    /// Not lock: that is left only by its own key, or a click meant for a
+    /// program that wants the mouse would unlock the keys it wants too.
     pub fn leave_mode(&mut self) {
-        self.mode = KeyMode::Normal;
+        if self.mode != KeyMode::Lock {
+            self.mode = KeyMode::Normal;
+        }
     }
 
     /// Decides what an event means.
@@ -204,15 +189,15 @@ impl InputRouter {
         match event {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => {
-                // A click ends tab mode, then does what it would have anyway.
+                // A click ends a mode, then does what it would have anyway.
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.leave_mode();
                 }
                 self.handle_mouse(mouse, panes)
             }
             Event::Paste(text) => {
-                // Text for the pane, not a tab command. The mode ends too,
-                // or the next key would be read as one the user never meant.
+                // Text for the pane, not a command. A mode ends too, or the
+                // next key would be read as one the user never meant.
                 self.leave_mode();
                 Action::Paste(text.clone())
             }
@@ -226,89 +211,76 @@ impl InputRouter {
         if event.kind != KeyEventKind::Press {
             return Action::None;
         }
+        let chord = Chord::from_event(event);
 
-        if self.mode == KeyMode::Tabs {
-            return self.tab_key(event);
-        }
-
-        if self.armed {
-            self.armed = false;
-
-            // The prefix twice sends the prefix itself, which is the only way
-            // to type it into a pane.
-            if self.prefix.matches(event) {
-                return Action::SendKey(
-                    Key::Char(self.prefix.code),
-                    modifiers_of(self.prefix.modifiers),
-                );
+        match self.mode {
+            KeyMode::Normal => match self.keymap.lookup(KeyMode::Normal, &chord) {
+                Some(command) => self.run(command),
+                None => send(event),
+            },
+            // Every key goes to the pane but the one that unlocks.
+            KeyMode::Lock => {
+                if self.keymap.lookup(KeyMode::Lock, &chord) == Some(Command::Unlock) {
+                    self.mode = KeyMode::Normal;
+                    Action::None
+                } else {
+                    send(event)
+                }
             }
+            mode => {
+                // The key that entered the mode, pressed again, is for the
+                // pane: the only way to type it into a program that wants it,
+                // as `^a ^a` always was.
+                let entering = mode
+                    .entered_by()
+                    .map(|command| self.keymap.chords_for(KeyMode::Normal, command))
+                    .unwrap_or_default();
+                if entering.contains(&chord) {
+                    self.mode = KeyMode::Normal;
+                    return send(event);
+                }
 
-            return command_for(event);
-        }
+                // The prefix reads one key, whatever it is.
+                if mode == KeyMode::Prefix {
+                    self.mode = KeyMode::Normal;
+                }
 
-        if self.prefix.matches(event) {
-            self.armed = true;
-            return Action::None;
-        }
+                // After the prefix, a key typed with Ctrl still held is read
+                // as the key alone when that is all that is bound: `^a ^x`
+                // for `^a x`, as screen's users type it, and as the prefix
+                // read keys before the keymap.
+                let command = self.keymap.lookup(mode, &chord).or_else(|| {
+                    (mode == KeyMode::Prefix && chord.modifiers.contains(KeyModifiers::CONTROL))
+                        .then(|| Chord::new(chord.code, chord.modifiers - KeyModifiers::CONTROL))
+                        .and_then(|bare| self.keymap.lookup(mode, &bare))
+                });
 
-        if is_tab_mode_key(event) {
-            self.mode = KeyMode::Tabs;
-            return Action::None;
-        }
-
-        if let Some(action) = direct(event) {
-            return action;
-        }
-
-        match translate(event) {
-            Some((key, mods)) => Action::SendKey(key, mods),
-            None => Action::None,
+                // An unbound key does nothing rather than reaching the pane,
+                // so a stray key cannot run something in an agent, and a mode
+                // stays on through it.
+                let Some(command) = command else {
+                    return Action::None;
+                };
+                let action = self.run(command);
+                if mode.is_modal() && self.mode == mode && !command.stays() {
+                    self.mode = KeyMode::Normal;
+                }
+                action
+            }
         }
     }
 
-    /// What a key means in tab mode, and whether the mode stays on after it.
-    ///
-    /// Stepping keys keep it on, so a tab or a pane can be walked several
-    /// places along; keys that open something or jump somewhere end it.
-    fn tab_key(&mut self, event: &KeyEvent) -> Action {
-        // Twice sends it through, the way the prefix does: Claude Code and a
-        // shell's fzf both use Ctrl t, and this is how they still get it.
-        if is_tab_mode_key(event) {
-            self.mode = KeyMode::Normal;
-            return Action::SendKey(Key::Char('t'), modifiers_of(KeyModifiers::CONTROL));
-        }
-
-        // Shift is allowed through: some terminals report it for `[` and `]`.
-        if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
+    /// Carries out a command: the router's own — entering, leaving and
+    /// unlocking a mode — here, and the rest as the action the app runs.
+    fn run(&mut self, command: Command) -> Action {
+        if let Some(mode) = command.enters() {
+            self.mode = mode;
             return Action::None;
         }
-
-        let (action, stays) = match event.code {
-            KeyCode::Char('n') => (Action::NewTab, false),
-            KeyCode::Char('r') => (Action::RenameTab, false),
-            KeyCode::Char('x') => (Action::CloseTab, false),
-            KeyCode::Left | KeyCode::Char('h') => (Action::PreviousTab, true),
-            KeyCode::Right | KeyCode::Char('l') => (Action::NextTab, true),
-            KeyCode::Char('[') => (Action::MovePaneLeft, true),
-            KeyCode::Char(']') => (Action::MovePaneRight, true),
-            KeyCode::Char('i') => (Action::MoveTabLeft, true),
-            KeyCode::Char('o') => (Action::MoveTabRight, true),
-            KeyCode::Char(digit @ '1'..='9') => (
-                Action::SelectTab(digit.to_digit(10).unwrap_or(1) as usize - 1),
-                false,
-            ),
-            KeyCode::Tab => (Action::LastTab, false),
-            KeyCode::Esc | KeyCode::Enter => (Action::None, false),
-            // Anything else is ignored and the mode stays on: a stray key must
-            // neither reach a pane nor drop the user out of what they were
-            // doing.
-            _ => return Action::None,
-        };
-
-        if !stays {
+        if matches!(command, Command::LeaveMode | Command::Unlock) {
             self.mode = KeyMode::Normal;
         }
-        action
+        command.action().unwrap_or(Action::None)
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent, panes: &[(PaneId, Rect)]) -> Action {
@@ -329,7 +301,10 @@ impl InputRouter {
 
         let (action, button) = match event.kind {
             // Focus follows the pointer, so moving the mouse over a pane is
-            // enough to type into it.
+            // enough to type into it. Not in scroll mode: its keys read the
+            // pane it was entered on, and a nudge of the mouse would hand
+            // them to another.
+            MouseEventKind::Moved if self.mode == KeyMode::Scroll => return Action::None,
             MouseEventKind::Moved => return Action::FocusPane(*id),
             MouseEventKind::Down(button) => (MouseAction::Press, translate_button(button)),
             MouseEventKind::Up(button) => (MouseAction::Release, translate_button(button)),
@@ -361,67 +336,12 @@ fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
-/// The command a key means once the prefix has armed.
-fn command_for(event: &KeyEvent) -> Action {
-    match event.code {
-        KeyCode::Char('n') => Action::NewPane,
-        KeyCode::Char('x') => Action::ClosePane,
-        KeyCode::Char('z') => Action::ToggleZoom,
-        KeyCode::Char('h') => Action::FocusDirection(Direction::Left),
-        KeyCode::Char('j') => Action::FocusDirection(Direction::Down),
-        KeyCode::Char('k') => Action::FocusDirection(Direction::Up),
-        KeyCode::Char('l') => Action::FocusDirection(Direction::Right),
-        KeyCode::Char('p') => Action::ProjectPicker,
-        KeyCode::Char('H') => Action::HarnessManager,
-        // `p` is already the project picker, so approvals go on `a` instead —
-        // mnemonic with the `a` that approves one once the prompt is open.
-        KeyCode::Char('a') => Action::Approvals,
-        // A subagent otherwise has no keyboard way in: `FocusDirection`
-        // searches the tiled grid, which excludes an unopened child by
-        // construction, and a click is not available over SSH without mouse
-        // reporting.
-        KeyCode::Char('s') => Action::ExpandChild,
-        KeyCode::Char('c') => Action::CollapseChild,
-        KeyCode::Char('f') => Action::ToggleFold,
-        KeyCode::Char('o') => Action::OpenProject,
-        KeyCode::Char('m') => Action::AddMachine,
-        KeyCode::Char('[') => Action::Scrollback,
-        // A grid holds four panes at most, so a fifth opens a tab rather than
-        // shrinking the other four into unreadability. Digits pick one
-        // directly; Tab walks them for anyone who would rather not count.
-        KeyCode::Char(digit @ '1'..='9') => {
-            Action::SelectTab(digit.to_digit(10).unwrap_or(1) as usize - 1)
-        }
-        KeyCode::Tab => Action::NextTab,
-        KeyCode::Char('q') => Action::Quit,
-        // An unbound key after the prefix does nothing rather than reaching
-        // the pane, so a mistyped command cannot run something in an agent.
-        _ => Action::None,
+/// The key, for the focused pane.
+fn send(event: &KeyEvent) -> Action {
+    match translate(event) {
+        Some((key, mods)) => Action::SendKey(key, mods),
+        None => Action::None,
     }
-}
-
-/// `Ctrl t`, the key that enters tab mode, as it does in zellij.
-fn is_tab_mode_key(event: &KeyEvent) -> bool {
-    event.code == KeyCode::Char('t') && event.modifiers == KeyModifiers::CONTROL
-}
-
-/// The keys that reach Dispatch with no mode and no prefix, as zellij's `Alt`
-/// keys do. `Alt` with anything else held still goes to the pane.
-fn direct(event: &KeyEvent) -> Option<Action> {
-    if event.modifiers != KeyModifiers::ALT {
-        return None;
-    }
-
-    Some(match event.code {
-        KeyCode::Char('n') => Action::NewPane,
-        KeyCode::Char('i') => Action::MoveTabLeft,
-        KeyCode::Char('o') => Action::MoveTabRight,
-        KeyCode::Left | KeyCode::Char('h') => Action::FocusOrTab(Direction::Left),
-        KeyCode::Right | KeyCode::Char('l') => Action::FocusOrTab(Direction::Right),
-        KeyCode::Up | KeyCode::Char('k') => Action::FocusDirection(Direction::Up),
-        KeyCode::Down | KeyCode::Char('j') => Action::FocusDirection(Direction::Down),
-        _ => return None,
-    })
 }
 
 /// Converts a crossterm button into the encoder's.

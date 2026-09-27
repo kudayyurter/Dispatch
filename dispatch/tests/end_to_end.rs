@@ -843,9 +843,9 @@ fn a_picker_takes_the_keyboard_while_it_is_open() {
 
 #[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
-fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
-    // Scrollback is only useful if new output does not yank the view away and
-    // typing brings it back, which is what every terminal does.
+fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output() {
+    // Scrollback is only useful if new output does not yank the view away
+    // and there is a plain way back, which in scroll mode is Esc.
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
@@ -858,16 +858,30 @@ fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
         "the newest output should be visible first"
     );
 
+    // The prefix route into scroll mode, which is what `^a [` became.
     app.send(b"\x01[");
     assert!(
-        app.wait_for(|lines| contains(lines, "scrolled back")),
-        "scrolling back should be announced"
+        app.wait_for(|lines| contains(lines, "SCROLL")),
+        "the prefix then [ opens scroll mode"
+    );
+
+    // Half a page back: the newest row is no longer on screen.
+    app.send(b"u");
+    assert!(
+        app.wait_for(|lines| !contains(lines, "row80")),
+        "the view moved back through the output"
+    );
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| contains(lines, "row80") && !contains(lines, "SCROLL")),
+        "Esc returns to the newest output"
     );
 
     app.send(b"echo back-at-the-bottom\r");
     assert!(
         app.wait_for(|lines| contains(lines, "back-at-the-bottom")),
-        "typing should return to the newest output"
+        "typing reaches the shell again"
     );
 }
 
@@ -1458,4 +1472,98 @@ fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
         app.wait_for(|lines| contains(lines, "tab 2/2")),
         "the new pane is on a tab of its own"
     );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+
+    app.send(b"seq -f 'line-%03g' 1 200\r");
+    assert!(app.wait_for(|lines| contains(lines, "line-200")));
+
+    // Ctrl s, then k thirty times: a line at a time, past a whole pane.
+    app.send(b"\x13");
+    app.send(&[b'k'; 30]);
+    assert!(
+        app.wait_for(|lines| contains(lines, "SCROLL") && !contains(lines, "line-200")),
+        "k scrolls the output back"
+    );
+
+    // g: the oldest output.
+    app.send(b"g");
+    assert!(
+        app.wait_for(|lines| contains(lines, "line-001")),
+        "g shows where the output began"
+    );
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| contains(lines, "line-200") && !contains(lines, "SCROLL")),
+        "Esc returns to live output"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn lock_mode_gives_the_shell_the_keys_dispatch_takes() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+    // Type-ahead into a shell that has not started yet can be lost.
+    assert!(
+        app.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    // `cat -v` shows a control key it is given as `^P`.
+    app.send(b"cat -v\r");
+
+    // Ctrl g locks.
+    app.send(b"\x07");
+    assert!(app.wait_for(|lines| contains(lines, "LOCKED")));
+
+    // Ctrl p, pane mode's key, is the shell's while locked. Ctrl p rather than
+    // Ctrl t: on macOS the terminal driver takes Ctrl t itself (it prints the
+    // load), so it would never reach `cat` and the test would prove nothing.
+    app.send(b"\x10\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "^P")),
+        "the shell was given Ctrl p"
+    );
+    let lines = app.lines();
+    assert!(contains(&lines, "LOCKED"), "still locked");
+    assert!(!contains(&lines, "PANE  "), "no pane mode while locked");
+
+    // Ctrl d ends `cat`; Ctrl g unlocks.
+    app.send(b"\x04\x07");
+    assert!(
+        app.wait_for(|lines| !contains(lines, "LOCKED")),
+        "Ctrl g unlocks"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_key_rebound_in_config_toml_is_the_one_dispatch_reads() {
+    let fixture = Fixture::new("rebind");
+    let config = fixture.config.path().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("the fixture wrote its config");
+    text.push_str("\n[keys.normal]\n\"Ctrl a\" = \"none\"\n\"Ctrl b\" = \"prefix\"\n");
+    std::fs::write(&config, text).expect("temp dir is writable");
+
+    let mut app = Harness::spawn(&fixture, Size::new(100, 30), &[]);
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    // Ctrl b, then n: the picker, through the moved prefix.
+    app.send(b"\x02");
+    assert!(app.wait_for(|lines| contains(lines, "PREFIX")));
+    app.send(b"n");
+    assert!(
+        app.wait_for(|lines| contains(lines, "New pane")),
+        "the new prefix reaches its commands"
+    );
+    app.send(b"\x1b");
 }

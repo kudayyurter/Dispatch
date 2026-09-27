@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ConfigError;
 use crate::harness::Launch;
@@ -135,6 +135,103 @@ impl ShellConfig {
     }
 }
 
+/// One value in a `[keys.<mode>]` table, as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum KeyValue {
+    /// A command's name, or `none`.
+    Command(String),
+    /// A flag, as `clear = true` is.
+    Flag(bool),
+    /// Anything else, named by its TOML type, so it is reported rather than
+    /// failing the file.
+    Other(String),
+}
+
+impl From<toml::Value> for KeyValue {
+    fn from(value: toml::Value) -> Self {
+        match value {
+            toml::Value::String(name) => KeyValue::Command(name),
+            toml::Value::Boolean(flag) => KeyValue::Flag(flag),
+            other => KeyValue::Other(other.type_str().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(toml::Value::deserialize(deserializer)?.into())
+    }
+}
+
+/// One entry under `[keys]`, as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum KeyTable {
+    /// A mode's table: each key's text and what it is bound to.
+    Table(BTreeMap<String, KeyValue>),
+    /// Anything else, named by its TOML type, so a binding written straight
+    /// under `[keys]` is reported rather than failing the file.
+    Other(String),
+}
+
+impl From<toml::Value> for KeyTable {
+    fn from(value: toml::Value) -> Self {
+        match value {
+            toml::Value::Table(table) => KeyTable::Table(
+                table
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into()))
+                    .collect(),
+            ),
+            other => KeyTable::Other(other.type_str().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyTable {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(toml::Value::deserialize(deserializer)?.into())
+    }
+}
+
+/// What `[keys]` says: per mode, each key's text and what it is bound to,
+/// as written.
+///
+/// Kept as text, and read leniently at every level: which modes, keys and
+/// commands exist is the interface's business, and it reports what it cannot
+/// use, so a mistake costs one binding rather than the whole file — and with
+/// it the daemon, which never reads `[keys]` at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(transparent)]
+pub struct KeysConfig {
+    /// Each entry under `[keys]`, by the name it is written under.
+    pub modes: BTreeMap<String, KeyTable>,
+    /// Whether `keys` was something other than a table, such as
+    /// `keys = "vim"`. It then binds nothing, and says so through the
+    /// interface.
+    #[serde(skip)]
+    pub not_a_table: bool,
+}
+
+impl<'de> Deserialize<'de> for KeysConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match toml::Value::deserialize(deserializer)? {
+            toml::Value::Table(table) => KeysConfig {
+                modes: table
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into()))
+                    .collect(),
+                not_a_table: false,
+            },
+            _ => KeysConfig {
+                modes: BTreeMap::new(),
+                not_a_table: true,
+            },
+        })
+    }
+}
+
 /// Everything `config.toml` can say.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -146,6 +243,8 @@ pub struct Config {
     /// The shell a `shell` pane runs. Read by whichever side starts panes:
     /// the daemon, or a standalone client.
     pub shell: ShellConfig,
+    /// Keys the interface binds, over its defaults. The daemon ignores it.
+    pub keys: KeysConfig,
 }
 
 /// A loaded configuration, plus the keys this build did not understand.
@@ -231,6 +330,9 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
                     }
                 }
             }
+            // The interface judges `[keys]` itself: it alone knows which
+            // modes, keys and commands exist, and it says what it skips.
+            ("keys", _) => {}
             _ => unknown.push(section.clone()),
         }
     }

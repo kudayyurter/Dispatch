@@ -32,7 +32,9 @@ use dispatch_tui::input::{
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
+use dispatch_tui::{
+    Command, Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -50,11 +52,6 @@ const TAB_TITLE: usize = 16;
 
 /// What a tab command says on a project whose daemon keeps no tabs.
 const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
-
-/// The status row while tab mode is on: every key it takes, since nothing
-/// else on screen says what they are.
-const TAB_MODE_HELP: &str =
-    "TAB  n new  r rename  x close  ←→ switch  [ ] move pane  i o move tab  1-9 go  Esc done";
 
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
@@ -518,6 +515,13 @@ pub struct App {
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
     router: InputRouter,
+    /// The pane scroll mode reads, while it is on: the one focused when it
+    /// began.
+    ///
+    /// Kept rather than read from the focus each time, so that whenever the
+    /// mode ends — however it ends — this pane, and no other, goes back to
+    /// live output. A pane left scrolled back is never marked blocked.
+    scrolling: Option<PaneId>,
     /// Each pane's content rectangle last frame — inside its border.
     ///
     /// This is what a pointer is resolved against and what a pane is resized
@@ -690,6 +694,7 @@ impl App {
             panes: HashMap::new(),
             harnesses,
             router: InputRouter::new(),
+            scrolling: None,
             frames: Vec::new(),
             frames_area: Rect::default(),
             frames_project: None,
@@ -826,6 +831,12 @@ impl App {
     pub fn set_motion(&mut self, on: bool) {
         self.motion = on;
         self.animations.set_enabled(on);
+    }
+
+    /// Reads keys through `keymap`: the defaults with the user's `[keys]`
+    /// laid over them.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.router = InputRouter::with_keymap(keymap);
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -1451,6 +1462,13 @@ impl App {
     /// Returns whether anything needs redrawing. Standalone, there is nothing
     /// to hear and this does nothing.
     pub fn poll_daemon(&mut self) -> bool {
+        let changed = self.take_in_daemon();
+        // A pane the daemon closed may be the one scroll mode was reading.
+        self.settle_scroll_mode() || changed
+    }
+
+    /// [`App::poll_daemon`]'s messages, before scroll mode is settled.
+    fn take_in_daemon(&mut self) -> bool {
         let added = self.poll_add_machine();
 
         let Mode::Attached(attachments) = &self.mode else {
@@ -2286,6 +2304,49 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        let handled = self.act_on(event, area);
+        // Settled after the event, whichever way it went: a click, a paste
+        // or a key can end scroll mode, or close or move focus off the pane
+        // it reads, and a key can start it.
+        self.settle_scroll_mode();
+        handled
+    }
+
+    /// Keeps scroll mode and the pane it reads in step. Returns whether the
+    /// mode ended.
+    ///
+    /// The mode takes the focused pane when it starts, and needs one: with
+    /// nothing focused it has nothing to read, and would only hold keys. It
+    /// ends when focus leaves that pane — the pane closing hands focus on —
+    /// since its keys would otherwise scroll a pane it was never entered on.
+    /// However it ends, the pane goes back to live output.
+    fn settle_scroll_mode(&mut self) -> bool {
+        let focused = self
+            .state
+            .focused_pane()
+            .filter(|id| self.panes.contains_key(id));
+
+        if self.router.key_mode() == KeyMode::Scroll {
+            match self.scrolling {
+                None if focused.is_some() => {
+                    self.scrolling = focused;
+                    return false;
+                }
+                Some(target) if focused == Some(target) => return false,
+                _ => self.router.leave_mode(),
+            }
+        } else if self.scrolling.is_none() {
+            return false;
+        }
+
+        if let Some(target) = self.scrolling.take() {
+            self.scroll_to_bottom(target);
+        }
+        true
+    }
+
+    /// [`App::handle`]'s work, before scroll mode is settled.
+    fn act_on(&mut self, event: &Event, area: Size) -> Result<()> {
         // A click ends tab mode whatever it lands on. The sidebar and the tab
         // row are resolved here, before the router sees the event, so the
         // router cannot end it for them.
@@ -2383,9 +2444,9 @@ impl App {
         let action = self.router.handle(event, &layout);
         self.layout = layout;
 
-        // Tab mode shows a message ahead of its keys, so one left from before
-        // would ride in with it and read as something the mode had said.
-        if mode != KeyMode::Tabs && self.router.key_mode() == KeyMode::Tabs {
+        // Entering a mode wipes a stale message, so what the mode's row shows
+        // between its name and its keys is about this mode.
+        if !mode.is_modal() && self.router.key_mode().is_modal() {
             self.status.clear();
         }
 
@@ -2397,7 +2458,7 @@ impl App {
             Action::FocusPane(id) => self.focus_pane(id),
             Action::FocusDirection(direction) => self.focus_direction(direction),
             Action::SendMouse(id, input) => self.send_mouse(id, input),
-            Action::Scroll(rows) => self.scroll_focused(rows),
+            Action::Scroll(rows) => self.scroll_view(ScrollTo::Delta(rows)),
             Action::ToggleZoom => self.state.toggle_zoom(),
             Action::ClosePane => self.close_focused(),
             Action::NewPane => self.open_harness_picker(),
@@ -2405,7 +2466,6 @@ impl App {
             Action::HarnessManager => self.open_harness_manager(),
             Action::SelectTab(index) => self.select_tab(index),
             Action::NextTab => self.select_tab(self.current_tab() + 1),
-            Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
             Action::OpenProject => self.start_open(),
@@ -2422,6 +2482,15 @@ impl App {
             Action::MoveTabLeft => self.move_current_tab(-1),
             Action::MoveTabRight => self.move_current_tab(1),
             Action::FocusOrTab(direction) => self.focus_or_tab(direction),
+            Action::FocusNext => self.focus_next(),
+            Action::ScrollHalfPages(pages) => self.scroll_pages(pages, true),
+            Action::ScrollPages(pages) => self.scroll_pages(pages, false),
+            Action::ScrollToTop => self.scroll_view(ScrollTo::Top),
+            Action::ScrollToBottom => {
+                if let Some(id) = self.scroll_target() {
+                    self.scroll_to_bottom(id);
+                }
+            }
         }
 
         Ok(())
@@ -3055,7 +3124,12 @@ impl App {
         items.sort_by_key(|item| item.id != SHELL);
 
         if items.is_empty() {
-            self.status = "no harnesses registered; press ^a H to add one".into();
+            // The key as it is bound: a hint naming a key the user moved
+            // would send them to the wrong one.
+            self.status = match self.router.keymap().path_to(Command::HarnessManager) {
+                Some(keys) => format!("no harnesses registered; press {keys} to add one"),
+                None => "no harnesses registered".into(),
+            };
             return;
         }
 
@@ -3421,16 +3495,17 @@ impl App {
         self.scroll_pane(id, rows);
     }
 
-    /// Scrolls the focused pane.
-    fn scroll_focused(&mut self, rows: isize) {
-        let Some(id) = self.state.focused_pane() else {
-            return;
-        };
-        self.scroll_pane(id, rows);
-    }
-
     /// Scrolls one pane and refreshes what it shows.
     fn scroll_pane(&mut self, id: PaneId, rows: isize) {
+        // The wheel over any pane but the one scroll mode is reading is the
+        // user turning to it, so the mode ends first. Settled here rather than
+        // after: going back to live output clears the status row, which would
+        // take this pane's message with it.
+        if self.router.key_mode() == KeyMode::Scroll && self.scrolling != Some(id) {
+            self.router.leave_mode();
+            self.settle_scroll_mode();
+        }
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -3442,7 +3517,65 @@ impl App {
             pane.screen = screen;
         }
 
-        self.status = "scrolled back — press End or type to return".into();
+        // Not for the pane scroll mode is reading, where End and typing return
+        // nowhere, and the mode's own row already says how to leave.
+        if self.router.key_mode() != KeyMode::Scroll {
+            self.status = "scrolled back — press End or type to return".into();
+        }
+    }
+
+    /// Focuses the next pane on the tab on screen, wrapping to the first.
+    fn focus_next(&mut self) {
+        let panes = self.panes_on_tab();
+        if panes.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .focused_pane()
+            .and_then(|focused| panes.iter().position(|pane| *pane == focused))
+            .map_or(0, |at| (at + 1) % panes.len());
+        self.focus_pane(panes[next]);
+    }
+
+    /// The pane a scroll command moves: the one scroll mode is reading, or
+    /// the focused one for a scroll key bound outside the mode.
+    fn scroll_target(&self) -> Option<PaneId> {
+        self.scrolling.or_else(|| self.state.focused_pane())
+    }
+
+    /// Moves a pane's view over its scrollback, for scroll mode.
+    ///
+    /// Says nothing on the status row, unlike a wheel scroll: the mode's own
+    /// row already says where the user is and how to get back.
+    fn scroll_view(&mut self, to: ScrollTo) {
+        let Some(id) = self.scroll_target() else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+
+        pane.backend.terminal_mut().scroll(to);
+        pane.scrolled_back = !matches!(to, ScrollTo::Bottom);
+
+        if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+            pane.screen = screen;
+        }
+    }
+
+    /// Scrolls a pane by `pages` of its own height, or of half its height;
+    /// negative towards older output.
+    fn scroll_pages(&mut self, pages: isize, half: bool) {
+        let Some(rows) = self
+            .scroll_target()
+            .and_then(|id| self.panes.get(&id))
+            .map(|pane| pane.backend.size().rows)
+        else {
+            return;
+        };
+        let step = if half { (rows / 2).max(1) } else { rows.max(1) };
+        self.scroll_view(ScrollTo::Delta(pages * step as isize));
     }
 
     /// Returns a pane to the newest output.
@@ -4552,9 +4685,18 @@ impl App {
         // prompt is, and when the daemon is gone the prompt cannot be acted
         // on anyway, so hiding the disconnect notice behind it would be
         // exactly backwards.
+        //
+        // The key that reopens it is named as it is bound, and left out when
+        // no key reaches it, rather than naming one that does nothing.
         let waiting_reminder = (!self.pending.is_empty()
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
-        .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
+        .then(|| {
+            let waiting = format!("{} delegation(s) waiting", self.pending.len());
+            match self.router.keymap().path_to(Command::Approvals) {
+                Some(keys) => format!("{waiting} — {keys}"),
+                None => waiting,
+            }
+        });
 
         // A blocked pane on another tab, or in a folded project, still needs
         // to be found; the status row is the one place always on screen.
@@ -4583,32 +4725,51 @@ impl App {
             .map(|device| device.name.clone())
             .collect();
 
-        let text = if self.router.is_armed() {
+        // Ahead of `self.status`, which may still hold whatever was happening
+        // when the connection went: a user needs to know the agents are out of
+        // reach more than they need the last message.
+        let lead = if !unreachable.is_empty() {
+            Some(format!(
+                "waiting for {} — its agents are still running",
+                unreachable.join(", ")
+            ))
+        } else if !self.status.is_empty() {
+            Some(self.status.clone())
+        } else {
+            None
+        };
+
+        let mode = self.router.key_mode();
+        let keymap = self.router.keymap();
+        let text = if mode == KeyMode::Prefix {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
-        } else if self.router.key_mode() == KeyMode::Tabs {
-            // The same goes for a mode, and it has keys of its own to spell out.
-            // A message goes between the mode's name and its keys: `[`, `]`,
-            // `i` and `o` keep the mode on, and a refusal hidden behind the
-            // key list would make the key look dead.
-            match TAB_MODE_HELP.strip_prefix("TAB  ") {
-                Some(keys) if !self.status.is_empty() => format!("TAB  {}  {keys}", self.status),
-                _ => TAB_MODE_HELP.to_string(),
+        } else if mode == KeyMode::Lock {
+            // Everything the normal row says but its keys, which lock does
+            // not read: a lock can last all afternoon, and a refusal or a
+            // waiting agent hidden behind it for that long is as good as
+            // dropped.
+            std::iter::once(keymap.lock_help())
+                .chain(lead)
+                .chain(waiting_reminder)
+                .chain(blocked_reminder)
+                .collect::<Vec<_>>()
+                .join("  ")
+        } else if mode.is_modal() {
+            // A mode spells out its own keys, from the same table that runs
+            // them. A message goes between its name and its keys: several
+            // keys keep the mode on, and a refusal hidden behind the key list
+            // would make the key look dead.
+            let help = keymap.mode_help(mode);
+            match help.split_once("  ") {
+                Some((title, keys)) if !self.status.is_empty() => {
+                    format!("{title}  {}  {keys}", self.status)
+                }
+                _ => help,
             }
         } else {
-            let (lead, help) = if !unreachable.is_empty() {
-                // Ahead of `self.status`, which may still hold whatever was
-                // happening when the connection went: a user needs to know the
-                // agents are out of reach more than they need the last message.
-                let notice = format!(
-                    "waiting for {} — its agents are still running",
-                    unreachable.join(", ")
-                );
-                (Some(notice), None)
-            } else if !self.status.is_empty() {
-                (Some(self.status.clone()), None)
-            } else {
+            let help = lead.is_none().then(|| {
                 let panes = self.state.visible_panes().len();
                 let tabs = if self.tab_count() > 1 {
                     format!("  tab {}/{}", self.current_tab() + 1, self.tab_count())
@@ -4620,11 +4781,8 @@ impl App {
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
-                let help = format!(
-                    "{panes} pane(s){where_}{tabs}  ^a n new  Ctrl t tabs  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
-                );
-                (None, Some(help))
-            };
+                format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help())
+            });
 
             // The reminders ahead of the key help: it alone runs past eighty
             // columns, and whatever follows it is cut off on the terminals
@@ -4641,7 +4799,7 @@ impl App {
 
         // On `tab`, like the active tab, and in the same text colour for the
         // same reason.
-        let style = if self.router.is_armed() || self.router.key_mode() == KeyMode::Tabs {
+        let style = if mode != KeyMode::Normal {
             Style::default()
                 .bg(self.theme.tab)
                 .fg(self.theme.text)
@@ -5089,6 +5247,105 @@ mod tests {
         );
     }
 
+    /// The rows a pane shows now, as text.
+    fn shown(app: &App, pane: PaneId) -> Vec<String> {
+        app.panes[&pane].screen.text_lines()
+    }
+
+    /// A pane that has printed `line-001` to `line-100`, so it has
+    /// scrollback.
+    fn pane_with_history(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+    ) -> PaneId {
+        let pane = spawn_several(app, daemon, project, 1)[0];
+        let output: String = (1..=100).map(|n| format!("line-{n:03}\r\n")).collect();
+        print(app, daemon, pane, output.as_bytes());
+        pane
+    }
+
+    #[test]
+    fn scroll_mode_reads_back_through_a_panes_output_and_esc_returns() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = pane_with_history(&mut app, &daemon, project);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(
+            shown(&app, pane)[0].trim_end(),
+            "line-001",
+            "the oldest output"
+        );
+        assert!(
+            app.status.is_empty(),
+            "the mode's own row says where the user is"
+        );
+
+        // Half of a 24-row pane.
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(shown(&app, pane)[0].trim_end(), "line-013");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("line-100")),
+            "back to live output"
+        );
+        assert!(!app.panes[&pane].scrolled_back);
+    }
+
+    #[test]
+    fn scroll_mode_on_a_pane_with_no_scrollback_is_harmless() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        print(&mut app, &daemon, pane, b"only-line\r\n");
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for code in [
+            KeyCode::Char('g'),
+            KeyCode::Char('u'),
+            KeyCode::PageUp,
+            KeyCode::Char('k'),
+        ] {
+            press(&mut app, code);
+        }
+
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("only-line"))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn pane_mode_p_walks_the_panes_on_this_tab() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.focus_pane(panes[0]);
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        for expected in [panes[1], panes[2], panes[0]] {
+            press(&mut app, KeyCode::Char('p'));
+            assert_eq!(app.state.focused_pane(), Some(expected));
+        }
+        assert_eq!(app.router.key_mode(), KeyMode::Pane, "still walking");
+    }
+
+    #[test]
+    fn the_prefix_then_a_bracket_opens_scroll_mode_in_the_app() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        command(&mut app, '[');
+
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+    }
+
     #[test]
     fn a_pane_that_exits_mid_work_stays_exited_and_unmarked() {
         let (mut app, project, daemon, _sent) = attached_app();
@@ -5532,7 +5789,7 @@ mod tests {
         press(&mut app, KeyCode::Right);
 
         assert_eq!(app.current_tab(), 2);
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still stepping");
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still stepping");
     }
 
     #[test]
@@ -6903,11 +7160,97 @@ mod tests {
         let row = text.lines().last().expect("a row");
 
         assert!(row.contains("1 waiting on you"), "{row:?}");
-        assert!(row.contains("1 delegation(s) waiting — ^a a"), "{row:?}");
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl a a"),
+            "{row:?}"
+        );
         assert!(
             row.find("waiting on you") < row.find("pane(s)"),
             "the key help follows, where being cut costs least: {row:?}"
         );
+    }
+
+    /// `app` reading its keys with `entries` laid over the defaults, each
+    /// (mode, key, command).
+    fn rebind(app: &mut App, entries: &[(&str, &str, &str)]) {
+        use std::collections::BTreeMap;
+
+        let mut modes: BTreeMap<String, BTreeMap<String, dispatch_config::KeyValue>> =
+            BTreeMap::new();
+        for (mode, chord, name) in entries {
+            modes.entry((*mode).to_string()).or_default().insert(
+                (*chord).to_string(),
+                dispatch_config::KeyValue::Command((*name).to_string()),
+            );
+        }
+        let keys = dispatch_config::KeysConfig {
+            modes: modes
+                .into_iter()
+                .map(|(mode, table)| (mode, dispatch_config::KeyTable::Table(table)))
+                .collect(),
+            not_a_table: false,
+        };
+        let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        app.set_keymap(keymap);
+    }
+
+    /// The status row with one delegation request waiting.
+    fn row_with_a_request_waiting(app: &mut App, project: ProjectId, parent: PaneId) -> String {
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        let mut terminal = a_terminal();
+        drawn(app, &mut terminal);
+        bottom_row(&terminal)
+    }
+
+    #[test]
+    fn hints_name_the_keys_as_they_are_bound() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("normal", "Ctrl b", "prefix")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(
+            row.contains("1 delegation(s) waiting — Ctrl b a"),
+            "{row:?}"
+        );
+
+        app.open_harness_picker();
+        assert_eq!(
+            app.status,
+            "no harnesses registered; press Ctrl b H to add one"
+        );
+    }
+
+    #[test]
+    fn a_hint_with_no_key_to_name_says_what_it_can() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "a", "none")],
+        );
+
+        let row = row_with_a_request_waiting(&mut app, project, pane);
+        assert!(row.contains("1 delegation(s) waiting  "), "{row:?}");
+        assert!(!row.contains('—'), "{row:?}");
+
+        rebind(
+            &mut app,
+            &[("normal", "Ctrl a", "none"), ("session", "H", "none")],
+        );
+        app.open_harness_picker();
+        assert_eq!(app.status, "no harnesses registered");
     }
 
     #[test]
@@ -10296,7 +10639,15 @@ mod tests {
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
-        assert!(bottom_row(&terminal).starts_with(TAB_MODE_HELP));
+        // The generated tab row is longer than this hundred-column test
+        // terminal, so the row is a prefix of the full help rather than
+        // equal to it.
+        assert!(
+            app.router
+                .keymap()
+                .mode_help(KeyMode::Tab)
+                .starts_with(bottom_row(&terminal).trim_end())
+        );
     }
 
     #[test]
@@ -10314,7 +10665,7 @@ mod tests {
         drawn(&mut app, &mut terminal);
 
         let row = bottom_row(&terminal);
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still in the mode");
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still in the mode");
         assert!(row.starts_with("TAB  no tab to the left  "), "{row:?}");
         assert!(row.contains("n new"), "the keys still follow: {row:?}");
     }
@@ -10327,7 +10678,7 @@ mod tests {
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
 
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs);
+        assert_eq!(app.router.key_mode(), KeyMode::Tab);
         assert!(app.status.is_empty(), "{:?}", app.status);
     }
 
@@ -10530,5 +10881,337 @@ mod tests {
             SHELL,
             "a daemon that keeps tabs has a shell"
         );
+    }
+
+    fn a_wide_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30))
+            .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn each_mode_spells_out_its_keys_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        for (key, mode) in [
+            ('p', KeyMode::Pane),
+            ('t', KeyMode::Tab),
+            ('s', KeyMode::Scroll),
+            ('o', KeyMode::Session),
+        ] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            assert_eq!(
+                bottom_row(&terminal).trim_end(),
+                app.router.keymap().mode_help(mode),
+                "{mode:?}"
+            );
+            press(&mut app, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn lock_says_how_to_unlock() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED  Ctrl g unlock");
+    }
+
+    #[test]
+    fn a_message_still_shows_while_locked() {
+        // Lock lasts; a refusal hidden behind it would drop keys silently.
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.status = "far is unreachable".into();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(
+            bottom_row(&terminal).trim_end(),
+            "LOCKED  Ctrl g unlock  far is unreachable"
+        );
+    }
+
+    #[test]
+    fn a_waiting_delegation_is_still_mentioned_while_locked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: pane,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        drawn(&mut app, &mut terminal);
+
+        let row = bottom_row(&terminal);
+        assert!(row.starts_with("LOCKED  Ctrl g unlock"), "{row:?}");
+        assert!(row.contains("1 delegation(s) waiting"), "{row:?}");
+    }
+
+    #[test]
+    fn the_wheel_in_scroll_mode_scrolls_without_a_message() {
+        // The wheel's message says End or typing returns, and neither does
+        // in scroll mode; the mode's own row already says how to leave.
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, target);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        press(&mut app, KeyCode::Char('G'));
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert!(app.panes[&target].scrolled_back, "the wheel still scrolls");
+        assert!(app.status.is_empty(), "{:?}", app.status);
+
+        press(&mut app, KeyCode::Esc);
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
+    }
+
+    #[test]
+    fn the_wheel_over_another_pane_ends_scroll_mode_and_says_so() {
+        // Turning to another pane with the wheel is leaving the one being
+        // read. Were it quiet, that other pane would sit scrolled back with
+        // nothing to say so, and a pane scrolled back is never marked blocked.
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back, "back to live output");
+        assert!(app.panes[&other].scrolled_back, "the wheel still scrolls");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
+    }
+
+    #[test]
+    fn the_normal_row_lists_the_mode_keys() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains(
+                "Ctrl p pane  Ctrl t tabs  Ctrl s scroll  Ctrl o session  Ctrl g lock  Ctrl a prefix"
+            ),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn a_rebound_key_shows_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut keys = dispatch_config::KeysConfig::default();
+        keys.modes.insert(
+            "pane".into(),
+            dispatch_config::KeyTable::Table(
+                [(
+                    "w".to_string(),
+                    dispatch_config::KeyValue::Command("close_pane".into()),
+                )]
+                .into(),
+            ),
+        );
+        app.set_keymap(dispatch_tui::Keymap::with_overrides(&keys).0);
+        let mut terminal = a_wide_terminal();
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains("x/w close"),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn entering_any_mode_clears_a_stale_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        app.status = "old".into();
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(app.status.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        app.status = "old".into();
+        command(&mut app, '[');
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.status.is_empty(), "through the prefix too");
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_goes() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    /// A pane with scrollback and a second beside it, drawn once so the
+    /// pointer has somewhere to land, with scroll mode on the first and its
+    /// view at the oldest output.
+    fn scrolled_back_beside_another() -> (App, PaneId, PaneId, Sender<ServerMessage>) {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let target = pane_with_history(&mut app, &daemon, project);
+        let other = spawn_several(&mut app, &daemon, project, 1)[0];
+        drawn(&mut app, &mut a_terminal());
+        app.focus_pane(target);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back, "read back to the start");
+
+        (app, target, other, daemon)
+    }
+
+    /// The middle of the cell block `pane` was last drawn in.
+    fn middle_of(app: &App, pane: PaneId) -> (u16, u16) {
+        let (_, rect) = app
+            .layout
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane is drawn");
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_closes_and_focus_goes_to_another() {
+        // Closing the pane hands focus to the one beside it, and scroll mode
+        // must not carry on over a pane it was never entered on.
+        let (mut app, target, other, daemon) = scrolled_back_beside_another();
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane: target })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut a_terminal());
+
+        assert_eq!(app.state.focused_pane(), Some(other));
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn moving_the_pointer_in_scroll_mode_keeps_focus_and_the_mode() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        app.handle(
+            &Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Size::new(100, 30),
+        )
+        .expect("the pointer is handled");
+
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(target),
+            "a nudge moves nothing"
+        );
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.panes[&target].scrolled_back, "still reading back");
+    }
+
+    #[test]
+    fn a_click_on_another_pane_ends_scroll_mode_and_returns_to_live_output() {
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+
+        click(&mut app, column, row);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            !app.panes[&target].scrolled_back,
+            "the pane scroll mode read is live again"
+        );
+    }
+
+    #[test]
+    fn a_paste_in_scroll_mode_returns_its_pane_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+
+        app.handle(&Event::Paste("hi".into()), Size::new(100, 30))
+            .expect("the paste is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
+    }
+
+    #[test]
+    fn a_key_bound_to_leave_mode_in_scroll_mode_returns_to_live_output() {
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        press(&mut app, KeyCode::Esc);
+        rebind(&mut app, &[("scroll", "q", "leave_mode")]);
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(app.panes[&target].scrolled_back);
+
+        press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back);
+    }
+
+    #[test]
+    fn every_mode_but_normal_is_drawn_highlighted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        for key in ['p', 's', 'o', 'g'] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            let row = terminal.backend().buffer().area.height - 1;
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((0, row))
+                .expect("the status row is drawn");
+            assert_eq!(cell.bg, app.theme.tab, "Ctrl {key}");
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+        }
     }
 }

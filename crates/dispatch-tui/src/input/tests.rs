@@ -2,7 +2,13 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
+
 use dispatch_core::PaneId;
+
+use dispatch_config::{KeyTable, KeyValue, KeysConfig};
+
+use crate::keymap::Keymap;
 
 fn press(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -96,39 +102,6 @@ fn a_command_runs_after_the_prefix() {
 }
 
 #[test]
-fn every_command_is_bound() {
-    let cases = [
-        ('n', Action::NewPane),
-        ('x', Action::ClosePane),
-        ('z', Action::ToggleZoom),
-        ('p', Action::ProjectPicker),
-        ('H', Action::HarnessManager),
-        ('a', Action::Approvals),
-        ('s', Action::ExpandChild),
-        ('c', Action::CollapseChild),
-        ('f', Action::ToggleFold),
-        ('o', Action::OpenProject),
-        ('m', Action::AddMachine),
-        ('[', Action::Scrollback),
-        ('q', Action::Quit),
-        ('h', Action::FocusDirection(Direction::Left)),
-        ('j', Action::FocusDirection(Direction::Down)),
-        ('k', Action::FocusDirection(Direction::Up)),
-        ('l', Action::FocusDirection(Direction::Right)),
-    ];
-
-    for (key, expected) in cases {
-        let mut router = router();
-        router.handle(&ctrl_a(), &[]);
-        assert_eq!(
-            router.handle(&press(KeyCode::Char(key)), &[]),
-            expected,
-            "prefix then {key:?}"
-        );
-    }
-}
-
-#[test]
 fn the_prefix_twice_sends_the_prefix_itself() {
     // Otherwise there is no way to type Ctrl-a into an agent that wants it.
     let mut router = router();
@@ -167,29 +140,6 @@ fn a_command_key_without_the_prefix_reaches_the_pane() {
         Action::SendKey(Key::Char('z'), Modifiers::NONE),
         "z is only a command after the prefix"
     );
-}
-
-#[test]
-fn a_custom_prefix_is_honoured() {
-    let mut router = InputRouter::with_prefix(Prefix {
-        code: 'b',
-        modifiers: KeyModifiers::CONTROL,
-    });
-
-    // The default prefix is now just a key.
-    assert_eq!(
-        router.handle(&ctrl_a(), &[]),
-        Action::SendKey(
-            Key::Char('a'),
-            Modifiers {
-                ctrl: true,
-                ..Modifiers::NONE
-            }
-        )
-    );
-
-    router.handle(&press_with(KeyCode::Char('b'), KeyModifiers::CONTROL), &[]);
-    assert!(router.is_armed());
 }
 
 #[test]
@@ -301,7 +251,7 @@ fn ctrl_t_enters_tab_mode_and_sends_nothing() {
     let mut router = router();
 
     assert_eq!(router.handle(&ctrl_t(), &[]), Action::None);
-    assert_eq!(router.key_mode(), KeyMode::Tabs);
+    assert_eq!(router.key_mode(), KeyMode::Tab);
 }
 
 #[test]
@@ -310,14 +260,14 @@ fn every_tab_mode_key_is_bound_and_says_whether_the_mode_stays() {
         (KeyCode::Char('n'), Action::NewTab, KeyMode::Normal),
         (KeyCode::Char('r'), Action::RenameTab, KeyMode::Normal),
         (KeyCode::Char('x'), Action::CloseTab, KeyMode::Normal),
-        (KeyCode::Left, Action::PreviousTab, KeyMode::Tabs),
-        (KeyCode::Char('h'), Action::PreviousTab, KeyMode::Tabs),
-        (KeyCode::Right, Action::NextTab, KeyMode::Tabs),
-        (KeyCode::Char('l'), Action::NextTab, KeyMode::Tabs),
-        (KeyCode::Char('['), Action::MovePaneLeft, KeyMode::Tabs),
-        (KeyCode::Char(']'), Action::MovePaneRight, KeyMode::Tabs),
-        (KeyCode::Char('i'), Action::MoveTabLeft, KeyMode::Tabs),
-        (KeyCode::Char('o'), Action::MoveTabRight, KeyMode::Tabs),
+        (KeyCode::Left, Action::PreviousTab, KeyMode::Tab),
+        (KeyCode::Char('h'), Action::PreviousTab, KeyMode::Tab),
+        (KeyCode::Right, Action::NextTab, KeyMode::Tab),
+        (KeyCode::Char('l'), Action::NextTab, KeyMode::Tab),
+        (KeyCode::Char('['), Action::MovePaneLeft, KeyMode::Tab),
+        (KeyCode::Char(']'), Action::MovePaneRight, KeyMode::Tab),
+        (KeyCode::Char('i'), Action::MoveTabLeft, KeyMode::Tab),
+        (KeyCode::Char('o'), Action::MoveTabRight, KeyMode::Tab),
         (KeyCode::Char('3'), Action::SelectTab(2), KeyMode::Normal),
         (KeyCode::Tab, Action::LastTab, KeyMode::Normal),
         (KeyCode::Esc, Action::None, KeyMode::Normal),
@@ -352,7 +302,7 @@ fn any_other_key_in_tab_mode_is_ignored_and_the_mode_stays() {
     ] {
         assert_eq!(router.handle(&event, &[]), Action::None);
     }
-    assert_eq!(router.key_mode(), KeyMode::Tabs);
+    assert_eq!(router.key_mode(), KeyMode::Tab);
 }
 
 #[test]
@@ -450,4 +400,351 @@ fn an_alt_key_dispatch_does_not_bind_still_reaches_the_pane() {
         ),
         Action::SendKey(..)
     ));
+}
+
+fn ctrl(c: char) -> Event {
+    press_with(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+/// A router in the mode `entering` puts it in.
+fn in_mode(entering: Event) -> InputRouter {
+    let mut router = router();
+    router.handle(&entering, &[]);
+    router
+}
+
+/// A router whose keys have `entries` laid over the defaults.
+fn router_with(entries: &[(&str, &str, &str)]) -> InputRouter {
+    let mut modes: BTreeMap<String, BTreeMap<String, KeyValue>> = BTreeMap::new();
+    for (mode, chord, name) in entries {
+        modes
+            .entry((*mode).to_string())
+            .or_default()
+            .insert((*chord).to_string(), KeyValue::Command((*name).to_string()));
+    }
+    let keys = KeysConfig {
+        modes: modes
+            .into_iter()
+            .map(|(mode, table)| (mode, KeyTable::Table(table)))
+            .collect(),
+        not_a_table: false,
+    };
+    let (keymap, warnings) = Keymap::with_overrides(&keys);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    InputRouter::with_keymap(keymap)
+}
+
+#[test]
+fn every_prefix_command_is_bound_as_before() {
+    let cases = [
+        ('n', Action::NewPane),
+        ('x', Action::ClosePane),
+        ('z', Action::ToggleZoom),
+        ('h', Action::FocusDirection(Direction::Left)),
+        ('j', Action::FocusDirection(Direction::Down)),
+        ('k', Action::FocusDirection(Direction::Up)),
+        ('l', Action::FocusDirection(Direction::Right)),
+        ('p', Action::ProjectPicker),
+        ('H', Action::HarnessManager),
+        ('a', Action::Approvals),
+        ('s', Action::ExpandChild),
+        ('c', Action::CollapseChild),
+        ('f', Action::ToggleFold),
+        ('o', Action::OpenProject),
+        ('m', Action::AddMachine),
+        ('q', Action::Quit),
+        ('3', Action::SelectTab(2)),
+    ];
+
+    for (key, expected) in cases {
+        let mut router = router();
+        router.handle(&ctrl_a(), &[]);
+        assert_eq!(
+            router.handle(&press(KeyCode::Char(key)), &[]),
+            expected,
+            "prefix then {key:?}"
+        );
+        assert_eq!(router.key_mode(), KeyMode::Normal, "one key, then back");
+    }
+
+    let mut router = router();
+    router.handle(&ctrl_a(), &[]);
+    assert_eq!(router.handle(&press(KeyCode::Tab), &[]), Action::NextTab);
+}
+
+#[test]
+fn the_prefix_then_a_bracket_opens_scroll_mode() {
+    let mut router = router();
+    router.handle(&ctrl_a(), &[]);
+
+    assert_eq!(router.handle(&press(KeyCode::Char('[')), &[]), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Scroll);
+}
+
+#[test]
+fn each_mode_key_enters_its_mode() {
+    for (c, mode) in [
+        ('p', KeyMode::Pane),
+        ('t', KeyMode::Tab),
+        ('s', KeyMode::Scroll),
+        ('o', KeyMode::Session),
+        ('g', KeyMode::Lock),
+    ] {
+        let mut router = router();
+        assert_eq!(router.handle(&ctrl(c), &[]), Action::None);
+        assert_eq!(router.key_mode(), mode, "Ctrl {c}");
+    }
+}
+
+#[test]
+fn a_mode_key_twice_goes_to_the_pane() {
+    // Every Ctrl key a mode takes is one some program uses: a shell's
+    // history, XON/XOFF, Claude Code's task list. Twice is how it still gets
+    // there.
+    for c in ['p', 't', 's', 'o'] {
+        let mut router = in_mode(ctrl(c));
+
+        assert_eq!(
+            router.handle(&ctrl(c), &[]),
+            Action::SendKey(
+                Key::Char(c),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                }
+            ),
+            "Ctrl {c} twice"
+        );
+        assert_eq!(router.key_mode(), KeyMode::Normal);
+    }
+}
+
+/// Runs `cases` of (key, action, mode after) against a router freshly put
+/// in the mode `entering` enters.
+fn check_mode(entering: char, cases: &[(Event, Action, KeyMode)]) {
+    for (event, action, after) in cases {
+        let mut router = in_mode(ctrl(entering));
+        assert_eq!(
+            &router.handle(event, &[]),
+            action,
+            "Ctrl {entering} then {event:?}"
+        );
+        assert_eq!(
+            router.key_mode(),
+            *after,
+            "mode after Ctrl {entering} then {event:?}"
+        );
+    }
+}
+
+#[test]
+fn pane_mode_keys() {
+    use KeyMode::{Normal, Pane};
+
+    check_mode(
+        'p',
+        &[
+            (press(KeyCode::Char('n')), Action::NewPane, Normal),
+            (press(KeyCode::Char('x')), Action::ClosePane, Normal),
+            (press(KeyCode::Char('f')), Action::ToggleZoom, Normal),
+            (press(KeyCode::Char('z')), Action::ToggleZoom, Normal),
+            (
+                press(KeyCode::Char('h')),
+                Action::FocusDirection(Direction::Left),
+                Pane,
+            ),
+            (
+                press(KeyCode::Down),
+                Action::FocusDirection(Direction::Down),
+                Pane,
+            ),
+            (press(KeyCode::Char('p')), Action::FocusNext, Pane),
+            (press(KeyCode::Char('s')), Action::ExpandChild, Pane),
+            (press(KeyCode::Char('c')), Action::CollapseChild, Pane),
+            (press(KeyCode::Esc), Action::None, Normal),
+            (press(KeyCode::Enter), Action::None, Normal),
+            (press(KeyCode::Char('q')), Action::None, Pane),
+        ],
+    );
+}
+
+#[test]
+fn tab_mode_steps_with_j_and_k_as_well() {
+    use KeyMode::Tab;
+
+    check_mode(
+        't',
+        &[
+            (press(KeyCode::Char('j')), Action::NextTab, Tab),
+            (press(KeyCode::Char('k')), Action::PreviousTab, Tab),
+        ],
+    );
+}
+
+#[test]
+fn scroll_mode_keys() {
+    use KeyMode::{Normal, Scroll};
+
+    check_mode(
+        's',
+        &[
+            (press(KeyCode::Char('j')), Action::Scroll(1), Scroll),
+            (press(KeyCode::Up), Action::Scroll(-1), Scroll),
+            (
+                press(KeyCode::Char('d')),
+                Action::ScrollHalfPages(1),
+                Scroll,
+            ),
+            (
+                press(KeyCode::Char('u')),
+                Action::ScrollHalfPages(-1),
+                Scroll,
+            ),
+            (press(KeyCode::PageDown), Action::ScrollPages(1), Scroll),
+            (ctrl('b'), Action::ScrollPages(-1), Scroll),
+            (press(KeyCode::Char('g')), Action::ScrollToTop, Scroll),
+            (press(KeyCode::Char('G')), Action::ScrollToBottom, Scroll),
+            (press(KeyCode::Esc), Action::ScrollToBottom, Normal),
+            (ctrl('c'), Action::ScrollToBottom, Normal),
+        ],
+    );
+}
+
+#[test]
+fn session_mode_keys() {
+    use KeyMode::Normal;
+
+    check_mode(
+        'o',
+        &[
+            (press(KeyCode::Char('p')), Action::ProjectPicker, Normal),
+            (press(KeyCode::Char('o')), Action::OpenProject, Normal),
+            (press(KeyCode::Char('m')), Action::AddMachine, Normal),
+            (press(KeyCode::Char('H')), Action::HarnessManager, Normal),
+            (press(KeyCode::Char('a')), Action::Approvals, Normal),
+            (press(KeyCode::Char('f')), Action::ToggleFold, Normal),
+            (press(KeyCode::Char('q')), Action::Quit, Normal),
+        ],
+    );
+}
+
+#[test]
+fn lock_sends_everything_but_its_unlock_to_the_pane() {
+    let mut router = in_mode(ctrl('g'));
+
+    for event in [
+        ctrl('t'),
+        ctrl('p'),
+        ctrl_a(),
+        press(KeyCode::Char('x')),
+        press(KeyCode::Esc),
+        alt(KeyCode::Char('n')),
+    ] {
+        assert!(
+            matches!(router.handle(&event, &[]), Action::SendKey(..)),
+            "{event:?} reaches the pane"
+        );
+        assert_eq!(router.key_mode(), KeyMode::Lock);
+    }
+
+    assert_eq!(router.handle(&ctrl('g'), &[]), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Normal);
+}
+
+#[test]
+fn a_click_or_a_paste_does_not_unlock() {
+    let mut router = in_mode(ctrl('g'));
+
+    router.handle(&mouse_down(), &[]);
+    assert_eq!(router.key_mode(), KeyMode::Lock);
+    assert_eq!(
+        router.handle(&Event::Paste("hi".into()), &[]),
+        Action::Paste("hi".into())
+    );
+    assert_eq!(router.key_mode(), KeyMode::Lock);
+}
+
+#[test]
+fn a_click_ends_every_other_mode() {
+    for c in ['p', 't', 's', 'o'] {
+        let mut router = in_mode(ctrl(c));
+        router.handle(&mouse_down(), &[]);
+        assert_eq!(router.key_mode(), KeyMode::Normal, "Ctrl {c}");
+    }
+}
+
+#[test]
+fn a_key_rebound_in_keys_is_the_one_read() {
+    let mut router = router_with(&[("pane", "w", "close_pane")]);
+    router.handle(&ctrl('p'), &[]);
+
+    assert_eq!(
+        router.handle(&press(KeyCode::Char('w')), &[]),
+        Action::ClosePane
+    );
+}
+
+#[test]
+fn a_prefix_moved_in_keys_is_honoured_and_the_old_key_goes_to_the_pane() {
+    let mut router = router_with(&[("normal", "Ctrl a", "none"), ("normal", "Ctrl b", "prefix")]);
+
+    assert_eq!(
+        router.handle(&ctrl_a(), &[]),
+        Action::SendKey(
+            Key::Char('a'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            }
+        ),
+        "Ctrl a is the shell's again"
+    );
+    router.handle(&ctrl('b'), &[]);
+    assert!(router.is_armed());
+    assert_eq!(
+        router.handle(&press(KeyCode::Char('n')), &[]),
+        Action::NewPane
+    );
+}
+
+#[test]
+fn moving_the_pointer_in_scroll_mode_focuses_nothing() {
+    // Scroll mode's keys read the pane it was entered on; a nudge of the
+    // mouse must not hand them to another.
+    let pane = PaneId::new();
+    let panes = [(pane, Rect::new(0, 0, 10, 10))];
+    let mut router = in_mode(ctrl('s'));
+
+    assert_eq!(router.handle(&moved(5, 5), &panes), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Scroll);
+
+    router.handle(&press(KeyCode::Esc), &panes);
+    assert_eq!(
+        router.handle(&moved(5, 5), &panes),
+        Action::FocusPane(pane),
+        "focus follows the pointer again once the mode is left"
+    );
+}
+
+#[test]
+fn the_prefix_reads_a_command_key_typed_with_ctrl_still_held() {
+    // GNU screen's habit: `^a ^x` for `^a x`, never letting go of Ctrl.
+    let mut router = router();
+    router.handle(&ctrl_a(), &[]);
+    assert_eq!(router.handle(&ctrl('x'), &[]), Action::ClosePane);
+    assert!(!router.is_armed());
+
+    // The prefix's own key twice still gives the pane that key.
+    router.handle(&ctrl_a(), &[]);
+    assert_eq!(
+        router.handle(&ctrl_a(), &[]),
+        Action::SendKey(
+            Key::Char('a'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            }
+        )
+    );
+    assert!(!router.is_armed());
 }
