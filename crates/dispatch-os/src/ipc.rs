@@ -577,6 +577,13 @@ pub struct Listener {
     /// Where it listens, so dropping it can wake the accepting thread.
     endpoint: PathBuf,
     accepting: Option<std::thread::JoinHandle<()>>,
+    /// Which file the socket is, recorded at bind, so a drop removes the
+    /// path only while it still names this listener's socket.
+    socket: Option<imp::Identity>,
+    /// The listening socket's descriptor, for a test to copy as a forked
+    /// child would.
+    #[cfg(all(test, unix))]
+    socket_fd: std::os::fd::RawFd,
 }
 
 impl std::fmt::Debug for Listener {
@@ -612,6 +619,9 @@ impl Listener {
         }
 
         let inner = imp::bind(path)?;
+        let socket = imp::identity(path);
+        #[cfg(all(test, unix))]
+        let socket_fd = std::os::fd::AsRawFd::as_raw_fd(&inner);
         let (sender, paired) = channel();
         let stopping = Arc::new(AtomicBool::new(false));
 
@@ -625,6 +635,9 @@ impl Listener {
             stopping,
             endpoint: path.to_path_buf(),
             accepting: Some(accepting),
+            socket,
+            #[cfg(all(test, unix))]
+            socket_fd,
         })
     }
 
@@ -668,6 +681,15 @@ impl Drop for Listener {
             let _ = accepting.join();
         }
         drop(wake);
+
+        // The file goes with the listener. Left behind, the next bind finds
+        // the path in use and probes it, and a copy of the old socket that a
+        // forked child holds for an instant answers as if a daemon were
+        // running. Removed only while it is still this listener's socket: a
+        // daemon that has since replaced it keeps its own.
+        if let Some(socket) = self.socket.take() {
+            imp::remove_if_same(&self.endpoint, socket);
+        }
     }
 }
 
@@ -794,6 +816,25 @@ mod imp {
     pub(super) type Stream = UnixStream;
     pub(super) type Listener = UnixListener;
 
+    /// A socket file's device and inode.
+    pub(super) type Identity = (u64, u64);
+
+    /// Which file `path` is now, if there is one.
+    pub(super) fn identity(path: &Path) -> Option<Identity> {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    /// Removes `path` if it is still the file `socket` was.
+    pub(super) fn remove_if_same(path: &Path, socket: Identity) {
+        if identity(path) == Some(socket) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
         UnixStream::connect(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
@@ -914,6 +955,15 @@ mod imp {
 
     use super::IpcError;
     use crate::owner_only::{OwnerOnly, current_user_sid, sid_string};
+
+    /// A pipe has no file to remove; nothing to identify.
+    pub(super) type Identity = ();
+
+    pub(super) fn identity(_path: &Path) -> Option<Identity> {
+        None
+    }
+
+    pub(super) fn remove_if_same(_path: &Path, _socket: Identity) {}
 
     /// Named pipes are addressed by name rather than by a filesystem path, so
     /// the endpoint is hashed into one. Two configurations therefore get two
@@ -2020,6 +2070,29 @@ mod tests {
         drop(first);
 
         let _second = Listener::bind().expect("the endpoint is free once the first is dropped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_of_the_socket_held_elsewhere_does_not_keep_the_endpoint() {
+        // A child forked while the listener is open holds a copy of its
+        // socket until it execs. The next bind must not take that copy for a
+        // running daemon. This is what made the test above fail about half
+        // the time beside the tests that spawn processes.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("held");
+
+        let first = Listener::bind().expect("binding succeeds");
+        // SAFETY: dup takes a descriptor by value; this one is the listener's
+        // and is open until the listener is dropped.
+        let copy = unsafe { libc::dup(first.socket_fd) };
+        assert!(copy >= 0, "the socket can be copied");
+        drop(first);
+
+        let second = Listener::bind();
+        // SAFETY: closes the copy made above, and nothing else.
+        unsafe { libc::close(copy) };
+        second.expect("a copy of the old socket does not keep the endpoint");
     }
 
     /// An accept failure that passes: too many files open, for a moment.
