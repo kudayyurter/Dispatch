@@ -843,9 +843,9 @@ fn a_picker_takes_the_keyboard_while_it_is_open() {
 
 #[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
-fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
-    // Scrollback is only useful if new output does not yank the view away and
-    // typing brings it back, which is what every terminal does.
+fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output() {
+    // Scrollback is only useful if new output does not yank the view away
+    // and there is a plain way back, which in scroll mode is Esc.
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
@@ -858,16 +858,25 @@ fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
         "the newest output should be visible first"
     );
 
+    // The prefix route into scroll mode, then half a page back: the newest
+    // row is no longer on screen.
     app.send(b"\x01[");
+    app.send(b"u");
     assert!(
-        app.wait_for(|lines| contains(lines, "scrolled back")),
-        "scrolling back should be announced"
+        app.wait_for(|lines| !contains(lines, "row80")),
+        "the view moved back through the output"
+    );
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| contains(lines, "row80")),
+        "Esc returns to the newest output"
     );
 
     app.send(b"echo back-at-the-bottom\r");
     assert!(
         app.wait_for(|lines| contains(lines, "back-at-the-bottom")),
-        "typing should return to the newest output"
+        "typing reaches the shell again"
     );
 }
 

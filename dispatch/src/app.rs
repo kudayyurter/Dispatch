@@ -2385,7 +2385,7 @@ impl App {
 
         // Tab mode shows a message ahead of its keys, so one left from before
         // would ride in with it and read as something the mode had said.
-        if mode != KeyMode::Tabs && self.router.key_mode() == KeyMode::Tabs {
+        if mode != KeyMode::Tab && self.router.key_mode() == KeyMode::Tab {
             self.status.clear();
         }
 
@@ -2397,7 +2397,7 @@ impl App {
             Action::FocusPane(id) => self.focus_pane(id),
             Action::FocusDirection(direction) => self.focus_direction(direction),
             Action::SendMouse(id, input) => self.send_mouse(id, input),
-            Action::Scroll(rows) => self.scroll_focused(rows),
+            Action::Scroll(rows) => self.scroll_view(ScrollTo::Delta(rows)),
             Action::ToggleZoom => self.state.toggle_zoom(),
             Action::ClosePane => self.close_focused(),
             Action::NewPane => self.open_harness_picker(),
@@ -2405,7 +2405,6 @@ impl App {
             Action::HarnessManager => self.open_harness_manager(),
             Action::SelectTab(index) => self.select_tab(index),
             Action::NextTab => self.select_tab(self.current_tab() + 1),
-            Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
             Action::OpenProject => self.start_open(),
@@ -2422,12 +2421,15 @@ impl App {
             Action::MoveTabLeft => self.move_current_tab(-1),
             Action::MoveTabRight => self.move_current_tab(1),
             Action::FocusOrTab(direction) => self.focus_or_tab(direction),
-            // Wired to the app's scrolling and focus in the next change.
-            Action::FocusNext
-            | Action::ScrollHalfPages(_)
-            | Action::ScrollPages(_)
-            | Action::ScrollToTop
-            | Action::ScrollToBottom => {}
+            Action::FocusNext => self.focus_next(),
+            Action::ScrollHalfPages(pages) => self.scroll_pages(pages, true),
+            Action::ScrollPages(pages) => self.scroll_pages(pages, false),
+            Action::ScrollToTop => self.scroll_view(ScrollTo::Top),
+            Action::ScrollToBottom => {
+                if let Some(id) = self.state.focused_pane() {
+                    self.scroll_to_bottom(id);
+                }
+            }
         }
 
         Ok(())
@@ -3427,14 +3429,6 @@ impl App {
         self.scroll_pane(id, rows);
     }
 
-    /// Scrolls the focused pane.
-    fn scroll_focused(&mut self, rows: isize) {
-        let Some(id) = self.state.focused_pane() else {
-            return;
-        };
-        self.scroll_pane(id, rows);
-    }
-
     /// Scrolls one pane and refreshes what it shows.
     fn scroll_pane(&mut self, id: PaneId, rows: isize) {
         let Some(pane) = self.panes.get_mut(&id) else {
@@ -3449,6 +3443,55 @@ impl App {
         }
 
         self.status = "scrolled back — press End or type to return".into();
+    }
+
+    /// Focuses the next pane on the tab on screen, wrapping to the first.
+    fn focus_next(&mut self) {
+        let panes = self.panes_on_tab();
+        if panes.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .focused_pane()
+            .and_then(|focused| panes.iter().position(|pane| *pane == focused))
+            .map_or(0, |at| (at + 1) % panes.len());
+        self.focus_pane(panes[next]);
+    }
+
+    /// Moves the focused pane's view over its scrollback, for scroll mode.
+    ///
+    /// Says nothing on the status row, unlike a wheel scroll: the mode's own
+    /// row already says where the user is and how to get back.
+    fn scroll_view(&mut self, to: ScrollTo) {
+        let Some(id) = self.state.focused_pane() else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+
+        pane.backend.terminal_mut().scroll(to);
+        pane.scrolled_back = !matches!(to, ScrollTo::Bottom);
+
+        if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+            pane.screen = screen;
+        }
+    }
+
+    /// Scrolls the focused pane by `pages` of its own height, or of half its
+    /// height; negative towards older output.
+    fn scroll_pages(&mut self, pages: isize, half: bool) {
+        let Some(rows) = self
+            .state
+            .focused_pane()
+            .and_then(|id| self.panes.get(&id))
+            .map(|pane| pane.backend.size().rows)
+        else {
+            return;
+        };
+        let step = if half { (rows / 2).max(1) } else { rows.max(1) };
+        self.scroll_view(ScrollTo::Delta(pages * step as isize));
     }
 
     /// Returns a pane to the newest output.
@@ -4593,7 +4636,7 @@ impl App {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
-        } else if self.router.key_mode() == KeyMode::Tabs {
+        } else if self.router.key_mode() == KeyMode::Tab {
             // The same goes for a mode, and it has keys of its own to spell out.
             // A message goes between the mode's name and its keys: `[`, `]`,
             // `i` and `o` keep the mode on, and a refusal hidden behind the
@@ -4647,7 +4690,7 @@ impl App {
 
         // On `tab`, like the active tab, and in the same text colour for the
         // same reason.
-        let style = if self.router.is_armed() || self.router.key_mode() == KeyMode::Tabs {
+        let style = if self.router.is_armed() || self.router.key_mode() == KeyMode::Tab {
             Style::default()
                 .bg(self.theme.tab)
                 .fg(self.theme.text)
@@ -5095,6 +5138,105 @@ mod tests {
         );
     }
 
+    /// The rows a pane shows now, as text.
+    fn shown(app: &App, pane: PaneId) -> Vec<String> {
+        app.panes[&pane].screen.text_lines()
+    }
+
+    /// A pane that has printed `line-001` to `line-100`, so it has
+    /// scrollback.
+    fn pane_with_history(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+    ) -> PaneId {
+        let pane = spawn_several(app, daemon, project, 1)[0];
+        let output: String = (1..=100).map(|n| format!("line-{n:03}\r\n")).collect();
+        print(app, daemon, pane, output.as_bytes());
+        pane
+    }
+
+    #[test]
+    fn scroll_mode_reads_back_through_a_panes_output_and_esc_returns() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = pane_with_history(&mut app, &daemon, project);
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(
+            shown(&app, pane)[0].trim_end(),
+            "line-001",
+            "the oldest output"
+        );
+        assert!(
+            app.status.is_empty(),
+            "the mode's own row says where the user is"
+        );
+
+        // Half of a 24-row pane.
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(shown(&app, pane)[0].trim_end(), "line-013");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("line-100")),
+            "back to live output"
+        );
+        assert!(!app.panes[&pane].scrolled_back);
+    }
+
+    #[test]
+    fn scroll_mode_on_a_pane_with_no_scrollback_is_harmless() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        print(&mut app, &daemon, pane, b"only-line\r\n");
+
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for code in [
+            KeyCode::Char('g'),
+            KeyCode::Char('u'),
+            KeyCode::PageUp,
+            KeyCode::Char('k'),
+        ] {
+            press(&mut app, code);
+        }
+
+        assert!(
+            shown(&app, pane)
+                .iter()
+                .any(|line| line.starts_with("only-line"))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn pane_mode_p_walks_the_panes_on_this_tab() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.focus_pane(panes[0]);
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        for expected in [panes[1], panes[2], panes[0]] {
+            press(&mut app, KeyCode::Char('p'));
+            assert_eq!(app.state.focused_pane(), Some(expected));
+        }
+        assert_eq!(app.router.key_mode(), KeyMode::Pane, "still walking");
+    }
+
+    #[test]
+    fn the_prefix_then_a_bracket_opens_scroll_mode_in_the_app() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        command(&mut app, '[');
+
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+    }
+
     #[test]
     fn a_pane_that_exits_mid_work_stays_exited_and_unmarked() {
         let (mut app, project, daemon, _sent) = attached_app();
@@ -5538,7 +5680,7 @@ mod tests {
         press(&mut app, KeyCode::Right);
 
         assert_eq!(app.current_tab(), 2);
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still stepping");
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still stepping");
     }
 
     #[test]
@@ -10320,7 +10462,7 @@ mod tests {
         drawn(&mut app, &mut terminal);
 
         let row = bottom_row(&terminal);
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still in the mode");
+        assert_eq!(app.router.key_mode(), KeyMode::Tab, "still in the mode");
         assert!(row.starts_with("TAB  no tab to the left  "), "{row:?}");
         assert!(row.contains("n new"), "the keys still follow: {row:?}");
     }
@@ -10333,7 +10475,7 @@ mod tests {
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
 
-        assert_eq!(app.router.key_mode(), KeyMode::Tabs);
+        assert_eq!(app.router.key_mode(), KeyMode::Tab);
         assert!(app.status.is_empty(), "{:?}", app.status);
     }
 
