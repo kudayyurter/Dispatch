@@ -488,9 +488,9 @@ mod imp {
 
             // The leader is unreaped, so its pid is still its group's id and
             // the group is certainly this pane's.
-            signal_group(pid, libc::SIGTERM).map_err(map)?;
+            signalled(signal_group(pid, libc::SIGTERM)).map_err(map)?;
             if !self.exited_by(deadline) {
-                signal_group(pid, libc::SIGKILL).map_err(map)?;
+                signalled(signal_group(pid, libc::SIGKILL)).map_err(map)?;
                 self.exited_by(Instant::now() + KILL_TIMEOUT);
             }
 
@@ -506,11 +506,26 @@ mod imp {
             self.reap();
             let rest = deadline.saturating_duration_since(Instant::now());
             if !wait_for_group_to_exit(pid, rest)
-                && signal_group(pid, libc::SIGKILL).map_err(map)?
+                && signalled(signal_group(pid, libc::SIGKILL)).map_err(map)?
             {
                 wait_for_group_to_exit(pid, KILL_TIMEOUT);
             }
             Ok(())
+        }
+    }
+
+    /// What a signal to a pane's group says, with "not permitted" read as
+    /// "nothing left in it to signal".
+    ///
+    /// macOS answers a signal to a group whose only member is a zombie -- the
+    /// exited leader, kept unreaped for its number -- with EPERM, where Linux
+    /// answers success. Either way nothing is left to signal, and the leader
+    /// still has to be reaped: returned as a failure, it ended the close
+    /// before the reap, and the zombie stayed for good.
+    pub(super) fn signalled(result: std::io::Result<bool>) -> std::io::Result<bool> {
+        match result {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(false),
+            other => other,
         }
     }
 
@@ -905,6 +920,25 @@ mod tests {
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the script printed a line")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_group_that_cannot_be_signalled_is_taken_for_one_with_nothing_left() {
+        // macOS answers a signal to a group whose only member is a zombie --
+        // the exited leader, kept unreaped for its number -- with EPERM,
+        // where Linux answers success. Taken as a failure, it ended the close
+        // before the leader was reaped, and the zombie stayed for good.
+        let refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(matches!(super::imp::signalled(Err(refused)), Ok(false)));
+        assert!(matches!(super::imp::signalled(Ok(true)), Ok(true)));
+        assert!(matches!(super::imp::signalled(Ok(false)), Ok(false)));
+
+        let other = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            super::imp::signalled(Err(other)).is_err(),
+            "any other failure is still one"
+        );
     }
 
     #[test]
