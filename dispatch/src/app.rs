@@ -3501,7 +3501,11 @@ impl App {
             pane.screen = screen;
         }
 
-        self.status = "scrolled back — press End or type to return".into();
+        // Not in scroll mode, where End and typing return nowhere, and the
+        // mode's own row already says how to leave.
+        if self.router.key_mode() != KeyMode::Scroll {
+            self.status = "scrolled back — press End or type to return".into();
+        }
     }
 
     /// Focuses the next pane on the tab on screen, wrapping to the first.
@@ -4696,6 +4700,20 @@ impl App {
             .map(|device| device.name.clone())
             .collect();
 
+        // Ahead of `self.status`, which may still hold whatever was happening
+        // when the connection went: a user needs to know the agents are out of
+        // reach more than they need the last message.
+        let lead = if !unreachable.is_empty() {
+            Some(format!(
+                "waiting for {} — its agents are still running",
+                unreachable.join(", ")
+            ))
+        } else if !self.status.is_empty() {
+            Some(self.status.clone())
+        } else {
+            None
+        };
+
         let mode = self.router.key_mode();
         let keymap = self.router.keymap();
         let text = if mode == KeyMode::Prefix {
@@ -4703,7 +4721,16 @@ impl App {
             // with no explanation.
             "PREFIX".to_string()
         } else if mode == KeyMode::Lock {
-            keymap.lock_help()
+            // Everything the normal row says but its keys, which lock does
+            // not read: a lock can last all afternoon, and a refusal or a
+            // waiting agent hidden behind it for that long is as good as
+            // dropped.
+            std::iter::once(keymap.lock_help())
+                .chain(lead)
+                .chain(waiting_reminder)
+                .chain(blocked_reminder)
+                .collect::<Vec<_>>()
+                .join("  ")
         } else if mode.is_modal() {
             // A mode spells out its own keys, from the same table that runs
             // them. A message goes between its name and its keys: several
@@ -4717,18 +4744,7 @@ impl App {
                 _ => help,
             }
         } else {
-            let (lead, help) = if !unreachable.is_empty() {
-                // Ahead of `self.status`, which may still hold whatever was
-                // happening when the connection went: a user needs to know the
-                // agents are out of reach more than they need the last message.
-                let notice = format!(
-                    "waiting for {} — its agents are still running",
-                    unreachable.join(", ")
-                );
-                (Some(notice), None)
-            } else if !self.status.is_empty() {
-                (Some(self.status.clone()), None)
-            } else {
+            let help = lead.is_none().then(|| {
                 let panes = self.state.visible_panes().len();
                 let tabs = if self.tab_count() > 1 {
                     format!("  tab {}/{}", self.current_tab() + 1, self.tab_count())
@@ -4740,9 +4756,8 @@ impl App {
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
-                let help = format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help());
-                (None, Some(help))
-            };
+                format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help())
+            });
 
             // The reminders ahead of the key help: it alone runs past eighty
             // columns, and whatever follows it is cut off on the terminals
@@ -10795,6 +10810,70 @@ mod tests {
         drawn(&mut app, &mut terminal);
 
         assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED  Ctrl g unlock");
+    }
+
+    #[test]
+    fn a_message_still_shows_while_locked() {
+        // Lock lasts; a refusal hidden behind it would drop keys silently.
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.status = "far is unreachable".into();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(
+            bottom_row(&terminal).trim_end(),
+            "LOCKED  Ctrl g unlock  far is unreachable"
+        );
+    }
+
+    #[test]
+    fn a_waiting_delegation_is_still_mentioned_while_locked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: pane,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        drawn(&mut app, &mut terminal);
+
+        let row = bottom_row(&terminal);
+        assert!(row.starts_with("LOCKED  Ctrl g unlock"), "{row:?}");
+        assert!(row.contains("1 delegation(s) waiting"), "{row:?}");
+    }
+
+    #[test]
+    fn the_wheel_in_scroll_mode_scrolls_without_a_message() {
+        // The wheel's message says End or typing returns, and neither does
+        // in scroll mode; the mode's own row already says how to leave.
+        let (mut app, target, _other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, target);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        press(&mut app, KeyCode::Char('G'));
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert!(app.panes[&target].scrolled_back, "the wheel still scrolls");
+        assert!(app.status.is_empty(), "{:?}", app.status);
+
+        press(&mut app, KeyCode::Esc);
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
     }
 
     #[test]

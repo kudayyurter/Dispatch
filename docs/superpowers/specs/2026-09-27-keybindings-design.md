@@ -134,7 +134,9 @@ output.
 | `Esc`, `Enter`, `Ctrl c` | leave, and jump back to live output | ends |
 
 `^a [` now enters scroll mode instead of scrolling ten lines. The mouse
-wheel scrolls as it does today, in any mode.
+wheel scrolls as it does today, in any mode; in scroll mode it does so
+without its "press End or type to return" message, which the mode's keys
+would contradict.
 
 ### Session mode (`Ctrl o`)
 
@@ -274,7 +276,10 @@ Generated from the keymap, so it always matches the bindings:
   it, a status message (such as a refusal) sits between the name and the
   keys, entering a mode clears a stale message, and the row is drawn in the
   highlighted style.
-- **Lock**: `LOCKED  Ctrl g unlock` (the chord as bound), highlighted.
+- **Lock**: `LOCKED  Ctrl g unlock` (the chord as bound), highlighted, then
+  what the normal row would say before its keys — an unreachable machine, a
+  status message, waiting delegations, blocked panes — since a lock can last
+  long enough for any of them to matter.
 - **Prefix**: `PREFIX`, as today.
 
 Slice C's hand-written `TAB_MODE_HELP` is replaced by the generated row; its
