@@ -241,7 +241,9 @@ did.
 - One table per mode: `normal`, `prefix`, `pane`, `tab`, `scroll`,
   `session`, `lock`. Each maps chord text to a command name.
 - A binding replaces that chord's default in that mode; `"none"` removes it.
-  A new chord is appended after the mode's defaults, in file order.
+  A new chord is appended after the mode's defaults, in the sorted order of
+  the key texts: the TOML reader does not promise the file's order, and the
+  order only decides where an added key sits in its mode's row.
 - `clear = true` inside a table drops that mode's defaults first, as
   zellij's `clear-defaults` does.
 - `dispatch-config` gains `KeysConfig`: the raw tables, kept as strings so a
