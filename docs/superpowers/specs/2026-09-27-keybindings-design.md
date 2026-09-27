@@ -330,8 +330,9 @@ wording changes slightly, and the tests that pin it move with it.
 - **Config**: `[keys]` parses, unknown modes are reported, the daemon
   ignores it.
 - **End to end**: `Ctrl s` then `k` scrolls a shell's output back and `Esc`
-  returns; `Ctrl g` then `Ctrl t` reaches the shell (the shell sees it), then
-  `Ctrl g` unlocks; a `[keys]` rebinding in the fixture's `config.toml` takes
+  returns; `Ctrl g` then `Ctrl p` reaches the shell (the shell sees it; not
+  `Ctrl t`, which macOS's terminal driver keeps for itself), then `Ctrl g`
+  unlocks; a `[keys]` rebinding in the fixture's `config.toml` takes
   effect.
 
 ## Documentation
