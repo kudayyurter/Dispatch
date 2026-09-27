@@ -1,6 +1,6 @@
 # Reliability pass: five things a day-long session trips over
 
-**Status:** approved design, not yet implemented.
+**Status:** implemented on branch `fix/reliability`.
 **Date:** 2026-09-27.
 
 **Where these came from:**
@@ -72,7 +72,7 @@ This is the same code in the daemon and in a standalone interface, which both us
 
 **Change.** The leader is kept unreaped, as a zombie, from its exit until the pane is closed or dropped, so its number cannot be reused. The Linux and BSD kernels keep a number in use for as long as a process, zombie or not, still has it as its pid or process group id.
 
-- **Reporting the exit.** The waiter learns the exit status with `waitid(P_PID, pid, WEXITED | WNOWAIT)`, which does not reap, and reports `Exited(code)` exactly as today. The code is reported exactly once, whichever of the waiter and the closing path sees the exit first.
+- **Reporting the exit.** The waiter learns the exit status with `waitid(P_PID, pid, WEXITED | WNOWAIT)`, which does not reap, and reports `Exited(code)` exactly as today. The code is reported exactly once, whichever of the waiter and the closing path sees the exit first. Only `CLD_EXITED`, `CLD_KILLED` and `CLD_DUMPED` count as an exit, because macOS has been seen to answer `WEXITED` for a child that has only stopped (golang/go#19314), and a stopped leader taken for exited would be reaped while it was still going.
 - **Ending the tree on close.** Close and drop end the tree in this order:
   1. `SIGTERM` the group. The leader is still pinned, so the group is certainly ours.
   2. Wait up to the grace period for the leader to exit, without reaping.
