@@ -3497,6 +3497,15 @@ impl App {
 
     /// Scrolls one pane and refreshes what it shows.
     fn scroll_pane(&mut self, id: PaneId, rows: isize) {
+        // The wheel over any pane but the one scroll mode is reading is the
+        // user turning to it, so the mode ends first. Settled here rather than
+        // after: going back to live output clears the status row, which would
+        // take this pane's message with it.
+        if self.router.key_mode() == KeyMode::Scroll && self.scrolling != Some(id) {
+            self.router.leave_mode();
+            self.settle_scroll_mode();
+        }
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -3508,8 +3517,8 @@ impl App {
             pane.screen = screen;
         }
 
-        // Not in scroll mode, where End and typing return nowhere, and the
-        // mode's own row already says how to leave.
+        // Not for the pane scroll mode is reading, where End and typing return
+        // nowhere, and the mode's own row already says how to leave.
         if self.router.key_mode() != KeyMode::Scroll {
             self.status = "scrolled back — press End or type to return".into();
         }
@@ -10975,6 +10984,29 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         app.handle(&wheel, Size::new(100, 30))
             .expect("the wheel is handled");
+        assert_eq!(app.status, "scrolled back — press End or type to return");
+    }
+
+    #[test]
+    fn the_wheel_over_another_pane_ends_scroll_mode_and_says_so() {
+        // Turning to another pane with the wheel is leaving the one being
+        // read. Were it quiet, that other pane would sit scrolled back with
+        // nothing to say so, and a pane scrolled back is never marked blocked.
+        let (mut app, target, other, _daemon) = scrolled_back_beside_another();
+        let (column, row) = middle_of(&app, other);
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        app.handle(&wheel, Size::new(100, 30))
+            .expect("the wheel is handled");
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(!app.panes[&target].scrolled_back, "back to live output");
+        assert!(app.panes[&other].scrolled_back, "the wheel still scrolls");
         assert_eq!(app.status, "scrolled back — press End or type to return");
     }
 
