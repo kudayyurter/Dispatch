@@ -4991,3 +4991,63 @@ fn a_pane_that_exits_leaves_its_tab() {
     )));
     assert_eq!(daemon.pane_count(), 1, "the pane itself stays until closed");
 }
+
+#[test]
+fn a_client_that_never_reads_is_let_go_of_over_tab_snapshots_too() {
+    // Every change to a tab sends every tab the project has to every
+    // client, through its outbox like the rest of the fleet's traffic. A
+    // client that stopped reading while tabs change is let go once what
+    // waits for it passes its budget -- counted for what the snapshots
+    // hold, not as so many small messages, which let it hold many times
+    // its budget first.
+    const BUDGET: usize = 16 * 1024;
+    let (mut daemon, project, _dir) = daemon("tabs-unread");
+    daemon.set_budgets(Budgets {
+        outbox_bytes: BUDGET,
+        ..Budgets::default()
+    });
+    let reading = subscribed(&mut daemon, 1);
+    let never_reads = subscribed(&mut daemon, 2);
+
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        (_, seen) = spawn_placed(
+            &mut daemon,
+            &reading,
+            project,
+            Placement::NewAfter { tab: None },
+        );
+    }
+    let tabs: Vec<TabId> = (0..4).map(|index| tab_at(&seen, project, index)).collect();
+
+    let mut renames = 0;
+    while daemon.clients.contains_key(&2) {
+        assert!(
+            renames < 10_000,
+            "a client that never reads was kept through {renames} renames"
+        );
+        daemon.request_for_test(
+            1,
+            ClientMessage::RenameTab {
+                tab: tabs[renames % tabs.len()],
+                name: format!("{renames:>64}"),
+            },
+        );
+        let _ = drain(&reading);
+        renames += 1;
+    }
+
+    // What was left waiting, as the bytes its writer would have sent.
+    let queued: usize = never_reads
+        .try_iter()
+        .map(|message| {
+            let mut frame = Vec::new();
+            Frame::write(&mut frame, &message).expect("a message encodes");
+            frame.len()
+        })
+        .sum();
+    assert!(
+        queued < 2 * BUDGET,
+        "{queued} bytes were queued for a client that never read, against a budget of {BUDGET}"
+    );
+}

@@ -190,15 +190,27 @@ impl Inbox {
 }
 
 /// Roughly what holding a message costs: its bulk, plus an allowance for
-/// the rest. Only output, a subagent's tail and a task are ever large.
+/// the rest. Only output, a subagent's tail, a task and a project's tabs
+/// are ever large.
 fn weight(message: &ServerMessage) -> usize {
     const ENVELOPE: usize = 64;
+    // A tab's id and the names of its fields, as they are written.
+    const TAB: usize = 64;
+    // A pane's id, written as text.
+    const PANE: usize = 40;
 
     ENVELOPE
         + match message {
             ServerMessage::PaneOutput { bytes, .. } => bytes.len(),
             ServerMessage::DelegateFinished { tail, .. } => tail.len(),
             ServerMessage::DelegatePending { task, .. } => task.len(),
+            // Every tab the project has, each time any of them changes: a
+            // client that stopped reading while tabs are renamed or moved
+            // is holding all of them, over and over.
+            ServerMessage::Tabs { tabs, .. } => tabs
+                .iter()
+                .map(|tab| TAB + tab.name.as_ref().map_or(0, String::len) + PANE * tab.panes.len())
+                .sum(),
             _ => 0,
         }
 }
