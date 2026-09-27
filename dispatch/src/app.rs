@@ -32,7 +32,7 @@ use dispatch_tui::input::{
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
+use dispatch_tui::{Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -50,11 +50,6 @@ const TAB_TITLE: usize = 16;
 
 /// What a tab command says on a project whose daemon keeps no tabs.
 const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
-
-/// The status row while tab mode is on: every key it takes, since nothing
-/// else on screen says what they are.
-const TAB_MODE_HELP: &str =
-    "TAB  n new  r rename  x close  ←→ switch  [ ] move pane  i o move tab  1-9 go  Esc done";
 
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
@@ -826,6 +821,12 @@ impl App {
     pub fn set_motion(&mut self, on: bool) {
         self.motion = on;
         self.animations.set_enabled(on);
+    }
+
+    /// Reads keys through `keymap`: the defaults with the user's `[keys]`
+    /// laid over them.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.router = InputRouter::with_keymap(keymap);
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -2383,9 +2384,9 @@ impl App {
         let action = self.router.handle(event, &layout);
         self.layout = layout;
 
-        // Tab mode shows a message ahead of its keys, so one left from before
-        // would ride in with it and read as something the mode had said.
-        if mode != KeyMode::Tab && self.router.key_mode() == KeyMode::Tab {
+        // Entering a mode wipes a stale message, so what the mode's row shows
+        // between its name and its keys is about this mode.
+        if !mode.is_modal() && self.router.key_mode().is_modal() {
             self.status.clear();
         }
 
@@ -3616,6 +3617,18 @@ impl App {
         self.animations.sweep(now);
         self.notice_focus(now);
 
+        // Scroll mode reads the focused pane's scrollback; with that pane gone
+        // there is nothing left to read, and the mode would hold keys for
+        // nothing.
+        if self.router.key_mode() == KeyMode::Scroll
+            && self
+                .state
+                .focused_pane()
+                .is_none_or(|id| !self.panes.contains_key(&id))
+        {
+            self.router.leave_mode();
+        }
+
         // Remembered once a frame rather than on each way focus can move:
         // there are many ways, and the frame sees the result of all of them.
         if let Some(focused) = self.state.focused_pane()
@@ -4632,18 +4645,25 @@ impl App {
             .map(|device| device.name.clone())
             .collect();
 
-        let text = if self.router.is_armed() {
+        let mode = self.router.key_mode();
+        let keymap = self.router.keymap();
+        let text = if mode == KeyMode::Prefix {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
-        } else if self.router.key_mode() == KeyMode::Tab {
-            // The same goes for a mode, and it has keys of its own to spell out.
-            // A message goes between the mode's name and its keys: `[`, `]`,
-            // `i` and `o` keep the mode on, and a refusal hidden behind the
-            // key list would make the key look dead.
-            match TAB_MODE_HELP.strip_prefix("TAB  ") {
-                Some(keys) if !self.status.is_empty() => format!("TAB  {}  {keys}", self.status),
-                _ => TAB_MODE_HELP.to_string(),
+        } else if mode == KeyMode::Lock {
+            keymap.lock_help()
+        } else if mode.is_modal() {
+            // A mode spells out its own keys, from the same table that runs
+            // them. A message goes between its name and its keys: several
+            // keys keep the mode on, and a refusal hidden behind the key list
+            // would make the key look dead.
+            let help = keymap.mode_help(mode);
+            match help.split_once("  ") {
+                Some((title, keys)) if !self.status.is_empty() => {
+                    format!("{title}  {}  {keys}", self.status)
+                }
+                _ => help,
             }
         } else {
             let (lead, help) = if !unreachable.is_empty() {
@@ -4669,9 +4689,7 @@ impl App {
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
-                let help = format!(
-                    "{panes} pane(s){where_}{tabs}  ^a n new  Ctrl t tabs  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
-                );
+                let help = format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help());
                 (None, Some(help))
             };
 
@@ -4690,7 +4708,7 @@ impl App {
 
         // On `tab`, like the active tab, and in the same text colour for the
         // same reason.
-        let style = if self.router.is_armed() || self.router.key_mode() == KeyMode::Tab {
+        let style = if mode != KeyMode::Normal {
             Style::default()
                 .bg(self.theme.tab)
                 .fg(self.theme.text)
@@ -10444,7 +10462,15 @@ mod tests {
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
-        assert!(bottom_row(&terminal).starts_with(TAB_MODE_HELP));
+        // The generated tab row is longer than this hundred-column test
+        // terminal, so the row is a prefix of the full help rather than
+        // equal to it.
+        assert!(
+            app.router
+                .keymap()
+                .mode_help(KeyMode::Tab)
+                .starts_with(bottom_row(&terminal).trim_end())
+        );
     }
 
     #[test]
@@ -10678,5 +10704,141 @@ mod tests {
             SHELL,
             "a daemon that keeps tabs has a shell"
         );
+    }
+
+    fn a_wide_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30))
+            .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn each_mode_spells_out_its_keys_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        for (key, mode) in [
+            ('p', KeyMode::Pane),
+            ('t', KeyMode::Tab),
+            ('s', KeyMode::Scroll),
+            ('o', KeyMode::Session),
+        ] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            assert_eq!(
+                bottom_row(&terminal).trim_end(),
+                app.router.keymap().mode_help(mode),
+                "{mode:?}"
+            );
+            press(&mut app, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn lock_says_how_to_unlock() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED  Ctrl g unlock");
+    }
+
+    #[test]
+    fn the_normal_row_lists_the_mode_keys() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains(
+                "Ctrl p pane  Ctrl t tabs  Ctrl s scroll  Ctrl o session  Ctrl g lock  Ctrl a prefix"
+            ),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn a_rebound_key_shows_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut keys = dispatch_config::KeysConfig::default();
+        keys.0.insert(
+            "pane".into(),
+            [(
+                "w".to_string(),
+                dispatch_config::KeyValue::Command("close_pane".into()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        app.set_keymap(dispatch_tui::Keymap::with_overrides(&keys).0);
+        let mut terminal = a_wide_terminal();
+
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            bottom_row(&terminal).contains("x/w close"),
+            "{}",
+            bottom_row(&terminal)
+        );
+    }
+
+    #[test]
+    fn entering_any_mode_clears_a_stale_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        app.status = "old".into();
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(app.status.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        app.status = "old".into();
+        command(&mut app, '[');
+        assert_eq!(app.router.key_mode(), KeyMode::Scroll);
+        assert!(app.status.is_empty(), "through the prefix too");
+    }
+
+    #[test]
+    fn scroll_mode_ends_when_its_pane_goes() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_terminal();
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        daemon
+            .send(ServerMessage::PaneClosed { pane })
+            .expect("the app is listening");
+        app.poll_daemon();
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn every_mode_but_normal_is_drawn_highlighted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        for key in ['p', 's', 'o', 'g'] {
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+            drawn(&mut app, &mut terminal);
+            let row = terminal.backend().buffer().area.height - 1;
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((0, row))
+                .expect("the status row is drawn");
+            assert_eq!(cell.bg, app.theme.tab, "Ctrl {key}");
+            key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
+        }
     }
 }

@@ -284,6 +284,14 @@ fn main() -> Result<ExitCode> {
 
     app.set_motion(loaded.config.interface.motion);
 
+    // Keys are the interface's alone; the daemon never reads `[keys]`. What
+    // could not be used is logged by name, and the rest still applies.
+    let (keymap, warnings) = dispatch_tui::Keymap::with_overrides(&loaded.config.keys);
+    for warning in &warnings {
+        tracing::warn!(%warning, path = %config_path.display(), "ignoring a key binding");
+    }
+    app.set_keymap(keymap);
+
     // From here on the terminal belongs to Dispatch, so nothing may write to
     // stdout and every exit path has to restore it.
     install_panic_hook();
