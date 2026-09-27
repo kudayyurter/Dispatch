@@ -66,7 +66,7 @@ every pane, whichever tab it is on.
 
 A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
-what it printed — `^a x` is what removes it for good.
+what it printed — `Ctrl p x` (or `^a x`) is what removes it for good.
 
 ## Tabs
 
@@ -81,7 +81,7 @@ it. When there are more tabs than fit, the row scrolls to keep yours in view.
 | `n` | new tab: the picker, with your shell first |
 | `r` | rename the tab (empty goes back to the first pane's title) |
 | `x` | close the tab and every pane on it, after a y/n |
-| `←` `→` / `h` `l` | previous / next tab |
+| `←` `→` / `h` `l` / `k` `j` | previous / next tab |
 | `[` `]` | move the focused pane to the previous / next tab (a new one past the last) |
 | `i` `o` | move the tab left / right |
 | `1`–`9` | go to a tab by position |
@@ -89,15 +89,60 @@ it. When there are more tabs than fit, the row scrolls to keep yours in view.
 | `Esc` / `Enter` | leave tab mode |
 | `Ctrl t` | send `Ctrl t` itself to the pane (Claude Code and fzf use it) |
 
-Some keys work without a mode: `Alt n` opens a new pane on this tab,
-`Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
-moves focus, going on to the next tab at the grid's edge. `^a 1`–`^a 9` and
-`^a Tab` still work too. As in zellij, a quick `Esc` followed by a letter
-(as in vim) can reach Dispatch as `Alt` and that letter.
+Some keys work without a mode: see Keys below.
 
 A daemon keeps its projects' tabs, so they survive detaching and look the
 same from every client. A daemon older than tabs still works: its panes are
 grouped four at a time, as before.
+
+## Keys
+
+Keys work the way zellij's do: a `Ctrl` key enters a mode for one kind of
+thing, the status row lists that mode's keys, and `Esc` leaves it. Every
+other key goes to the pane.
+
+| Key | Mode |
+|---|---|
+| `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
+| `Ctrl t` | tab: see Tabs above |
+| `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
+| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit |
+| `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
+| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode |
+
+Some keys work without a mode: `Alt n` opens a new pane on this tab,
+`Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
+moves focus, going on to the next tab at the grid's edge. As in zellij, a
+quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
+that letter.
+
+A mode's key pressed twice goes to the pane (`Ctrl s Ctrl s` gives a shell
+its `Ctrl s`), and lock mode gives a program every key until you unlock.
+`Ctrl q` does not quit on its own — standalone, quitting ends every agent —
+so quit is `Ctrl o q` or `^a q`.
+
+To change a key, say only what differs in `config.toml`:
+
+```toml
+[keys.normal]
+"Ctrl q" = "quit"        # bind something new
+"Ctrl a" = "none"        # give Ctrl a back to the shell…
+"Ctrl b" = "prefix"      # …and use tmux's key for the prefix
+
+[keys.pane]
+"w" = "close_pane"       # a second key for a command
+"x" = "none"             # unbind a default
+```
+
+The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
+`lock`, and a key is written as zellij writes one: `"Ctrl t"`, `"Alt n"`,
+`"x"`, `"H"`, `"Shift Tab"`, `"PageUp"`, `"F5"`. `clear = true` in a table
+drops that mode's defaults. A command is named in snake_case — `new_pane`,
+`close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
+`next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
+`quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
+name and skipped, and the rest still applies. `Esc` always leaves a mode,
+and lock always has a key that unlocks. Keys are read when Dispatch starts.
 
 ## Shell panes
 
