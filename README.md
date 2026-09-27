@@ -116,10 +116,15 @@ moves focus, going on to the next tab at the grid's edge. As in zellij, a
 quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
 that letter.
 
-A mode's key pressed twice goes to the pane (`Ctrl s Ctrl s` gives a shell
-its `Ctrl s`), and lock mode gives a program every key until you unlock.
-`Ctrl q` does not quit on its own — standalone, quitting ends every agent —
-so quit is `Ctrl o q` or `^a q`.
+Four of these keys are newly taken from panes: `Ctrl p` is a shell's
+previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is
+bash's operate-and-get-next, and `Ctrl g` is emacs's cancel. `Ctrl t` was
+already taken, by fzf's file finder and Claude Code's task list. A mode's
+key pressed twice goes to the pane instead (`Ctrl s Ctrl s` gives a shell
+its `Ctrl s`), lock mode gives a program every key until you unlock, and
+`"none"` in `[keys]` gives a key back for good. `Ctrl q` does not quit on
+its own — standalone, quitting ends every agent — so quit is `Ctrl o q` or
+`^a q`.
 
 To change a key, say only what differs in `config.toml`:
 
