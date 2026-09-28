@@ -195,3 +195,44 @@ fn a_list_taller_than_the_box_scrolls_to_keep_the_selection_visible() {
         text(&buf)
     );
 }
+
+#[test]
+fn a_hint_is_drawn_on_the_bottom_border() {
+    let picker = picker().with_hint("Enter open · e settings");
+    let text = text(&render(&picker, 60, 10));
+
+    let line = text
+        .lines()
+        .find(|line| line.contains("Enter open · e settings"))
+        .expect("the hint is drawn");
+    assert!(line.contains('└'), "on the bottom border: {line:?}");
+    assert_eq!(picker.hint(), Some("Enter open · e settings"));
+}
+
+#[test]
+fn a_hint_widens_a_picker_to_fit() {
+    let picker = Picker::new("P", vec![Item::new("a", "a")])
+        .with_hint("a hint much wider than anything in the list");
+
+    assert!(text(&render(&picker, 80, 10)).contains("a hint much wider than anything in the list"));
+}
+
+#[test]
+fn a_picker_has_no_hint_unless_given_one() {
+    assert_eq!(picker().hint(), None);
+}
+
+#[test]
+fn selecting_by_id_moves_the_highlight() {
+    let mut picker = picker();
+
+    picker.select("agy");
+    assert_eq!(picker.selected().expect("an item").id, "agy");
+
+    picker.select("nothing-by-that-name");
+    assert_eq!(
+        picker.selected().expect("an item").id,
+        "agy",
+        "an unknown id leaves it where it was"
+    );
+}

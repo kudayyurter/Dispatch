@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
+use dispatch_config::{Choices, DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
 use dispatch_core::{
     PaneId, PaneStatus, Placement, Project, ProjectId, ProjectSource, ProjectTabs, RequestId,
     TabError, TabId,
@@ -277,6 +277,10 @@ pub struct Daemon {
     leftovers_tried: Instant,
     /// The task directory's lock, while this daemon holds it.
     task_dir_lock: Option<std::fs::File>,
+    /// Where the user's saved harness settings live, when this daemon
+    /// reads them: `None` until it is told, so no test reads the
+    /// developer's own.
+    settings_dir: Option<PathBuf>,
     /// When branches were last looked at.
     branches_checked: Option<Instant>,
     /// How often they are looked at: [`dispatch_os::git::RECHECK`], or every
@@ -319,6 +323,7 @@ impl Daemon {
             leftovers: Leftovers::default(),
             leftovers_tried: Instant::now(),
             task_dir_lock: None,
+            settings_dir: None,
             branches_checked: None,
             branch_every: dispatch_os::git::RECHECK,
         }
@@ -336,6 +341,23 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_task_dir(&mut self, dir: PathBuf) {
         self.task_dir = dir;
+    }
+
+    /// Reads the user's saved harness settings from `dir`.
+    ///
+    /// Before `serve`, which consumes the daemon.
+    pub fn set_settings_dir(&mut self, dir: PathBuf) {
+        self.settings_dir = Some(dir);
+    }
+
+    /// What the user saved for `harness`, read fresh so a save in any
+    /// client takes effect at once. Nothing when this daemon was told of
+    /// no directory, or the file cannot be read.
+    fn saved_settings(&self, harness: &str) -> Choices {
+        self.settings_dir
+            .as_deref()
+            .map(|dir| dispatch_config::harness_settings::load_or_empty(dir, harness))
+            .unwrap_or_default()
     }
 
     /// Returns the handle that stops this daemon.
@@ -692,7 +714,15 @@ impl Daemon {
                 harness,
                 size,
                 place,
-            } => self.spawn_pane(id, project, &harness, Size::new(size.0, size.1), place),
+                settings,
+            } => self.spawn_pane(
+                id,
+                project,
+                &harness,
+                &settings,
+                Size::new(size.0, size.1),
+                place,
+            ),
 
             ClientMessage::WritePane { pane, bytes } => {
                 let Some(target) = self.panes.get_mut(&pane) else {
@@ -902,6 +932,7 @@ impl Daemon {
         client: ClientId,
         project: ProjectId,
         harness: &str,
+        settings: &Choices,
         size: Size,
         place: Placement,
     ) {
@@ -925,7 +956,26 @@ impl Daemon {
             return;
         };
 
-        let mut launch = def.launch_for_current_platform();
+        // The client sends only what the user chose or saved; the rest
+        // is this machine's to decide. A value this harness cannot take
+        // is refused, never dropped: a dropped `bypass = false` would
+        // start an agent with its prompts off.
+        let values = match def.resolve(settings, &self.saved_settings(harness)) {
+            Ok(values) => values,
+            Err(reason) => {
+                self.send(
+                    client,
+                    ServerMessage::Error {
+                        // `reason` already names the harness (`HarnessDef::resolve`
+                        // puts it first), so naming it again here would read as
+                        // "not starting claude: claude: …".
+                        error: ProtocolError::Other(format!("not starting a pane: {reason}")),
+                    },
+                );
+                return;
+            }
+        };
+        let mut launch = def.launch_with(std::env::consts::OS, &values);
         let id = PaneId::new();
         add_missing(&mut launch.env, self.pane_env(id));
 
@@ -1144,7 +1194,14 @@ impl Daemon {
     /// One place builds it, so what is judged before a run starts is what
     /// starts.
     fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
-        let mut run = self.harnesses.get(harness)?.task_launch(task)?;
+        let def = self.harnesses.get(harness)?;
+        // No client chose anything for a subagent: it gets what the user
+        // saved, then the file's defaults. Nothing chosen is nothing to
+        // refuse, so this cannot fail.
+        let values = def
+            .resolve(&Choices::new(), &self.saved_settings(harness))
+            .unwrap_or_default();
+        let mut run = def.task_launch_with(std::env::consts::OS, task, &values)?;
         add_missing(&mut run.launch.env, self.pane_env(pane));
         if run.input == TaskInput::Argument {
             // Its task is in its arguments, so a task file named in its

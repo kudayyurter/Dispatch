@@ -23,28 +23,16 @@ args = ["-p", "{task}"]
 args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 
-# Each setting's args go after the launch's own, in a one-shot run too, with
-# {value} replaced by what was chosen. Unset passes nothing and leaves the
-# choice to Claude. `e` on a harness in the new-pane picker changes them.
 [[settings]]
 key = "model"
 label = "Model"
 kind = "choice"
-options = ["opus", "sonnet", "fable", "haiku"]
-custom = true
-args = ["--model", "{value}"]
+options = ["default", "opus", "sonnet", "haiku"]
+default = "default"
 
 [[settings]]
-key = "effort"
-label = "Effort"
+key = "permission_mode"
+label = "Permission mode"
 kind = "choice"
-options = ["low", "medium", "high", "xhigh", "max"]
-args = ["--effort", "{value}"]
-
-[[settings]]
-key = "permissions"
-label = "Permissions"
-kind = "choice"
-options = ["bypassPermissions", "auto", "acceptEdits", "plan", "manual"]
-default = "bypassPermissions"
-args = ["--permission-mode", "{value}"]
+options = ["default", "acceptEdits", "plan"]
+default = "default"

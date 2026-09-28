@@ -38,6 +38,9 @@ fn every_client_message_round_trips() {
             harness: "claude".into(),
             size: (80, 24),
             place: Placement::Into { tab: TabId::new() },
+            settings: [("model".to_string(), "opus".to_string())]
+                .into_iter()
+                .collect(),
         },
         ClientMessage::MovePane {
             pane: PaneId::new(),
@@ -756,6 +759,7 @@ fn a_spawn_from_an_older_client_is_placed_automatically() {
             harness: "claude".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         }
     );
 }
@@ -837,4 +841,27 @@ fn an_older_client_skips_a_tabs_snapshot() {
         Frame::read(&mut buf.as_slice()).expect("an older peer still reads the frame");
 
     assert_eq!(read, OlderServerMessage::Unknown);
+}
+
+#[test]
+fn a_spawns_settings_survive_the_wire() {
+    let message = ClientMessage::SpawnPane {
+        project: ProjectId::new(),
+        harness: "claude".into(),
+        size: (80, 24),
+        place: Placement::Auto,
+        settings: [
+            ("model".to_string(), "opus".to_string()),
+            ("permissions".to_string(), String::new()),
+            ("bypass".to_string(), "false".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &message).expect("writing succeeds");
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(read, message);
 }

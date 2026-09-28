@@ -45,6 +45,9 @@ its socket can do anything a client can. Delegation approval keeps
 well-meaning agents in check; it is not a sandbox for untrusted ones. See
 [docs/security-model.md](docs/security-model.md).
 
+Agents also start without their own permission prompts; see
+[Harness settings](#harness-settings) to turn them back on.
+
 ## Layout
 
 | Crate | Responsibility |
@@ -186,6 +189,94 @@ Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
 `COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
 runs in, so a program never sends it another terminal's private sequences.
 A harness's own `env` still wins.
+
+## Harness settings
+
+Every agent Dispatch ships starts **without its permission prompts**: Claude
+Code in `bypassPermissions` mode, Codex with
+`--dangerously-bypass-approvals-and-sandbox` (which also drops its sandbox),
+agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
+[docs/security-model.md](docs/security-model.md) before running an agent you
+do not trust this way.
+
+Claude Code refuses to start in bypass mode when it runs as root: on a
+machine where Dispatch's daemon runs as root — a container, many remote
+machines — every Claude pane and every delegated `claude -p` exits at once.
+Save another **Permissions** mode for Claude on that machine (`e`, then
+`s`), or, only when the machine really is a sandbox such as a container,
+set `IS_SANDBOX = "1"` in that machine's `claude.toml` under `[env]`, which
+Claude reads as permission to bypass.
+
+In the new-pane picker, `e` opens the highlighted harness's settings:
+
+| Key | Does |
+|---|---|
+| `↑` `↓` | move between settings |
+| `←` `→` | step through a setting's values; `Space` flips one that is on or off |
+| `Enter` | open a pane with what is shown, saving nothing |
+| `s` | save what is shown as the harness's default |
+| `Esc` | back to the picker |
+
+A model that is not on the list is typed on the setting's **Custom…** value.
+**agent default** passes nothing, and the agent decides as its own
+configuration says. Beside each harness, the picker shows what you have saved
+that differs from its file.
+
+opencode takes its model from a variable its shared background service never
+sees, so an opencode pane with a chosen model runs a private opencode server
+of its own.
+
+Saved defaults live beside `config.toml`:
+
+```toml
+# ~/.config/dispatch/harness-settings.toml
+[claude]
+model = "opus"
+permissions = ""   # agent default: Claude asks, as it does outside Dispatch
+
+[codex]
+bypass = false     # Codex's prompts and sandbox are back
+```
+
+These are per machine: a subagent is started by the daemon on its own
+machine, so it follows that machine's saved defaults, not the file of the
+machine you are typing on, and not a one-off choice made in the pane that
+asked for it.
+
+A harness file says what its settings are, and how each becomes a flag, so a
+harness you add can have them as well:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"                 # choice | text | bool
+options = ["low", "medium", "high", "xhigh", "max"]
+custom = false                  # true adds a typed value to a choice
+args = ["--effort", "{value}"]  # after the launch's own; nothing when unset
+# env = { NAME = "{value}" }    # or a variable
+
+[[settings]]
+key = "permissions"
+label = "Permissions"
+kind = "choice"
+options = ["bypassPermissions", "auto", "acceptEdits", "plan", "manual"]
+default = "bypassPermissions"
+args = ["--permission-mode", "{value}"]
+```
+
+A `bool` adds its `args` when it is on. A value may hold only letters, digits
+and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
+`cmd.exe`'s command line. The daemon reads harness files when it starts, so
+restart it after editing one, and after upgrading Dispatch too: a daemon
+started before this release ignores the settings a newer client sends, and
+keeps the harness files it already loaded.
+
+A harness file you have edited is left as it is when Dispatch upgrades: it
+keeps its prompts and offers no settings until you delete it (Dispatch
+writes the current one back on its next start) or add `[[settings]]` to it
+yourself.
 
 ## The sidebar
 
@@ -417,9 +508,14 @@ args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 ```
 
-`claude` and `codex` ship with one. On Windows the daemon refuses a form that
-would put the task on `cmd.exe`'s command line, and says which file to fix.
-Caps live in `config.toml`, and refuse rather than prompt:
+`claude` and `codex` ship with one. A subagent starts on the daemon's own
+machine and follows that machine's saved settings, auto-approve included,
+so it can use its tools without waiting on a prompt nobody would see —
+not a one-off choice made in the pane that asked for it, and not another
+machine's saved file. On Windows the
+daemon refuses a form that would put the task on `cmd.exe`'s
+command line, and says which file to fix. Caps live in `config.toml`,
+and refuse rather than prompt:
 
 ```toml
 [delegation]

@@ -280,6 +280,7 @@ fn spawn_parent_pane(
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");

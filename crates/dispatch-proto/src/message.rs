@@ -5,6 +5,7 @@
 //! what make a version mismatch survivable: a newer peer's extra fields are
 //! skipped, and a missing one falls back rather than failing the decode.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dispatch_core::{PaneId, PaneStatus, Placement, Project, ProjectId, RequestId, Tab, TabId};
@@ -180,6 +181,13 @@ pub enum ClientMessage {
         /// [`Placement::Auto`].
         #[serde(default)]
         place: Placement,
+        /// Each setting's value the user chose or saved, by key: a choice
+        /// or text as itself, `""` for agent default, a flag as `"true"` or
+        /// `"false"`. A setting left out is the daemon's to decide, from its
+        /// own saved defaults and then the harness file. An older client
+        /// sends none.
+        #[serde(default)]
+        settings: BTreeMap<String, String>,
     },
 
     /// Sends already-encoded bytes to a pane.

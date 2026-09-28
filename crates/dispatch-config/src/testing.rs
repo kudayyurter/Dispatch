@@ -50,3 +50,49 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Settings as a shipped harness has them: a model to choose or type, an
+/// effort to choose, and a flag that is on unless turned off.
+pub const DEMO_SETTINGS: &str = r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["small", "large"]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+options = ["low", "high"]
+args = ["--effort", "{value}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--yolo"]
+"#;
+
+/// A harness `demo` carrying `settings`, a TOML fragment of `[[settings]]`
+/// tables (and any other tables), loaded through a registry so it is
+/// checked as a harness file is.
+///
+/// It has a Windows wrapper and a Windows one-shot form that reads its task
+/// from a file, as the shipped harnesses do.
+pub fn demo_harness(settings: &str) -> crate::HarnessDef {
+    let text = format!(
+        "id = \"demo\"\ndisplay_name = \"Demo\"\ncommand = \"demo\"\nargs = [\"--tui\"]\n\n\
+         [platform.windows]\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"demo\"]\n\n\
+         [task]\nargs = [\"-p\", \"{{task}}\"]\n\n\
+         [task.platform.windows]\nargs = [\"/d\", \"/c\", \"demo\", \"-p\", \"<%DISPATCH_TASK_FILE%\"]\n\
+         input = \"file\"\n\n\
+         {settings}"
+    );
+    let def: crate::HarnessDef = toml::from_str(&text).expect("a valid harness");
+    let registry: crate::HarnessRegistry = [def].into_iter().collect();
+    registry.get("demo").expect("it is registered").clone()
+}

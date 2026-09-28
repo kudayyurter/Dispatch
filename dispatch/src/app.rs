@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dispatch_client::Client;
-use dispatch_config::{HarnessRegistry, Launch, SHELL};
+use dispatch_config::{Choices, HarnessRegistry, Launch, SHELL};
 use dispatch_core::{
     AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Placement,
     Project, ProjectId, ProjectSource, ProjectTabs, RequestId, TabId,
@@ -33,7 +33,8 @@ use dispatch_tui::input::{
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
 use dispatch_tui::{
-    Command, Item, Keymap, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate,
+    Command, FormAction, Item, Keymap, PaneWidget, Picker, Prompt, SettingsForm, Sidebar, Theme,
+    sidebar, truncate,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -293,6 +294,13 @@ struct Pane {
 enum Overlay {
     /// A harness to spawn.
     Harness(Picker),
+    /// A harness's settings, before a pane is opened with them.
+    Settings {
+        /// The harness they are for.
+        harness: String,
+        /// The rows.
+        form: SettingsForm,
+    },
     /// A project to switch to.
     Project(Picker),
     /// A harness to register, found on PATH.
@@ -339,7 +347,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker) => Some(picker),
-            Overlay::Browse(_)
+            Overlay::Settings { .. }
+            | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
@@ -355,7 +364,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker) => Some(picker),
-            Overlay::Browse(_)
+            Overlay::Settings { .. }
+            | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
@@ -372,7 +382,8 @@ impl Overlay {
             Overlay::Project(_) => Some(OverlayKind::Project),
             Overlay::Register(_) => Some(OverlayKind::Register),
             Overlay::Machine(_) => Some(OverlayKind::Machine),
-            Overlay::Browse(_)
+            Overlay::Settings { .. }
+            | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
@@ -388,6 +399,7 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker) => picker.set_border(style),
+            Overlay::Settings { form, .. } => form.set_border(style),
             Overlay::Browse(browser) => browser.set_border(style),
             Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
             Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
@@ -503,6 +515,10 @@ pub struct App {
     /// `None` in a test, and in any client told to keep nothing: the list is a
     /// convenience, and a client that cannot write it still runs.
     kept: Option<PathBuf>,
+    /// Where the user's saved harness settings live, when this client
+    /// keeps them. `None` in a test that has not said, so no test reads
+    /// the developer's own.
+    settings_dir: Option<PathBuf>,
     /// How the add overlay proves a machine answers.
     ///
     /// A field so a test can answer for a machine that does not exist; the
@@ -687,6 +703,7 @@ impl App {
             local: Some(local),
             browse_from: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             kept: None,
+            settings_dir: None,
             checker: Box::new(add_machine::check),
             browser: None,
             overlay: None,
@@ -1063,6 +1080,20 @@ impl App {
         self.kept = Some(dir.into());
     }
 
+    /// Reads and saves harness settings in `dir`.
+    pub fn keep_settings_in(&mut self, dir: impl Into<PathBuf>) {
+        self.settings_dir = Some(dir.into());
+    }
+
+    /// What the user saved for `harness`, or nothing when this client
+    /// keeps no settings. A file that cannot be read is nothing saved.
+    fn saved_settings(&self, harness: &str) -> Choices {
+        self.settings_dir
+            .as_deref()
+            .map(|dir| dispatch_config::harness_settings::load_or_empty(dir, harness))
+            .unwrap_or_default()
+    }
+
     /// Registers a project.
     ///
     /// Attached, the daemon is asked to open it and the project appears when it
@@ -1200,11 +1231,28 @@ impl App {
         self.quit
     }
 
-    /// Starts a pane running `harness` in the selected project.
+    /// Starts a pane running `harness` in the selected project, with the
+    /// user's saved settings.
     ///
     /// Attached, this asks and returns: the pane appears when the daemon says it
     /// has started one, which is also how the other clients hear about it.
     pub fn spawn_pane(&mut self, harness: &str, area: Size) -> Result<()> {
+        // What Enter in the picker opens with: only what the user saved,
+        // so a machine whose harness file differs from this one's still
+        // starts the pane unless the user asked it for something it
+        // cannot do.
+        let chosen = self
+            .harnesses
+            .get(harness)
+            .map(|def| def.usable_saved(&self.saved_settings(harness)))
+            .unwrap_or_default();
+        self.spawn_pane_with(harness, area, chosen)
+    }
+
+    /// Starts a pane running `harness` in the selected project, with
+    /// `chosen` for its settings and the harness file's defaults for the
+    /// rest.
+    fn spawn_pane_with(&mut self, harness: &str, area: Size, chosen: Choices) -> Result<()> {
         // Taken whatever happens next, so a placement meant for this pane
         // can never land a later one somewhere the user did not ask.
         let place = std::mem::take(&mut self.placing);
@@ -1214,19 +1262,28 @@ impl App {
             return Ok(());
         };
 
-        // Cloned out of the registry rather than borrowed: naming the machine
-        // that cannot be reached is a write to the status line, and the
-        // registry is a field of the same `self`.
-        let Some((display_name, launch)): Option<(String, Launch)> =
+        // Resolved here as the daemon will resolve it: a value this
+        // harness cannot take is refused before anything is asked of
+        // anyone.
+        let resolved: Option<Result<(String, Launch), String>> =
             self.harnesses.get(harness).map(|def| {
-                (
-                    def.display_name.clone(),
-                    def.launch_for_current_platform().clone(),
-                )
-            })
-        else {
-            self.status = format!("unknown harness {harness:?}");
-            return Ok(());
+                def.resolve(&chosen, &Choices::new()).map(|values| {
+                    (
+                        def.display_name.clone(),
+                        def.launch_with(std::env::consts::OS, &values),
+                    )
+                })
+            });
+        let (display_name, launch) = match resolved {
+            Some(Ok(found)) => found,
+            Some(Err(reason)) => {
+                self.status = reason;
+                return Ok(());
+            }
+            None => {
+                self.status = format!("unknown harness {harness:?}");
+                return Ok(());
+            }
         };
 
         // Attached, the machine the project is on is the one asked — and a
@@ -1245,6 +1302,7 @@ impl App {
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
                 place,
+                settings: chosen,
             });
             self.status = format!("starting {display_name}…");
             return Ok(());
@@ -2619,6 +2677,11 @@ impl App {
                     .filter(|c| !matches!(c, '\r' | '\n'))
                     .for_each(|c| prompt.push(c)),
                 Some(Overlay::AddMachine(add)) => add.paste(text),
+                Some(Overlay::Settings { form, .. }) => {
+                    if let FormAction::Refused(why) = form.paste(text) {
+                        self.status = why;
+                    }
+                }
                 _ => {}
             }
             return Ok(());
@@ -2634,6 +2697,10 @@ impl App {
         if matches!(self.overlay, Some(Overlay::Approval { .. })) {
             self.handle_approval_key(key);
             return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::Settings { .. })) {
+            return self.handle_settings_key(key, area);
         }
 
         // The browser takes every plain key: what is typed is a filter, and a
@@ -2683,6 +2750,10 @@ impl App {
             // keystroke away from deleting the wrong kind of thing.
             KeyCode::Char('d') if matches!(self.overlay, Some(Overlay::Project(_))) => {
                 self.drop_selected_project();
+            }
+            // Only the new-pane picker: settings belong to a harness.
+            KeyCode::Char('e') if matches!(self.overlay, Some(Overlay::Harness(_))) => {
+                self.open_settings();
             }
             KeyCode::Enter => {
                 let chosen = self.overlay.as_ref().and_then(|overlay| {
@@ -3095,6 +3166,18 @@ impl App {
 
     /// Opens the picker for a pane that goes where `place` says.
     fn open_picker_placing(&mut self, place: Placement) {
+        // A hand edit that breaks the file otherwise fails silently: saved
+        // settings, `bypass = false` included, are dropped without a word
+        // until `s` refuses to save. Said once, here, rather than on every
+        // pane spawned in the meantime.
+        if let Some(dir) = &self.settings_dir
+            && let Err(error) = dispatch_config::harness_settings::check(dir)
+        {
+            self.status = format!(
+                "harness-settings.toml can't be read, so saved settings are not used: {error}"
+            );
+        }
+
         let local = self.project_is_local();
         // A daemon that predates tabs predates the built-in `shell` too: a
         // Shell offered, and chosen by Enter, would only be refused as an
@@ -3116,7 +3199,17 @@ impl App {
                 } else {
                     h.display_name.clone()
                 };
-                Item::new(&h.id, label).with_detail(&h.launch.command)
+                // What Enter would change from the harness file, so the
+                // choice is in view before it is made.
+                let mut detail = h.launch.command.clone();
+                let chosen = h.usable_saved(&self.saved_settings(&h.id));
+                if let Ok(values) = h.resolve(&chosen, &Choices::new()) {
+                    for change in h.describe_changes(&values) {
+                        detail.push_str(" · ");
+                        detail.push_str(&change);
+                    }
+                }
+                Item::new(&h.id, label).with_detail(detail)
             })
             .collect();
         // The user's own shell first, and so chosen: Enter on a new tab gives
@@ -3134,7 +3227,9 @@ impl App {
         }
 
         self.placing = place;
-        self.overlay = Some(Overlay::Harness(Picker::new("New pane", items)));
+        self.overlay = Some(Overlay::Harness(
+            Picker::new("New pane", items).with_hint("Enter open · e settings · Esc close"),
+        ));
     }
 
     /// Drops the project the picker is sitting on from the kept list.
@@ -3389,6 +3484,91 @@ impl App {
             .collect();
 
         self.overlay = Some(Overlay::Register(Picker::new("Add harness", items)));
+    }
+
+    /// Opens the settings popup for the harness the picker is on.
+    fn open_settings(&mut self) {
+        let Some(id) = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::picker)
+            .and_then(Picker::selected)
+            .map(|item| item.id.clone())
+        else {
+            return;
+        };
+        let Some(def) = self.harnesses.get(&id) else {
+            return;
+        };
+        if def.settings.is_empty() {
+            self.status = format!("{} has no settings", def.display_name);
+            return;
+        }
+
+        let values = def
+            .resolve(&Choices::new(), &self.saved_settings(&id))
+            .unwrap_or_default();
+        let form = SettingsForm::new(
+            format!("New {} pane", def.display_name),
+            &def.settings,
+            &values,
+        );
+        self.overlay = Some(Overlay::Settings { harness: id, form });
+    }
+
+    /// Acts on one key while a harness's settings are open.
+    fn handle_settings_key(&mut self, key: &KeyEvent, area: Size) -> Result<()> {
+        let Some(Overlay::Settings { form, .. }) = &mut self.overlay else {
+            return Ok(());
+        };
+
+        match form.key(key) {
+            FormAction::None => {}
+            FormAction::Refused(why) => self.status = why,
+            FormAction::Back => self.back_to_picker(),
+            FormAction::Save => self.save_settings(),
+            FormAction::Open => {
+                if let Some(Overlay::Settings { harness, form }) = self.overlay.take() {
+                    self.spawn_pane_with(&harness, area, form.values())?;
+                }
+                // A request that arrived while the popup had the keyboard
+                // was queued rather than shown.
+                if self.overlay.is_none() {
+                    self.open_next_approval();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Leaves the settings for the picker they came from, on the same
+    /// harness, its detail brought up to date with anything just saved.
+    fn back_to_picker(&mut self) {
+        let Some(Overlay::Settings { harness, .. }) = self.overlay.take() else {
+            return;
+        };
+        self.open_picker_placing(self.placing);
+        if let Some(Overlay::Harness(picker)) = &mut self.overlay {
+            picker.select(&harness);
+        }
+    }
+
+    /// Saves what the popup shows as its harness's defaults, and says so.
+    fn save_settings(&mut self) {
+        let Some(Overlay::Settings { harness, form }) = &self.overlay else {
+            return;
+        };
+        let Some(def) = self.harnesses.get(harness) else {
+            return;
+        };
+
+        self.status = match &self.settings_dir {
+            None => "couldn't save: there is nowhere to keep settings".to_string(),
+            Some(dir) => match dispatch_config::harness_settings::save(dir, def, &form.values()) {
+                Ok(()) => format!("saved as {}'s default", def.display_name),
+                Err(error) => format!("couldn't save: {error}"),
+            },
+        };
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
@@ -3812,12 +3992,24 @@ impl App {
             overlay.set_border(border);
         }
 
+        if let Some(Overlay::Settings { form, .. }) = &mut self.overlay {
+            form.set_styles(
+                Style::default().bg(self.theme.tint).fg(self.theme.text),
+                Style::default().fg(self.theme.faded),
+            );
+        }
+
         let Some(overlay) = &self.overlay else {
             return;
         };
 
         if let Some(picker) = overlay.picker() {
             frame.render_widget(picker, panes_area);
+            return;
+        }
+
+        if let Overlay::Settings { form, .. } = overlay {
+            frame.render_widget(form, panes_area);
             return;
         }
 
@@ -10819,6 +11011,413 @@ mod tests {
         let row = top_row(&terminal);
         click(&mut app, cell_of(&row, "›"), 0);
         assert_eq!(app.current_tab(), 6, "clicking › shows the next tab");
+    }
+
+    /// Settings as a shipped harness has them: a model to choose or type,
+    /// an effort, a permission choice with a default of its own, and a flag
+    /// on by default.
+    const DEMO_SETTINGS: &str = r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["small", "large"]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+options = ["low", "high"]
+args = ["--effort", "{value}"]
+
+[[settings]]
+key = "permissions"
+label = "Permissions"
+kind = "choice"
+options = ["ask", "never"]
+default = "never"
+args = ["--permissions", "{value}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--yolo"]
+"#;
+
+    /// A harness `id` running `command`, carrying [`DEMO_SETTINGS`].
+    fn with_settings(id: &str, display: &str, command: &str) -> dispatch_config::HarnessDef {
+        toml::from_str(&format!(
+            "id = \"{id}\"\ndisplay_name = \"{display}\"\ncommand = \"{command}\"\n{DEMO_SETTINGS}"
+        ))
+        .expect("a valid harness")
+    }
+
+    /// `demo`, carrying [`DEMO_SETTINGS`], and the user's shell.
+    fn registry_with_settings() -> HarnessRegistry {
+        [
+            with_settings("demo", "Demo", "demo"),
+            dispatch_config::HarnessDef {
+                id: SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                ..dispatch_config::HarnessDef::default()
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// `pairs` as [`Choices`].
+    fn choices(pairs: &[(&str, &str)]) -> Choices {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// An attached app holding [`registry_with_settings`], its settings
+    /// kept in `dir` when one is given, with the new-pane picker open on
+    /// `demo`.
+    fn app_on_demo(
+        dir: Option<&std::path::Path>,
+    ) -> (App, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        let (client, daemon, sent) = Client::for_test();
+        let mut app = App::attached(registry_with_settings(), client);
+        if let Some(dir) = dir {
+            app.keep_settings_in(dir);
+        }
+        daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/tmp/attached", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &mut app.overlay else {
+            panic!("the picker is open");
+        };
+        picker.select("demo");
+
+        (app, daemon, sent)
+    }
+
+    /// The settings the last pane this app asked its daemon for was sent
+    /// with.
+    fn sent_settings(sent: &Receiver<ClientMessage>) -> Option<Choices> {
+        sent.try_iter()
+            .filter_map(|message| match message {
+                ClientMessage::SpawnPane { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .last()
+    }
+
+    /// The popup's values, while it is open.
+    fn form_values(app: &App) -> Choices {
+        let Some(Overlay::Settings { form, .. }) = &app.overlay else {
+            panic!("the settings are open");
+        };
+        form.values()
+    }
+
+    #[test]
+    fn e_opens_the_settings_of_the_harness_the_picker_is_on() {
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+
+        press(&mut app, KeyCode::Char('e'));
+
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Settings { harness, .. }) if harness == "demo"),
+            "the settings are open on demo"
+        );
+    }
+
+    #[test]
+    fn e_on_a_harness_with_no_settings_says_so() {
+        let mut app = App::new(registry_with_settings());
+        app.state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        app.open_harness_picker();
+
+        press(&mut app, KeyCode::Char('e'));
+
+        assert_eq!(app.status, "Shell has no settings");
+        assert!(matches!(app.overlay, Some(Overlay::Harness(_))));
+    }
+
+    #[test]
+    fn the_new_pane_picker_says_e_opens_the_settings() {
+        let (app, _daemon, _sent) = app_on_demo(None);
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.hint(), Some("Enter open · e settings · Esc close"));
+    }
+
+    #[test]
+    fn enter_in_the_settings_opens_a_pane_with_what_they_show() {
+        let (mut app, _daemon, sent) = app_on_demo(None);
+        press(&mut app, KeyCode::Char('e'));
+
+        press(&mut app, KeyCode::Right); // model: small
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right); // bypass: off
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            sent_settings(&sent),
+            Some(choices(&[
+                ("model", "small"),
+                ("effort", ""),
+                ("permissions", "never"),
+                ("bypass", "false"),
+            ]))
+        );
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn the_settings_open_showing_what_is_saved() {
+        let dir = scratch("settings-open-saved");
+        std::fs::write(
+            dir.join("harness-settings.toml"),
+            "[demo]\nmodel = \"large\"\n",
+        )
+        .expect("temp dir is writable");
+        let (mut app, _daemon, _sent) = app_on_demo(Some(&dir));
+
+        press(&mut app, KeyCode::Char('e'));
+
+        assert_eq!(form_values(&app)["model"], "large");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_shown_when_the_picker_opens() {
+        let dir = scratch("settings-unreadable-picker");
+        std::fs::write(dir.join("harness-settings.toml"), "not = [valid")
+            .expect("temp dir is writable");
+
+        let (app, _daemon, _sent) = app_on_demo(Some(&dir));
+
+        assert!(
+            app.status
+                .starts_with("harness-settings.toml can't be read"),
+            "{:?}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s_saves_the_settings_and_keeps_them_open() {
+        let dir = scratch("settings-save");
+        let (mut app, _daemon, sent) = app_on_demo(Some(&dir));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Right); // model: small
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert_eq!(app.status, "saved as Demo's default");
+        assert!(matches!(app.overlay, Some(Overlay::Settings { .. })));
+        assert_eq!(sent_settings(&sent), None, "nothing was opened");
+        let saved: toml::Table = std::fs::read_to_string(dir.join("harness-settings.toml"))
+            .expect("the file was written")
+            .parse()
+            .expect("it is valid TOML");
+        assert_eq!(saved["demo"]["model"].as_str(), Some("small"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s_with_nowhere_to_keep_settings_says_so() {
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        press(&mut app, KeyCode::Char('e'));
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert!(app.status.starts_with("couldn't save"), "{}", app.status);
+    }
+
+    #[test]
+    fn esc_in_the_settings_goes_back_to_the_picker_on_the_same_harness() {
+        let mut app = App::new(registry_with_settings());
+        app.state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &mut app.overlay else {
+            panic!("the picker is open");
+        };
+        picker.select("demo");
+        press(&mut app, KeyCode::Char('e'));
+
+        press(&mut app, KeyCode::Esc);
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("back in the picker");
+        };
+        assert_eq!(
+            picker.selected().map(|item| item.id.as_str()),
+            Some("demo"),
+            "on demo, not back at the shell"
+        );
+    }
+
+    #[test]
+    fn enter_in_the_picker_sends_the_saved_settings() {
+        let dir = scratch("settings-picker-enter");
+        std::fs::write(
+            dir.join("harness-settings.toml"),
+            "[demo]\nmodel = \"large\"\n",
+        )
+        .expect("temp dir is writable");
+        let (mut app, _daemon, sent) = app_on_demo(Some(&dir));
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(sent_settings(&sent), Some(choices(&[("model", "large")])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_in_the_picker_with_nothing_saved_sends_no_settings() {
+        // So a machine whose harness file differs from this one's still
+        // starts the pane: what the user never chose is that machine's to
+        // decide.
+        let (mut app, _daemon, sent) = app_on_demo(None);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(sent_settings(&sent), Some(Choices::new()));
+    }
+
+    #[test]
+    fn a_stale_saved_value_is_not_sent_and_the_pane_still_opens() {
+        let dir = scratch("settings-stale");
+        std::fs::write(
+            dir.join("harness-settings.toml"),
+            "[demo]\nmodel = \"large\"\neffort = \"extreme\"\ncolour = \"red\"\n",
+        )
+        .expect("temp dir is writable");
+        let (mut app, _daemon, sent) = app_on_demo(Some(&dir));
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(sent_settings(&sent), Some(choices(&[("model", "large")])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_default_saved_over_a_file_default_reaches_the_daemon_as_empty() {
+        let dir = scratch("settings-agent-default");
+        let (mut app, _daemon, sent) = app_on_demo(Some(&dir));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // permissions: never
+        press(&mut app, KeyCode::Left); // ask
+        press(&mut app, KeyCode::Left); // agent default
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(sent_settings(&sent), Some(choices(&[("permissions", "")])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_picker_shows_what_differs_from_the_harnesss_defaults() {
+        let dir = scratch("settings-detail");
+        std::fs::write(
+            dir.join("harness-settings.toml"),
+            "[demo]\nmodel = \"large\"\nbypass = false\n",
+        )
+        .expect("temp dir is writable");
+        let (app, _daemon, _sent) = app_on_demo(Some(&dir));
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        let demo = picker
+            .items()
+            .iter()
+            .find(|item| item.id == "demo")
+            .expect("demo is offered");
+        assert_eq!(
+            demo.detail.as_deref(),
+            Some("demo · large · Skip prompts off")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_paste_reaches_a_value_being_typed() {
+        let (mut app, _daemon, sent) = app_on_demo(None);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Left); // model: typed
+
+        app.handle(&Event::Paste("big-1\n".to_string()), Size::new(100, 30))
+            .expect("a paste is handled");
+        press(&mut app, KeyCode::Enter); // confirm
+        press(&mut app, KeyCode::Enter); // open
+
+        assert_eq!(
+            sent_settings(&sent).and_then(|settings| settings.get("model").cloned()),
+            Some("big-1".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_pane_from_the_settings_starts_with_their_flags() {
+        let dir = scratch("settings-standalone");
+        let out = dir.join("args.out");
+        let mut record = with_settings("record", "Record", "sh");
+        record.launch.args = vec![
+            "-c".to_string(),
+            "printf '%s\\n' \"$@\" > \"$0\"; sleep 5".to_string(),
+            out.display().to_string(),
+        ];
+        let mut app = App::new([record].into_iter().collect());
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.open_harness_picker();
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Right); // model: small
+        press(&mut app, KeyCode::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let written = loop {
+            if let Ok(text) = std::fs::read_to_string(&out)
+                && text.ends_with('\n')
+            {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pane never wrote its arguments"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            written.lines().collect::<Vec<_>>(),
+            vec!["--model", "small", "--permissions", "never", "--yolo"]
+        );
+
+        // Real processes: stopped here rather than left to outlive the test.
+        for (_, mut pane) in app.panes.drain() {
+            pane.backend.terminate();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A registry holding `claude` and the user's shell, `command`.

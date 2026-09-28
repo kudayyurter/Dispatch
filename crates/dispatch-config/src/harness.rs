@@ -37,15 +37,30 @@ pub enum SettingKind {
 }
 
 /// One configurable setting a harness exposes.
+///
+/// It says how it becomes a flag: its own `args` and `env`, with `{value}`
+/// standing for the value. A harness Dispatch has never seen gets a settings
+/// popup from its file alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingDef {
-    /// Key the setting is referenced by in argument templates.
+    /// Key the setting is saved and sent under.
     pub key: String,
-    /// Human-readable label shown in the harness manager.
+    /// Human-readable label shown in the settings popup.
     pub label: String,
     /// What the setting accepts.
     #[serde(flatten)]
     pub kind: SettingKind,
+    /// For a choice, whether the popup also offers a value the user types.
+    #[serde(default)]
+    pub custom: bool,
+    /// Arguments added after the launch's own. A choice or text puts its
+    /// value where `{value}` is and adds nothing when unset; a flag adds
+    /// them as written when it is on.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Variables set for the child, filled in as `args` is.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// How to launch a harness on one platform.
@@ -197,7 +212,7 @@ pub struct HarnessDef {
     #[serde(default)]
     pub task: Option<TaskLaunch>,
 
-    /// Settings the harness manager offers for this harness.
+    /// Settings the settings popup offers for this harness.
     #[serde(default)]
     pub settings: Vec<SettingDef>,
 

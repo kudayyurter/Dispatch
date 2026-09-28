@@ -3,8 +3,10 @@
 pub mod config;
 pub mod defaults;
 pub mod harness;
+pub mod harness_settings;
 pub mod machines;
 pub mod projects;
+pub mod settings;
 pub mod status;
 mod store;
 
@@ -24,6 +26,7 @@ pub use harness::{
     HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput, TaskLaunch,
     TaskRun,
 };
+pub use settings::{Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, is_safe_char, is_safe_value};
 pub use status::{RuleState, StatusInput, StatusRules};
 
 /// The id of the harness that runs the user's own shell.
@@ -102,8 +105,17 @@ impl FromIterator<HarnessDef> for HarnessRegistry {
 }
 
 impl HarnessRegistry {
-    /// A registry over `harnesses`, with each one's status rules compiled.
-    fn with(harnesses: BTreeMap<String, HarnessDef>) -> Self {
+    /// A registry over `harnesses`, with each one's settings checked and
+    /// its status rules compiled.
+    ///
+    /// Settings are checked here, once, for files and for definitions
+    /// built in memory alike: whatever a launch or the popup reads has
+    /// already passed.
+    fn with(mut harnesses: BTreeMap<String, HarnessDef>) -> Self {
+        for def in harnesses.values_mut() {
+            def.settings = settings::usable(&def.id, std::mem::take(&mut def.settings));
+        }
+
         let rules = harnesses
             .values()
             .map(|def| {

@@ -112,6 +112,12 @@ fn main() -> Result<()> {
 
     let mut daemon = Daemon::with_limits(harnesses, args.device.clone(), loaded.config.delegation);
 
+    // Saved from the settings popup, and read at every spawn and delegation
+    // so a save in any client takes effect at once.
+    daemon.set_settings_dir(
+        dispatch_os::paths::config_dir().context("failed to locate the configuration directory")?,
+    );
+
     let projects = if args.projects.is_empty() {
         vec![std::env::current_dir().context("failed to read the working directory")?]
     } else {
