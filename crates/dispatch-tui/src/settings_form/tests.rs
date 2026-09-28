@@ -322,6 +322,22 @@ fn a_typed_value_shows_as_custom() {
 }
 
 #[test]
+fn the_box_grows_to_fit_a_long_typed_value() {
+    let mut form = form();
+    press(&mut form, KeyCode::Left);
+    for c in "openrouter/anthropic/claude-sonnet-4.5".chars() {
+        press(&mut form, KeyCode::Char(c));
+    }
+
+    let text = render(&form, 80, 10);
+
+    assert!(
+        text.contains("Custom: openrouter/anthropic/claude-sonnet-4.5▏"),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_popup_bigger_than_the_screen_is_clipped_not_a_panic() {
     let long = "a".repeat(dispatch_config::MAX_VALUE_CHARS);
     let form = form_with(&[("model", long.as_str())]);

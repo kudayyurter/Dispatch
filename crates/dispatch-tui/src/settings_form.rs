@@ -435,6 +435,25 @@ impl SettingsForm {
             row.value = edit.before;
         }
     }
+
+    /// The width of what a value being typed shows right now (its prefix,
+    /// the text and the cursor), so the box can grow to fit it instead of
+    /// cutting it off at [`TYPED_WIDTH`]. Stepping alone leaves this at
+    /// zero, so it never resizes the box.
+    fn editing_width(&self) -> usize {
+        let Some(edit) = &self.editing else {
+            return 0;
+        };
+        let Some(row) = self.rows.get(self.selected) else {
+            return 0;
+        };
+        let prefix = match row.shape {
+            Shape::Text => 0,
+            _ => "Custom: ".len(),
+        };
+        // One more for the cursor drawn after the text.
+        prefix + edit.text.chars().count() + 1
+    }
 }
 
 impl Widget for &SettingsForm {
@@ -449,7 +468,13 @@ impl Widget for &SettingsForm {
             .map(|row| row.label.chars().count())
             .max()
             .unwrap_or(0);
-        let value_width = self.rows.iter().map(Row::widest).max().unwrap_or(0);
+        let value_width = self
+            .rows
+            .iter()
+            .map(Row::widest)
+            .max()
+            .unwrap_or(0)
+            .max(self.editing_width());
         let hint = if self.editing.is_some() {
             EDITING_HINT
         } else {
