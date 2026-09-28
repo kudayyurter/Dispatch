@@ -659,6 +659,9 @@ pub struct App {
     /// is, for a click to be matched against.
     tab_row: Rect,
     tab_hits: Vec<(u16, u16, TabHit)>,
+    /// The panes this client last fitted to its screen, so one that leaves
+    /// the screen can withdraw its size.
+    fitted: HashSet<PaneId>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -731,6 +734,7 @@ impl App {
             tab_back: None,
             tab_row: Rect::default(),
             tab_hits: Vec::new(),
+            fitted: HashSet::new(),
         }
     }
 
@@ -1985,7 +1989,28 @@ impl App {
                 .state
                 .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
 
-            ServerMessage::PaneResized { .. } => false,
+            ServerMessage::PaneResized { pane, size } => {
+                let now = self.now();
+                let Some(target) = self.panes.get_mut(&pane) else {
+                    return false;
+                };
+                let Backend::Remote(remote) = &mut target.backend else {
+                    return false;
+                };
+                // The pty is this size now, and every byte that follows was
+                // drawn for it: the copy takes it here, in order with the
+                // output, never ahead of it.
+                if let Err(error) = remote.resized(Size::new(size.0, size.1)) {
+                    tracing::warn!(%error, "failed to resize a pane");
+                    return false;
+                }
+                // The repaint that follows is the resize's doing.
+                target.activity.resized(now);
+                if let Ok(screen) = target.reader.read(target.backend.terminal()) {
+                    target.screen = screen;
+                }
+                true
+            }
 
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
@@ -4813,13 +4838,23 @@ impl App {
             .render(row, frame.buffer_mut());
     }
 
-    /// Resizes every visible pane to the rectangle it now occupies.
+    /// Fits every visible pane to the rectangle it now occupies, and
+    /// withdraws this client's size for any pane no longer on screen.
     ///
     /// A child that is not told its new size redraws to the old one, which is
     /// the most visible bug this layer can have.
     pub fn resize_panes(&mut self) {
         let now = self.now();
         let layout = self.layout.clone();
+
+        let showing: HashSet<PaneId> = layout.iter().map(|(id, _)| *id).collect();
+        let gone: Vec<PaneId> = self.fitted.difference(&showing).copied().collect();
+        for id in gone {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.backend.hide();
+            }
+        }
+        self.fitted = showing;
 
         for (id, rect) in layout {
             // Silently, unlike a keystroke: this runs every frame, and a
@@ -4835,21 +4870,17 @@ impl App {
                 continue;
             };
 
-            let size = Size::new(rect.width, rect.height);
-            if size == pane.backend.size() {
-                continue;
-            }
-
-            if let Err(error) = pane.backend.resize(size) {
-                tracing::warn!(%error, "failed to resize a pane");
-                continue;
-            }
-            // The program repaints to fit, and that repaint is this resize's
-            // doing rather than the program at work.
-            pane.activity.resized(now);
-
-            if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
-                pane.screen = screen;
+            match pane.backend.fit(Size::new(rect.width, rect.height)) {
+                Ok(false) => {}
+                Ok(true) => {
+                    // The program repaints to fit, and that repaint is this
+                    // resize's doing rather than the program at work.
+                    pane.activity.resized(now);
+                    if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+                        pane.screen = screen;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to resize a pane"),
             }
         }
     }
@@ -5210,6 +5241,129 @@ mod tests {
             !app.state.is_unseen(background),
             "and it finished nothing, so it is not done"
         );
+    }
+
+    /// Says `pane` is `cols`×`rows`, as a daemon that decides sizes does.
+    fn say_size(app: &mut App, daemon: &Sender<ServerMessage>, pane: PaneId, cols: u16, rows: u16) {
+        daemon
+            .send(ServerMessage::PaneResized {
+                pane,
+                size: (cols, rows),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+    }
+
+    /// The `ResizePane` sizes this app sent for `pane`, in order.
+    fn asked_sizes(sent: &Receiver<ClientMessage>, pane: PaneId) -> Vec<(u16, u16)> {
+        sent.try_iter()
+            .filter_map(|message| match message {
+                ClientMessage::ResizePane { pane: p, size } if p == pane => Some(size),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_is_drawn_at_the_size_its_daemon_says() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 50, 20);
+        assert_eq!(app.panes[&pane].backend.size(), Size::new(50, 20));
+
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        assert_eq!(
+            app.panes[&pane].backend.size(),
+            Size::new(50, 20),
+            "its tile is asked for, not taken"
+        );
+        let asked = asked_sizes(&sent, pane);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_ne!(asked[0], (50, 20), "the tile's own size was asked");
+
+        app.resize_panes();
+        assert!(
+            asked_sizes(&sent, pane).is_empty(),
+            "asked once, not every frame"
+        );
+    }
+
+    #[test]
+    fn with_an_old_daemon_a_pane_is_resized_here_as_before() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        let asked = asked_sizes(&sent, pane);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            app.panes[&pane].backend.size(),
+            Size::new(asked[0].0, asked[0].1),
+            "a daemon that never says a size leaves it to this client"
+        );
+    }
+
+    #[test]
+    fn a_pane_leaving_the_screen_withdraws_its_size_and_asks_again() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        for pane in &panes {
+            say_size(&mut app, &daemon, *pane, 40, 12);
+        }
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+        let _ = sent.try_iter().count();
+
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        let messages: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ClientMessage::HidePane { pane } if *pane == panes[0])),
+            "the pane now off screen withdraws its size: {messages:?}"
+        );
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+        assert_eq!(
+            asked_sizes(&sent, panes[0]).len(),
+            1,
+            "and asks again when shown"
+        );
+    }
+
+    #[test]
+    fn the_repaint_after_the_daemon_resizes_a_pane_is_not_work() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let background = panes[0];
+        say_size(&mut app, &daemon, background, 40, 12);
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+
+        say_size(&mut app, &daemon, background, 60, 20);
+        advance(&clock, Duration::from_millis(50));
+        print(&mut app, &daemon, background, b"\x1b[H\x1b[2Jrepainted\r\n");
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(100));
+            app.poll_panes();
+            assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        }
     }
 
     #[test]
