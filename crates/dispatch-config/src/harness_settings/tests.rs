@@ -134,6 +134,40 @@ fn another_harnesss_values_are_left_alone() {
 }
 
 #[test]
+fn a_wrongly_typed_value_is_dropped_and_the_rest_of_the_file_survives() {
+    let dir = TempDir::new("settings-wrong-type");
+    dir.write(
+        FILE,
+        "[demo]\nmodel = \"large\"\neffort = 3\n\n[other]\nmodel = \"kept\"\n",
+    );
+
+    assert_eq!(
+        load(dir.path(), "demo").expect("it loads"),
+        values(&[("model", "large")])
+    );
+    assert_eq!(
+        load(dir.path(), "other").expect("another harness's table survives"),
+        values(&[("model", "kept")])
+    );
+    assert!(check(dir.path()).is_ok(), "the file is still readable");
+}
+
+#[test]
+fn check_reports_a_file_that_does_not_parse_at_all() {
+    let dir = TempDir::new("settings-check-unparsable");
+    dir.write(FILE, "not = [valid");
+
+    assert!(check(dir.path()).is_err());
+}
+
+#[test]
+fn check_with_no_file_is_ok() {
+    let dir = TempDir::new("settings-check-missing");
+
+    assert!(check(dir.path()).is_ok());
+}
+
+#[test]
 fn an_unreadable_file_loads_as_empty_and_refuses_to_save() {
     let dir = TempDir::new("settings-unreadable");
     dir.write(FILE, "not = [valid");

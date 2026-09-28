@@ -3166,6 +3166,18 @@ impl App {
 
     /// Opens the picker for a pane that goes where `place` says.
     fn open_picker_placing(&mut self, place: Placement) {
+        // A hand edit that breaks the file otherwise fails silently: saved
+        // settings, `bypass = false` included, are dropped without a word
+        // until `s` refuses to save. Said once, here, rather than on every
+        // pane spawned in the meantime.
+        if let Some(dir) = &self.settings_dir
+            && let Err(error) = dispatch_config::harness_settings::check(dir)
+        {
+            self.status = format!(
+                "harness-settings.toml can't be read, so saved settings are not used: {error}"
+            );
+        }
+
         let local = self.project_is_local();
         // A daemon that predates tabs predates the built-in `shell` too: a
         // Shell offered, and chosen by Enter, would only be refused as an
@@ -11184,6 +11196,23 @@ args = ["--yolo"]
         press(&mut app, KeyCode::Char('e'));
 
         assert_eq!(form_values(&app)["model"], "large");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_shown_when_the_picker_opens() {
+        let dir = scratch("settings-unreadable-picker");
+        std::fs::write(dir.join("harness-settings.toml"), "not = [valid")
+            .expect("temp dir is writable");
+
+        let (app, _daemon, _sent) = app_on_demo(Some(&dir));
+
+        assert!(
+            app.status
+                .starts_with("harness-settings.toml can't be read"),
+            "{:?}",
+            app.status
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

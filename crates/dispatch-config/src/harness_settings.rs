@@ -14,20 +14,25 @@ use crate::{Choices, ConfigError, HarnessDef};
 /// The file, inside the configuration directory.
 pub const FILE: &str = "harness-settings.toml";
 
-/// One saved value: a flag as a TOML boolean, anything else as a string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One saved value: a flag as a TOML boolean, anything else as a string, or
+/// -- a hand edit's mistake, such as `effort = 3` -- whatever TOML holds
+/// there instead, so it costs only that value rather than the whole file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Stored {
     Flag(bool),
     Text(String),
+    Other(toml::Value),
 }
 
 impl Stored {
-    /// The value as [`Choices`] carries it.
-    fn to_choice(&self) -> String {
+    /// The value as [`Choices`] carries it, or `None` for a value that is
+    /// neither a flag nor text.
+    fn to_choice(&self) -> Option<String> {
         match self {
-            Stored::Flag(on) => on.to_string(),
-            Stored::Text(text) => text.clone(),
+            Stored::Flag(on) => Some(on.to_string()),
+            Stored::Text(text) => Some(text.clone()),
+            Stored::Other(_) => None,
         }
     }
 }
@@ -39,6 +44,11 @@ impl Stored {
 struct Saved(BTreeMap<String, BTreeMap<String, Stored>>);
 
 /// What the user saved for `harness`. No file is nothing saved.
+///
+/// A key whose value is neither a flag nor text -- a hand edit's mistake,
+/// such as `effort = 3` -- is left out and logged, rather than failing the
+/// whole file: the rest of this harness's values, and every other harness's,
+/// still load.
 pub fn load(dir: &Path, harness: &str) -> Result<Choices, ConfigError> {
     let saved: Saved = crate::store::read(dir, FILE)?;
     Ok(saved
@@ -47,10 +57,28 @@ pub fn load(dir: &Path, harness: &str) -> Result<Choices, ConfigError> {
         .map(|values| {
             values
                 .iter()
-                .map(|(key, value)| (key.clone(), value.to_choice()))
+                .filter_map(|(key, value)| match value.to_choice() {
+                    Some(choice) => Some((key.clone(), choice)),
+                    None => {
+                        tracing::warn!(
+                            harness,
+                            key = key.as_str(),
+                            "ignoring a saved harness setting of the wrong type"
+                        );
+                        None
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Whether `dir`'s saved-settings file can be read at all. No file is fine;
+/// a file that does not parse as TOML is not, and `s` will fail the same
+/// way, but silently until then -- this is what makes it visible sooner.
+pub fn check(dir: &Path) -> Result<(), ConfigError> {
+    crate::store::read::<Saved>(dir, FILE)?;
+    Ok(())
 }
 
 /// [`load`], with a file that cannot be read taken as nothing saved and
