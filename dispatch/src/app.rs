@@ -190,6 +190,12 @@ const EVALUATE_EVERY: Duration = Duration::from_millis(250);
 /// would come back "finished while you were away".
 const GRACE: Duration = Duration::from_secs(3);
 
+/// How often a window tells its daemons it is the one in use, at most.
+///
+/// Often enough that the size follows the user within a moment of turning
+/// to a window; rare enough that typing does not send one per keystroke.
+const ACTIVE_EVERY: Duration = Duration::from_millis(500);
+
 /// How long focus takes to move: the borders easing between faded and the
 /// accent, and the sidebar's tint on its way to the focused row.
 const EASE: Duration = Duration::from_millis(150);
@@ -441,6 +447,10 @@ struct Attachment {
     /// The failure last put on the status line, so a machine retrying every
     /// thirty seconds says so once rather than every time.
     reported: Option<String>,
+    /// Whether this daemon decides pane sizes, known once it has said one.
+    /// A daemon from before that never will, and is told nothing it would
+    /// not understand.
+    size_aware: bool,
 }
 
 /// Which kept list a root opened on an attachment belongs on.
@@ -662,6 +672,10 @@ pub struct App {
     /// The panes this client last fitted to its screen, so one that leaves
     /// the screen can withdraw its size.
     fitted: HashSet<PaneId>,
+    /// When this window last told a daemon it was the one in use, so
+    /// [`App::note_active`] can hold `Active` to at most one per
+    /// [`ACTIVE_EVERY`].
+    active_sent: Option<Instant>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -735,6 +749,7 @@ impl App {
             tab_row: Rect::default(),
             tab_hits: Vec::new(),
             fitted: HashSet::new(),
+            active_sent: None,
         }
     }
 
@@ -808,6 +823,7 @@ impl App {
             label,
             remote,
             reported: None,
+            size_aware: false,
         };
 
         match &mut self.mode {
@@ -1289,6 +1305,29 @@ impl App {
         (self.clock)()
     }
 
+    /// Tells every daemon that decides sizes that this window is the one in
+    /// use, at most once per [`ACTIVE_EVERY`].
+    fn note_active(&mut self) {
+        let now = self.now();
+        if self
+            .active_sent
+            .is_some_and(|at| now.duration_since(at) < ACTIVE_EVERY)
+        {
+            return;
+        }
+        let Mode::Attached(attachments) = &self.mode else {
+            return;
+        };
+        let mut sent = false;
+        for attachment in attachments.iter().filter(|a| a.size_aware) {
+            attachment.client.send(ClientMessage::Active);
+            sent = true;
+        }
+        if sent {
+            self.active_sent = Some(now);
+        }
+    }
+
     /// Which spinner frame a working pane shows now, from the clock, so every
     /// spinner on screen turns in step; `None` with motion off.
     fn spinner_frame(&self) -> Option<usize> {
@@ -1558,6 +1597,10 @@ impl App {
 
         let first = attachment.generation == 0;
         attachment.generation = generation;
+        // A new connection may be to a different daemon, or an old one that
+        // forgot what it had learned: known size-awareness does not survive
+        // a reconnect, only a fresh `PaneResized` does.
+        attachment.size_aware = false;
 
         // Everything this machine was showing was described by a connection
         // that is gone. Its `Subscribe` replay describes its own fleet afresh,
@@ -1990,6 +2033,13 @@ impl App {
                 .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
 
             ServerMessage::PaneResized { pane, size } => {
+                // This daemon just proved it decides pane sizes, whether or
+                // not this particular pane is still one this client knows.
+                if let Mode::Attached(attachments) = &mut self.mode
+                    && let Some(attachment) = attachments.iter_mut().find(|a| a.device == device)
+                {
+                    attachment.size_aware = true;
+                }
                 let now = self.now();
                 let Some(target) = self.panes.get_mut(&pane) else {
                     return false;
@@ -2331,6 +2381,19 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        // Anything the user does in this window makes it the one in use,
+        // including what never reaches a daemon: moving focus, switching
+        // tabs, resizing the window.
+        if matches!(
+            event,
+            Event::Key(_)
+                | Event::Mouse(_)
+                | Event::Paste(_)
+                | Event::Resize(..)
+                | Event::FocusGained
+        ) {
+            self.note_active();
+        }
         let handled = self.act_on(event, area);
         // Settled after the event, whichever way it went: a click, a paste
         // or a key can end scroll mode, or close or move focus off the pane
@@ -3493,6 +3556,16 @@ impl App {
         };
 
         let size = pane.backend.size();
+        // Another window can have made the pane smaller than its tile here:
+        // a pointer past its edge is over nothing the program drew. A wheel
+        // there still scrolls this client's own copy.
+        if input.col >= size.cols || input.row >= size.rows {
+            if let Some(rows) = wheel {
+                self.scroll_pane(id, rows);
+            }
+            return;
+        }
+
         let bytes = match pane.mouse.encode(pane.backend.terminal(), size, input) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -5364,6 +5437,77 @@ mod tests {
             app.poll_panes();
             assert_eq!(status_of(&app, background), PaneStatus::Idle);
         }
+    }
+
+    /// How many `Active` messages this app sent.
+    fn actives(sent: &Receiver<ClientMessage>) -> usize {
+        sent.try_iter()
+            .filter(|message| matches!(message, ClientMessage::Active))
+            .count()
+    }
+
+    #[test]
+    fn input_tells_a_size_aware_daemon_this_window_is_in_use() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(actives(&sent), 1);
+
+        advance(&clock, Duration::from_millis(100));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(actives(&sent), 0, "at most once per half second");
+
+        advance(&clock, Duration::from_millis(500));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(actives(&sent), 1);
+    }
+
+    #[test]
+    fn input_says_nothing_to_a_daemon_too_old_to_size_panes() {
+        let (mut app, project, daemon, sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let _ = sent.try_iter().count();
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(actives(&sent), 0);
+    }
+
+    #[test]
+    fn a_click_past_the_edge_of_a_smaller_pane_goes_nowhere() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // The program asks for mouse reports, as an agent's interface does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h");
+        let _ = sent.try_iter().count();
+
+        let click = |col, row| MouseInput {
+            action: dispatch_pty::MouseAction::Press,
+            button: dispatch_pty::MouseButton::Left,
+            col,
+            row,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        app.send_mouse(pane, click(20, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "past the pane's right edge: nothing is sent"
+        );
+
+        app.send_mouse(pane, click(3, 2));
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "inside it: the click is the program's"
+        );
     }
 
     #[test]
