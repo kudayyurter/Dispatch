@@ -1,6 +1,6 @@
 # Shared pane size: the window you are using decides
 
-Status: designed, not yet planned.
+Status: implemented on branch `fix/shared-pane-size`.
 Date: 2026-09-28.
 Branch: `fix/shared-pane-size`, cut from `main` at 4045531. Independent of
 `feat/harness-settings` (PR #4).
