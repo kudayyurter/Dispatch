@@ -13,6 +13,8 @@ mod delegation;
 mod outbox;
 mod pane;
 mod session;
+#[allow(dead_code)] // used by the daemon loop from the next commit
+mod sizing;
 mod task_file;
 
 pub use budgets::Budgets;
