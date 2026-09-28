@@ -26,8 +26,9 @@ pub struct RemotePane {
     /// The size this client last asked the daemon for, while the pane is
     /// on this client's screen.
     asked: Option<Size>,
-    /// Whether the daemon has said what size the pane is. One that does
-    /// decides it; one too old to never will, and this client sizes its
+    /// Whether the daemon has said what size the pane is, with a
+    /// `PaneResized`. True once a daemon that decides pane sizes has sent
+    /// one; an older daemon never does, and this client goes on sizing its
     /// own copy as it always did.
     sized_by_daemon: bool,
 }

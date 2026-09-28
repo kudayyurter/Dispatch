@@ -2132,8 +2132,11 @@ impl App {
             return false;
         }
 
-        // Sized to nothing much: the next frame's layout resizes it to the
-        // rectangle it actually gets.
+        // Sized to nothing much: a daemon that decides pane sizes says the
+        // real size straight after announcing the pane, and `PaneResized`
+        // corrects this. An older daemon never sends that, so this is left
+        // to the next frame's layout, which resizes it to the rectangle it
+        // actually gets.
         let backend = match RemotePane::new(id, daemon, Size::new(80, 24)) {
             Ok(remote) => Backend::Remote(remote),
             Err(error) => {
@@ -5652,7 +5655,10 @@ mod tests {
 
         app.send_mouse(
             pane,
-            past_the_edge(dispatch_pty::MouseAction::Press, dispatch_pty::MouseButton::Left),
+            past_the_edge(
+                dispatch_pty::MouseAction::Press,
+                dispatch_pty::MouseButton::Left,
+            ),
         );
         assert!(
             !sent

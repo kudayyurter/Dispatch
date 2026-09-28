@@ -884,14 +884,6 @@ impl Daemon {
     /// only a bounded amount per tick, so bytes can be sitting read and
     /// unsent right up to the moment a resize lands. Flushed here, before the
     /// resize, so they are never stranded on the wrong side of it.
-    ///
-    /// `broadcast`, below, can hang up on a client that has fallen behind,
-    /// which reaches `abandon`, which forgets that client's asks and calls
-    /// this again for every pane it had sized. That re-entry is bounded --
-    /// each hang-up removes a client before recursing, so it cannot repeat
-    /// forever -- and every broadcast here still goes out in the order
-    /// queued, since a client removed mid-loop simply stops receiving the
-    /// rest.
     fn fit(&mut self, pane: PaneId) {
         let Some(size) = self.sizes.wanted(pane) else {
             return;
@@ -912,8 +904,17 @@ impl Daemon {
             if output.is_empty() {
                 break;
             }
-            waiting.push(ServerMessage::PaneOutput { pane, bytes: output });
+            waiting.push(ServerMessage::PaneOutput {
+                pane,
+                bytes: output,
+            });
         }
+        // Each of these can hang up on a client that has fallen behind,
+        // which reaches `abandon`, which forgets that client's asks and
+        // calls `fit` again for every pane it had sized -- so `fit` can
+        // re-enter itself here. Bounded, since each hang-up removes a
+        // client before recursing, and the order above still holds: a
+        // client removed mid-loop simply stops receiving the rest.
         for message in waiting {
             self.broadcast(message);
         }

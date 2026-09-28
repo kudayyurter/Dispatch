@@ -194,11 +194,15 @@ pub enum ClientMessage {
         bytes: Vec<u8>,
     },
 
-    /// Resizes a pane.
+    /// The size of the sending window's own tile for a pane.
+    ///
+    /// The daemon applies it only when this window is the one in use; a pane
+    /// shared with another window can be, and often is, left at a size other
+    /// than what this last asked for.
     ResizePane {
         /// Which pane.
         pane: PaneId,
-        /// New size in cells.
+        /// The tile's size in cells.
         size: (u16, u16),
     },
 
