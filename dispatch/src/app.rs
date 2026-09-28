@@ -3559,6 +3559,14 @@ impl App {
         // Another window can have made the pane smaller than its tile here:
         // a pointer past its edge is over nothing the program drew. A wheel
         // there still scrolls this client's own copy.
+        //
+        // The vendored mouse encoder already drops most out-of-range
+        // positions on its own, but one cell past the edge it clamps into
+        // the last column or row instead of dropping — so without this,
+        // that one cell's click would reach the program. Kept regardless of
+        // what the encoder does today: this contract is the app's to keep,
+        // not an accident of however the encoder currently draws its own
+        // line, and it holds even if a future encoder clamps everywhere.
         if input.col >= size.cols || input.row >= size.rows {
             if let Some(rows) = wheel {
                 self.scroll_pane(id, rows);
@@ -5494,19 +5502,85 @@ mod tests {
             modifiers: dispatch_pty::Modifiers::default(),
         };
 
+        // Well past the edge, where the vendored mouse encoder would refuse
+        // it too.
         app.send_mouse(pane, click(20, 2));
         assert!(
             !sent
                 .try_iter()
                 .any(|m| matches!(m, ClientMessage::WritePane { .. })),
-            "past the pane's right edge: nothing is sent"
+            "a click well past the pane's right edge reaches nothing"
+        );
+
+        // One column past the last one (valid columns are 0..=9): the
+        // encoder's own bounds check is strict — `>`, not `>=` — so left to
+        // it alone this position is clamped into column 9 and reported as a
+        // click there, rather than refused. Only the app's own check stops
+        // it, which is what this asserts.
+        app.send_mouse(pane, click(10, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a click one column past the pane's right edge reaches nothing either"
         );
 
         app.send_mouse(pane, click(3, 2));
         assert!(
             sent.try_iter()
                 .any(|m| matches!(m, ClientMessage::WritePane { .. })),
-            "inside it: the click is the program's"
+            "a click inside the pane reaches the program"
+        );
+    }
+
+    #[test]
+    fn a_wheel_past_the_edge_of_a_smaller_pane_scrolls_it_instead() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // Scrollback for the wheel to move through, and mouse tracking so a
+        // wheel event inside the pane would otherwise be the program's.
+        let output: String = (1..=20).map(|n| format!("line-{n:02}\r\n")).collect();
+        print(&mut app, &daemon, pane, output.as_bytes());
+        print(&mut app, &daemon, pane, b"\x1b[?1000h");
+        let _ = sent.try_iter().count();
+
+        let wheel_up = |col, row| MouseInput {
+            action: dispatch_pty::MouseAction::Press,
+            button: dispatch_pty::MouseButton::WheelUp,
+            col,
+            row,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        // One column past the pane's last, same boundary the click test
+        // above pins: only the app's own check keeps this off the program.
+        app.send_mouse(pane, wheel_up(10, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a wheel past the pane's edge reaches nothing"
+        );
+        assert!(
+            app.panes[&pane].scrolled_back,
+            "but it still scrolls this client's own copy"
+        );
+
+        // Reset so the second wheel event's own effect is what is checked.
+        app.panes.get_mut(&pane).expect("adopted").scrolled_back = false;
+
+        // Inside the pane, which is tracking the mouse: the wheel is the
+        // program's, not this client's scrollback.
+        app.send_mouse(pane, wheel_up(3, 2));
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a wheel inside the pane reaches the program instead"
+        );
+        assert!(
+            !app.panes[&pane].scrolled_back,
+            "and does not also scroll this client's own copy"
         );
     }
 
