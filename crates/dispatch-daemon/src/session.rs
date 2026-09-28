@@ -1059,12 +1059,16 @@ impl Daemon {
         });
 
         // Its size, said as for any other change of it, so every window's
-        // copy starts at the pty's size rather than a guess.
-        let actual = self.panes[&id].session.size();
-        self.broadcast(ServerMessage::PaneResized {
-            pane: id,
-            size: (actual.cols, actual.rows),
-        });
+        // copy starts at the pty's size rather than a guess. Read without
+        // indexing for consistency with `approve`, below, even though this
+        // pane has no caller of its own for a broadcast just above to hang
+        // up: nothing here can remove it between the insert and this read.
+        if let Some(actual) = self.panes.get(&id).map(|pane| pane.session.size()) {
+            self.broadcast(ServerMessage::PaneResized {
+                pane: id,
+                size: (actual.cols, actual.rows),
+            });
+        }
 
         // After the announcement, so a snapshot never names a pane a client
         // has not heard of.
@@ -1561,12 +1565,17 @@ impl Daemon {
         });
 
         // Its size, said as for any other change of it, so every window's
-        // copy starts at the pty's size rather than a guess.
-        let actual = self.panes[&id].session.size();
-        self.broadcast(ServerMessage::PaneResized {
-            pane: id,
-            size: (actual.cols, actual.rows),
-        });
+        // copy starts at the pty's size rather than a guess. Read without
+        // indexing: `resolve`, just above, can hang up on `caller` if it is
+        // behind, which reaches `abandon`, which terminates this very pane
+        // when it is a one-off subagent -- its caller, now gone, can never
+        // be answered by it. Nothing is left to announce a size for.
+        if let Some(actual) = self.panes.get(&id).map(|pane| pane.session.size()) {
+            self.broadcast(ServerMessage::PaneResized {
+                pane: id,
+                size: (actual.cols, actual.rows),
+            });
+        }
     }
 
     /// Resolves a request: answers its caller, and tells every other interface

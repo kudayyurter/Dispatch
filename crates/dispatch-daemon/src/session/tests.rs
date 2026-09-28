@@ -1432,6 +1432,54 @@ fn a_pane_the_daemon_does_not_own_cannot_delegate() {
     );
 }
 
+/// Round 3, item 2: an approval that cannot reach its caller must not panic
+/// indexing the pane it just spawned.
+///
+/// A budget of zero makes the very next thing sent to a client that already
+/// has anything unread `Refused::Behind`, without a real socket or a wait: the
+/// caller's own `Welcome` is left sitting in its queue, so `resolve`'s answer
+/// to `DelegateResolved` is what trips it. That reaches `hang_up`, then
+/// `abandon`, which terminates the one-off subagent `approve` just spawned
+/// before `approve` goes on to read its size.
+#[test]
+fn an_approval_whose_caller_has_hung_up_does_not_panic() {
+    let (mut daemon, project, _dir) = daemon("delegate-behind");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    // Past this point, anything already queued and unread makes the next
+    // send to that client `Refused::Behind`.
+    daemon.set_budgets(Budgets {
+        outbox_bytes: 0,
+        ..Budgets::default()
+    });
+
+    // The caller's own `Welcome`, queued when it said `Hello`, is left
+    // unread on purpose -- that is what is still waiting when its approval
+    // comes back.
+    let _caller = ask(&mut daemon, parent, "echo never");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    // No panic reached here is the assertion; this line only runs at all if
+    // `approve` survived indexing the pane `abandon` had already removed.
+    assert_eq!(
+        daemon.pane_count(),
+        1,
+        "the one-off subagent was terminated along with its caller, leaving only the parent"
+    );
+}
+
 #[test]
 fn a_delegate_caller_is_not_sent_pane_output() {
     // It waits on one request; the fleet's output is a firehose it never reads.
