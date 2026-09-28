@@ -264,9 +264,18 @@ bypass = false        # this harness's prompts are back on
 
 ## How a choice reaches the pane
 
-**The client resolves, the daemon checks.** Whenever the user opens a pane
-(with `Enter` in the picker, or with `Enter` in the popup), the client resolves
-every setting of that harness, in the order above, and sends the result:
+**The client sends what the user chose, the daemon checks and fills in the
+rest.** `Enter` in the picker sends the user's saved defaults, the ones this
+harness can take. `Enter` in the popup sends every value the popup shows. A
+setting the message leaves out is the daemon's to decide.
+
+Sending every setting on a plain `Enter` was the first design. It would have
+refused every spawn on a machine whose harness file lacks one of this
+machine's settings, even when the user had chosen nothing. Sending only what
+the user chose means a machine with a different harness file still starts
+the pane, unless the user asked it for something it cannot do.
+
+The message:
 
 ```rust
 ClientMessage::SpawnPane {
@@ -275,9 +284,9 @@ ClientMessage::SpawnPane {
     size: (u16, u16),
     #[serde(default)]
     place: Placement,
-    /// Each setting's value, as the user's screen showed it: a choice or
-    /// text as itself ("" for agent default), a bool as "true" or "false".
-    /// An older client sends none.
+    /// Each setting's value the user chose or saved: a choice or text as
+    /// itself ("" for agent default), a bool as "true" or "false". An older
+    /// client sends none.
     #[serde(default)]
     settings: BTreeMap<String, String>,
 }
@@ -287,10 +296,13 @@ The daemon validates every entry (see "Safety"), fills in any setting the
 message leaves out from its own saved defaults and then the harness file, and
 builds the launch. So:
 
-- **A local pane** gets exactly what the picker detail or the popup showed.
-- **A pane on another machine** also gets what the user's own screen showed:
-  the choices travel with the request. The picker already lists this
-  machine's harnesses for every project, so this matches.
+- **A local pane** gets exactly what the picker detail or the popup showed:
+  the daemon's saved file is the same file.
+- **A pane on another machine** gets the user's saved defaults, or everything
+  the popup showed: those travel with the request. A setting the user never
+  chose is decided by that machine, from its own saved defaults and then its
+  harness file. A setting that machine's harness file does not have is
+  refused, naming it.
 - **An older client** sends no settings, and the daemon applies its own
   saved defaults and the harness file's defaults. Auto-approve applies there
   too.
@@ -512,6 +524,8 @@ the user may want back.
   `←`/`→` drop the text and step, `Esc` restores.
 - `Enter` spawns with the shown values and saves nothing; `s` writes the file
   and keeps the popup open; `Esc` returns to the picker.
+- `Enter` in the picker sends the saved values the harness can take, and
+  nothing when nothing is saved.
 - `s` writes only values that differ from the file's defaults, removes keys
   set back to them, and writes `""` for agent default over a file default.
 - The picker's detail shows values that differ from the file's defaults, and
