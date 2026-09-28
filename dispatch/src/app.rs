@@ -191,6 +191,12 @@ const EVALUATE_EVERY: Duration = Duration::from_millis(250);
 /// would come back "finished while you were away".
 const GRACE: Duration = Duration::from_secs(3);
 
+/// How often a window tells its daemons it is the one in use, at most.
+///
+/// Often enough that the size follows the user within a moment of turning
+/// to a window; rare enough that typing does not send one per keystroke.
+const ACTIVE_EVERY: Duration = Duration::from_millis(500);
+
 /// How long focus takes to move: the borders easing between faded and the
 /// accent, and the sidebar's tint on its way to the focused row.
 const EASE: Duration = Duration::from_millis(150);
@@ -453,6 +459,10 @@ struct Attachment {
     /// The failure last put on the status line, so a machine retrying every
     /// thirty seconds says so once rather than every time.
     reported: Option<String>,
+    /// Whether this daemon decides pane sizes, known once it has said one.
+    /// A daemon from before that never will, and is told nothing it would
+    /// not understand.
+    size_aware: bool,
 }
 
 /// Which kept list a root opened on an attachment belongs on.
@@ -675,6 +685,13 @@ pub struct App {
     /// is, for a click to be matched against.
     tab_row: Rect,
     tab_hits: Vec<(u16, u16, TabHit)>,
+    /// The panes this client last fitted to its screen, so one that leaves
+    /// the screen can withdraw its size.
+    fitted: HashSet<PaneId>,
+    /// When this window last told a daemon it was the one in use, so
+    /// [`App::note_active`] can hold `Active` to at most one per
+    /// [`ACTIVE_EVERY`].
+    active_sent: Option<Instant>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -748,6 +765,8 @@ impl App {
             tab_back: None,
             tab_row: Rect::default(),
             tab_hits: Vec::new(),
+            fitted: HashSet::new(),
+            active_sent: None,
         }
     }
 
@@ -821,6 +840,7 @@ impl App {
             label,
             remote,
             reported: None,
+            size_aware: false,
         };
 
         match &mut self.mode {
@@ -1343,6 +1363,29 @@ impl App {
         (self.clock)()
     }
 
+    /// Tells every daemon that decides sizes that this window is the one in
+    /// use, at most once per [`ACTIVE_EVERY`].
+    fn note_active(&mut self) {
+        let now = self.now();
+        if self
+            .active_sent
+            .is_some_and(|at| now.duration_since(at) < ACTIVE_EVERY)
+        {
+            return;
+        }
+        let Mode::Attached(attachments) = &self.mode else {
+            return;
+        };
+        let mut sent = false;
+        for attachment in attachments.iter().filter(|a| a.size_aware) {
+            attachment.client.send(ClientMessage::Active);
+            sent = true;
+        }
+        if sent {
+            self.active_sent = Some(now);
+        }
+    }
+
     /// Which spinner frame a working pane shows now, from the clock, so every
     /// spinner on screen turns in step; `None` with motion off.
     fn spinner_frame(&self) -> Option<usize> {
@@ -1612,6 +1655,10 @@ impl App {
 
         let first = attachment.generation == 0;
         attachment.generation = generation;
+        // A new connection may be to a different daemon, or an old one that
+        // forgot what it had learned: known size-awareness does not survive
+        // a reconnect, only a fresh `PaneResized` does.
+        attachment.size_aware = false;
 
         // Everything this machine was showing was described by a connection
         // that is gone. Its `Subscribe` replay describes its own fleet afresh,
@@ -2043,6 +2090,36 @@ impl App {
                 .state
                 .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
 
+            ServerMessage::PaneResized { pane, size } => {
+                // This daemon just proved it decides pane sizes, whether or
+                // not this particular pane is still one this client knows.
+                if let Mode::Attached(attachments) = &mut self.mode
+                    && let Some(attachment) = attachments.iter_mut().find(|a| a.device == device)
+                {
+                    attachment.size_aware = true;
+                }
+                let now = self.now();
+                let Some(target) = self.panes.get_mut(&pane) else {
+                    return false;
+                };
+                let Backend::Remote(remote) = &mut target.backend else {
+                    return false;
+                };
+                // The pty is this size now, and every byte that follows was
+                // drawn for it: the copy takes it here, in order with the
+                // output, never ahead of it.
+                if let Err(error) = remote.resized(Size::new(size.0, size.1)) {
+                    tracing::warn!(%error, "failed to resize a pane");
+                    return false;
+                }
+                // The repaint that follows is the resize's doing.
+                target.activity.resized(now);
+                if let Ok(screen) = target.reader.read(target.backend.terminal()) {
+                    target.screen = screen;
+                }
+                true
+            }
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
             // clients. Unknown messages from newer peers are ignored.
@@ -2113,8 +2190,11 @@ impl App {
             return false;
         }
 
-        // Sized to nothing much: the next frame's layout resizes it to the
-        // rectangle it actually gets.
+        // Sized to nothing much: a daemon that decides pane sizes says the
+        // real size straight after announcing the pane, and `PaneResized`
+        // corrects this. An older daemon never sends that, so this is left
+        // to the next frame's layout, which resizes it to the rectangle it
+        // actually gets.
         let backend = match RemotePane::new(id, daemon, Size::new(80, 24)) {
             Ok(remote) => Backend::Remote(remote),
             Err(error) => {
@@ -2362,6 +2442,21 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        // Anything the user does in this window makes it the one in use,
+        // including what never reaches a daemon: moving focus, switching
+        // tabs, resizing the window. A bare `Moved` does not count: mouse
+        // capture reports plain hover, and a terminal usually sends pointer
+        // motion to the window under the pointer even without keyboard
+        // focus, so hovering over an idle window must not steal every
+        // shared pane's size.
+        let is_use = match event {
+            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
+            Event::Key(_) | Event::Paste(_) | Event::Resize(..) | Event::FocusGained => true,
+            _ => false,
+        };
+        if is_use {
+            self.note_active();
+        }
         let handled = self.act_on(event, area);
         // Settled after the event, whichever way it went: a click, a paste
         // or a key can end scroll mode, or close or move focus off the pane
@@ -3617,8 +3712,8 @@ impl App {
     /// A pane that tracks the mouse receives the event. One that does not gets
     /// nothing, and a wheel event then scrolls its scrollback instead, which
     /// is what a terminal without mouse tracking does.
-    fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
-        use dispatch_pty::MouseButton;
+    fn send_mouse(&mut self, id: PaneId, mut input: MouseInput) {
+        use dispatch_pty::{MouseAction, MouseButton};
 
         let now = self.now();
         let wheel = match input.button {
@@ -3646,6 +3741,42 @@ impl App {
         };
 
         let size = pane.backend.size();
+        // Another window can have made the pane smaller than its tile here:
+        // a pointer past its edge is over nothing the program drew. A wheel
+        // there still scrolls this client's own copy.
+        //
+        // The vendored mouse encoder already drops most out-of-range
+        // positions on its own, but one cell past the edge it clamps into
+        // the last column or row instead of dropping — so without this,
+        // that one cell's click would reach the program. Kept regardless of
+        // what the encoder does today: this contract is the app's to keep,
+        // not an accident of however the encoder currently draws its own
+        // line, and it holds even if a future encoder clamps everywhere.
+        if input.col >= size.cols || input.row >= size.rows {
+            match input.action {
+                // A release, or a drag with a button held, can have started
+                // inside the pane and wandered out here — dropping it would
+                // leave the program's selection stuck with no release ever
+                // delivered. Clamped to the pane's last cell and forwarded,
+                // the same as a real terminal does at its own edge. Every
+                // `Motion` that reaches here is a drag: the input router turns
+                // a plain hover into focusing the pane, never into a pointer
+                // event for the program.
+                MouseAction::Release | MouseAction::Motion => {
+                    input.col = size.cols.saturating_sub(1);
+                    input.row = size.rows.saturating_sub(1);
+                }
+                // A fresh press past the edge lands on nothing the program
+                // drew, and a wheel there scrolls this client's own copy.
+                MouseAction::Press => {
+                    if let Some(rows) = wheel {
+                        self.scroll_pane(id, rows);
+                    }
+                    return;
+                }
+            }
+        }
+
         let bytes = match pane.mouse.encode(pane.backend.terminal(), size, input) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -5003,13 +5134,23 @@ impl App {
             .render(row, frame.buffer_mut());
     }
 
-    /// Resizes every visible pane to the rectangle it now occupies.
+    /// Fits every visible pane to the rectangle it now occupies, and
+    /// withdraws this client's size for any pane no longer on screen.
     ///
     /// A child that is not told its new size redraws to the old one, which is
     /// the most visible bug this layer can have.
     pub fn resize_panes(&mut self) {
         let now = self.now();
         let layout = self.layout.clone();
+
+        let showing: HashSet<PaneId> = layout.iter().map(|(id, _)| *id).collect();
+        let gone: Vec<PaneId> = self.fitted.difference(&showing).copied().collect();
+        for id in gone {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.backend.hide();
+            }
+        }
+        self.fitted = showing;
 
         for (id, rect) in layout {
             // Silently, unlike a keystroke: this runs every frame, and a
@@ -5025,21 +5166,17 @@ impl App {
                 continue;
             };
 
-            let size = Size::new(rect.width, rect.height);
-            if size == pane.backend.size() {
-                continue;
-            }
-
-            if let Err(error) = pane.backend.resize(size) {
-                tracing::warn!(%error, "failed to resize a pane");
-                continue;
-            }
-            // The program repaints to fit, and that repaint is this resize's
-            // doing rather than the program at work.
-            pane.activity.resized(now);
-
-            if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
-                pane.screen = screen;
+            match pane.backend.fit(Size::new(rect.width, rect.height)) {
+                Ok(false) => {}
+                Ok(true) => {
+                    // The program repaints to fit, and that repaint is this
+                    // resize's doing rather than the program at work.
+                    pane.activity.resized(now);
+                    if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+                        pane.screen = screen;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to resize a pane"),
             }
         }
     }
@@ -5399,6 +5536,356 @@ mod tests {
         assert!(
             !app.state.is_unseen(background),
             "and it finished nothing, so it is not done"
+        );
+    }
+
+    /// Says `pane` is `cols`×`rows`, as a daemon that decides sizes does.
+    fn say_size(app: &mut App, daemon: &Sender<ServerMessage>, pane: PaneId, cols: u16, rows: u16) {
+        daemon
+            .send(ServerMessage::PaneResized {
+                pane,
+                size: (cols, rows),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+    }
+
+    /// The `ResizePane` sizes this app sent for `pane`, in order.
+    fn asked_sizes(sent: &Receiver<ClientMessage>, pane: PaneId) -> Vec<(u16, u16)> {
+        sent.try_iter()
+            .filter_map(|message| match message {
+                ClientMessage::ResizePane { pane: p, size } if p == pane => Some(size),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_is_drawn_at_the_size_its_daemon_says() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 50, 20);
+        assert_eq!(app.panes[&pane].backend.size(), Size::new(50, 20));
+
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        assert_eq!(
+            app.panes[&pane].backend.size(),
+            Size::new(50, 20),
+            "its tile is asked for, not taken"
+        );
+        let asked = asked_sizes(&sent, pane);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_ne!(asked[0], (50, 20), "the tile's own size was asked");
+
+        app.resize_panes();
+        assert!(
+            asked_sizes(&sent, pane).is_empty(),
+            "asked once, not every frame"
+        );
+    }
+
+    #[test]
+    fn with_an_old_daemon_a_pane_is_resized_here_as_before() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        let asked = asked_sizes(&sent, pane);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            app.panes[&pane].backend.size(),
+            Size::new(asked[0].0, asked[0].1),
+            "a daemon that never says a size leaves it to this client"
+        );
+    }
+
+    #[test]
+    fn a_pane_leaving_the_screen_withdraws_its_size_and_asks_again() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        for pane in &panes {
+            say_size(&mut app, &daemon, *pane, 40, 12);
+        }
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+        let _ = sent.try_iter().count();
+
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+
+        let messages: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ClientMessage::HidePane { pane } if *pane == panes[0])),
+            "the pane now off screen withdraws its size: {messages:?}"
+        );
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        app.resize_panes();
+        assert_eq!(
+            asked_sizes(&sent, panes[0]).len(),
+            1,
+            "and asks again when shown"
+        );
+    }
+
+    #[test]
+    fn the_repaint_after_the_daemon_resizes_a_pane_is_not_work() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let background = panes[0];
+        say_size(&mut app, &daemon, background, 40, 12);
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+
+        say_size(&mut app, &daemon, background, 60, 20);
+        advance(&clock, Duration::from_millis(50));
+        print(&mut app, &daemon, background, b"\x1b[H\x1b[2Jrepainted\r\n");
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(100));
+            app.poll_panes();
+            assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        }
+    }
+
+    /// How many `Active` messages this app sent.
+    fn actives(sent: &Receiver<ClientMessage>) -> usize {
+        sent.try_iter()
+            .filter(|message| matches!(message, ClientMessage::Active))
+            .count()
+    }
+
+    #[test]
+    fn input_tells_a_size_aware_daemon_this_window_is_in_use() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(actives(&sent), 1);
+
+        advance(&clock, Duration::from_millis(100));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(actives(&sent), 0, "at most once per half second");
+
+        advance(&clock, Duration::from_millis(500));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(actives(&sent), 1);
+    }
+
+    #[test]
+    fn hovering_does_not_tell_the_daemon_this_window_is_in_use() {
+        // Mouse capture reports plain hover, and a terminal usually sends
+        // pointer motion to the window under the pointer even when it lacks
+        // keyboard focus. So a `Moved` event must not count as use — only a
+        // button going down (or up, or dragging, or a wheel) does.
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        app.handle(
+            &Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Size::new(100, 30),
+        )
+        .expect("a hover is handled");
+        assert_eq!(actives(&sent), 0, "hovering is not use");
+
+        click(&mut app, 5, 5);
+        assert_eq!(actives(&sent), 1, "a press is use");
+    }
+
+    #[test]
+    fn input_says_nothing_to_a_daemon_too_old_to_size_panes() {
+        let (mut app, project, daemon, sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let _ = sent.try_iter().count();
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(actives(&sent), 0);
+    }
+
+    #[test]
+    fn a_click_past_the_edge_of_a_smaller_pane_goes_nowhere() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // The program asks for mouse reports, as an agent's interface does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h");
+        let _ = sent.try_iter().count();
+
+        let click = |col, row| MouseInput {
+            action: dispatch_pty::MouseAction::Press,
+            button: dispatch_pty::MouseButton::Left,
+            col,
+            row,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        // Well past the edge, where the vendored mouse encoder would refuse
+        // it too.
+        app.send_mouse(pane, click(20, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a click well past the pane's right edge reaches nothing"
+        );
+
+        // One column past the last one (valid columns are 0..=9): the
+        // encoder's own bounds check is strict — `>`, not `>=` — so left to
+        // it alone this position is clamped into column 9 and reported as a
+        // click there, rather than refused. Only the app's own check stops
+        // it, which is what this asserts.
+        app.send_mouse(pane, click(10, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a click one column past the pane's right edge reaches nothing either"
+        );
+
+        app.send_mouse(pane, click(3, 2));
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a click inside the pane reaches the program"
+        );
+    }
+
+    #[test]
+    fn a_wheel_past_the_edge_of_a_smaller_pane_scrolls_it_instead() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // Scrollback for the wheel to move through, and mouse tracking so a
+        // wheel event inside the pane would otherwise be the program's.
+        let output: String = (1..=20).map(|n| format!("line-{n:02}\r\n")).collect();
+        print(&mut app, &daemon, pane, output.as_bytes());
+        print(&mut app, &daemon, pane, b"\x1b[?1000h");
+        let _ = sent.try_iter().count();
+
+        let wheel_up = |col, row| MouseInput {
+            action: dispatch_pty::MouseAction::Press,
+            button: dispatch_pty::MouseButton::WheelUp,
+            col,
+            row,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        // One column past the pane's last, same boundary the click test
+        // above pins: only the app's own check keeps this off the program.
+        app.send_mouse(pane, wheel_up(10, 2));
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a wheel past the pane's edge reaches nothing"
+        );
+        assert!(
+            app.panes[&pane].scrolled_back,
+            "but it still scrolls this client's own copy"
+        );
+
+        // Reset so the second wheel event's own effect is what is checked.
+        app.panes.get_mut(&pane).expect("adopted").scrolled_back = false;
+
+        // Inside the pane, which is tracking the mouse: the wheel is the
+        // program's, not this client's scrollback.
+        app.send_mouse(pane, wheel_up(3, 2));
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a wheel inside the pane reaches the program instead"
+        );
+        assert!(
+            !app.panes[&pane].scrolled_back,
+            "and does not also scroll this client's own copy"
+        );
+    }
+
+    #[test]
+    fn a_release_or_drag_past_the_edge_of_a_smaller_pane_still_reaches_it() {
+        // A drag that starts in a pane's content and wanders into the
+        // padding another window's size left it with must still deliver its
+        // release, or the program's selection is left stuck there forever.
+        // Only a fresh press past the edge is dropped.
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // The program asks for mouse reports and drag events, as an agent's
+        // interface does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h\x1b[?1002h");
+        let _ = sent.try_iter().count();
+
+        let past_the_edge = |action, button| MouseInput {
+            action,
+            button,
+            col: 20,
+            row: 2,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        app.send_mouse(
+            pane,
+            past_the_edge(
+                dispatch_pty::MouseAction::Press,
+                dispatch_pty::MouseButton::Left,
+            ),
+        );
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a fresh press past the edge still reaches nothing"
+        );
+
+        app.send_mouse(
+            pane,
+            past_the_edge(
+                dispatch_pty::MouseAction::Motion,
+                dispatch_pty::MouseButton::Left,
+            ),
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a drag that has wandered into the padding still reaches the program"
+        );
+
+        app.send_mouse(
+            pane,
+            past_the_edge(
+                dispatch_pty::MouseAction::Release,
+                dispatch_pty::MouseButton::Left,
+            ),
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "and its release past the edge must still be delivered"
         );
     }
 

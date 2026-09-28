@@ -865,3 +865,59 @@ fn a_spawns_settings_survive_the_wire() {
 
     assert_eq!(read, message);
 }
+
+#[test]
+fn the_shared_size_messages_survive_the_wire() {
+    let pane = PaneId::new();
+
+    let server = ServerMessage::PaneResized {
+        pane,
+        size: (120, 40),
+    };
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &server).expect("writing succeeds");
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+    assert_eq!(read, server);
+
+    for client in [ClientMessage::Active, ClientMessage::HidePane { pane }] {
+        let mut buf = Vec::new();
+        Frame::write(&mut buf, &client).expect("writing succeeds");
+        let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+        assert_eq!(read, client);
+    }
+}
+
+#[test]
+fn an_older_build_reads_the_shared_size_messages_as_unknown() {
+    // What a build from before these messages sees: its own variants, and
+    // `Unknown` for the rest. Reading one must not fail the frame, which
+    // would take the connection with it.
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Older {
+        Ping {
+            token: u64,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    let pane = PaneId::new();
+    let mut frames = Vec::new();
+    Frame::write(&mut frames, &ClientMessage::Active).expect("writing succeeds");
+    Frame::write(&mut frames, &ClientMessage::HidePane { pane }).expect("writing succeeds");
+    Frame::write(
+        &mut frames,
+        &ServerMessage::PaneResized {
+            pane,
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    let mut reader = frames.as_slice();
+    for _ in 0..3 {
+        let read: Older = Frame::read(&mut reader).expect("an older build reads it");
+        assert_eq!(read, Older::Unknown);
+    }
+}

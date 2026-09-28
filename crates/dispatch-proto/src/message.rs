@@ -202,12 +202,29 @@ pub enum ClientMessage {
         bytes: Vec<u8>,
     },
 
-    /// Resizes a pane.
+    /// The size of the sending window's own tile for a pane.
+    ///
+    /// The daemon applies it only when this window is the one in use; a pane
+    /// shared with another window can be, and often is, left at a size other
+    /// than what this last asked for.
     ResizePane {
         /// Which pane.
         pane: PaneId,
-        /// New size in cells.
+        /// The tile's size in cells.
         size: (u16, u16),
+    },
+
+    /// The user is using this window: it should decide the size of the panes
+    /// it shows.
+    ///
+    /// Sent on input the daemon would not otherwise see, such as moving focus
+    /// or resizing the window, at most twice a second.
+    Active,
+
+    /// This window no longer shows `pane`, so its size for it stops counting.
+    HidePane {
+        /// The pane it has stopped showing.
+        pane: PaneId,
     },
 
     /// Closes a pane and terminates its process tree.
@@ -319,6 +336,21 @@ pub enum ServerMessage {
         /// and re-rendering remotely would cost a full screen per frame.
         #[serde(with = "serde_bytes_compat")]
         bytes: Vec<u8>,
+    },
+
+    /// A pane's pty is now `size`, as `(cols, rows)`.
+    ///
+    /// Sent after the pty was resized, and after everything the daemon had
+    /// already read from it is sent, so that always precedes this on the
+    /// connection and output drawn at the new size always follows it. Bytes
+    /// still sitting in the pty's own kernel buffer, not yet read by the
+    /// daemon at all, can still arrive after this — a program that redraws
+    /// on `SIGWINCH`, as most full-screen ones do, covers that gap itself.
+    PaneResized {
+        /// Which pane.
+        pane: PaneId,
+        /// Its size now, in cells, as `(cols, rows)`.
+        size: (u16, u16),
     },
 
     /// A pane changed in some way other than producing output.

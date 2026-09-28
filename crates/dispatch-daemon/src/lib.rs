@@ -13,6 +13,7 @@ mod delegation;
 mod outbox;
 mod pane;
 mod session;
+mod sizing;
 mod task_file;
 
 pub use budgets::Budgets;

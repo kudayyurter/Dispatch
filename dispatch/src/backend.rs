@@ -23,6 +23,14 @@ pub struct RemotePane {
     terminal: VtTerminal,
     size: Size,
     state: RunState,
+    /// The size this client last asked the daemon for, while the pane is
+    /// on this client's screen.
+    asked: Option<Size>,
+    /// Whether the daemon has said what size the pane is, with a
+    /// `PaneResized`. True once a daemon that decides pane sizes has sent
+    /// one; an older daemon never does, and this client goes on sizing its
+    /// own copy as it always did.
+    sized_by_daemon: bool,
 }
 
 impl RemotePane {
@@ -36,6 +44,8 @@ impl RemotePane {
             terminal,
             size,
             state: RunState::Running,
+            asked: None,
+            sized_by_daemon: false,
         })
     }
 
@@ -47,6 +57,16 @@ impl RemotePane {
     /// Records that the pane's process has exited.
     pub fn set_state(&mut self, state: RunState) {
         self.state = state;
+    }
+
+    /// Takes the size the daemon says the pane now is.
+    pub fn resized(&mut self, size: Size) -> Result<()> {
+        self.terminal
+            .resize(size)
+            .context("failed to resize a pane")?;
+        self.size = size;
+        self.sized_by_daemon = true;
+        Ok(())
     }
 }
 
@@ -118,24 +138,55 @@ impl Backend {
         }
     }
 
-    /// Tells the pane its new size.
-    pub fn resize(&mut self, size: Size) -> Result<()> {
+    /// Fits the pane to a tile of `size`.
+    ///
+    /// Returns whether its screen changed size now. A pane whose daemon
+    /// decides sizes only asks here, and changes size when the daemon says
+    /// so.
+    pub fn fit(&mut self, size: Size) -> Result<bool> {
         match self {
-            Self::Local(session) => session.resize(size).context("failed to resize a pane"),
+            Self::Local(session) => {
+                if session.size() == size {
+                    return Ok(false);
+                }
+                session.resize(size).context("failed to resize a pane")?;
+                Ok(true)
+            }
             Self::Remote(remote) => {
-                // The local emulator is resized too, so the screen reflows this
-                // frame rather than when the daemon's next output arrives.
-                remote
-                    .terminal
-                    .resize(size)
-                    .context("failed to resize a pane")?;
-                remote.size = size;
+                if remote.asked == Some(size) {
+                    return Ok(false);
+                }
+                // A daemon too old to say what size the pane is: this
+                // client's copy is resized here, this frame, as it always
+                // was.
+                let now = !remote.sized_by_daemon;
+                if now {
+                    remote
+                        .terminal
+                        .resize(size)
+                        .context("failed to resize a pane")?;
+                    remote.size = size;
+                }
+                remote.asked = Some(size);
                 remote.daemon.send(ClientMessage::ResizePane {
                     pane: remote.id,
                     size: (size.cols, size.rows),
                 });
-                Ok(())
+                Ok(now)
             }
+        }
+    }
+
+    /// Stops this client's tile counting towards the pane's size, now the
+    /// pane is off this client's screen.
+    pub fn hide(&mut self) {
+        if let Self::Remote(remote) = self
+            && remote.asked.take().is_some()
+            && remote.sized_by_daemon
+        {
+            remote
+                .daemon
+                .send(ClientMessage::HidePane { pane: remote.id });
         }
     }
 

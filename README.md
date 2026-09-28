@@ -462,9 +462,12 @@ running when the client exits, and a Ctrl-C meant for the interface does not
 reach the agents. It records its process id in `dispatchd.pid` beside the socket,
 which is what to stop when you want it gone.
 
-Several clients can attach at once and see the same panes. A client attaching to
-a pane that is already running is replayed the last 256 KiB it printed, so
-reattaching shows the work rather than a blank rectangle.
+Several clients can attach at once and see the same panes. Each pane takes the
+size of the window you used last: the one you typed or clicked in, resized, or
+opened most recently. The other windows show it at that size, with blank space
+around it or its edges cut off to fit their tile. A client attaching to a pane
+that is already running is replayed the last 256 KiB it printed, so reattaching
+shows the work rather than a blank rectangle.
 
 An attached client reconnects on its own: restart the daemon, or lose the socket,
 and it waits, says so, and rebuilds its view from what the daemon reports when it
