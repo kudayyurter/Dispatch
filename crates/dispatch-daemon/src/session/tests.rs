@@ -5269,3 +5269,255 @@ fn a_pane_placed_on_a_tab_delegates_under_the_same_cap() {
         "the tab holds the two placed panes"
     );
 }
+
+/// Writes `record`: a harness that writes the arguments it was started
+/// with to `out`, one to a line, and then waits. `$0` is the file, so what
+/// it writes is exactly what its settings added. Its one-shot form writes
+/// them and exits.
+#[cfg(unix)]
+fn write_recording_harness(dir: &std::path::Path, out: &std::path::Path) {
+    let body = format!(
+        r#"id = "record"
+display_name = "Record"
+command = "sh"
+args = ["-c", "printf '%s\n' \"$@\" > \"$0\"; sleep 30", "{out}"]
+
+[task]
+args = ["-c", "printf '%s\n' \"$@\" > \"$0\"", "{out}"]
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["small", "large"]
+custom = true
+args = ["--model", "{{value}}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+options = ["low", "high"]
+args = ["--effort", "{{value}}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--yolo"]
+"#,
+        out = out.display()
+    );
+    std::fs::create_dir_all(dir).expect("temp dir is writable");
+    std::fs::write(dir.join("record.toml"), body).expect("temp dir is writable");
+}
+
+/// A daemon serving `record` beside the usual harnesses, reading saved
+/// settings from `dir/config`, plus the file `record` writes to.
+#[cfg(unix)]
+fn recording_daemon(label: &str) -> (Daemon, ProjectId, TempDir, PathBuf) {
+    let dir = TempDir::new(label);
+    let harness_dir = dir.0.join("harnesses");
+    let out = dir.0.join("record.out");
+    write_recording_harness(&harness_dir, &out);
+    let registry = harnesses(&harness_dir);
+
+    let mut daemon = Daemon::new(registry, "test-device");
+    daemon.set_task_dir(dir.0.join("tasks"));
+    daemon.set_settings_dir(dir.0.join("config"));
+    let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
+    let project = daemon.open_project(root);
+
+    (daemon, project, dir, out)
+}
+
+/// Saves `text` as the daemon's `harness-settings.toml`.
+#[cfg(unix)]
+fn save_settings(dir: &TempDir, text: &str) {
+    let config = dir.0.join("config");
+    std::fs::create_dir_all(&config).expect("temp dir is writable");
+    std::fs::write(config.join("harness-settings.toml"), text).expect("temp dir is writable");
+}
+
+/// What `record` wrote, once it has: one argument to a line.
+#[cfg(unix)]
+fn recorded(daemon: &mut Daemon, out: &std::path::Path) -> Vec<String> {
+    let deadline = Instant::now() + WAIT_FOR_DEADLINE;
+    loop {
+        daemon.tick();
+        if let Ok(text) = std::fs::read_to_string(out)
+            && text.ends_with('\n')
+        {
+            return text.lines().map(str::to_string).collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "record never wrote its arguments"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Asks for a pane of `harness` with `settings`, as a client does.
+fn spawn_with(daemon: &mut Daemon, project: ProjectId, harness: &str, settings: &[(&str, &str)]) {
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: harness.into(),
+            size: (80, 24),
+            place: Placement::Auto,
+            settings: settings
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        },
+    );
+}
+
+/// The text of the first `Other` error among `messages`.
+fn error_text(messages: &[ServerMessage]) -> Option<String> {
+    messages.iter().find_map(|m| match m {
+        ServerMessage::Error {
+            error: ProtocolError::Other(text),
+        } => Some(text.clone()),
+        _ => None,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_spawn_starts_with_the_flags_the_client_chose() {
+    let (mut daemon, project, _dir, out) = recording_daemon("settings-chosen");
+    let _inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+
+    spawn_with(
+        &mut daemon,
+        project,
+        "record",
+        &[("model", "large"), ("bypass", "false")],
+    );
+
+    assert_eq!(recorded(&mut daemon, &out), vec!["--model", "large"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_spawn_with_nothing_chosen_uses_the_saved_settings_then_the_files() {
+    let (mut daemon, project, dir, out) = recording_daemon("settings-saved");
+    save_settings(&dir, "[record]\nmodel = \"small\"\n");
+    let _inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+
+    spawn_with(&mut daemon, project, "record", &[]);
+
+    assert_eq!(
+        recorded(&mut daemon, &out),
+        vec!["--model", "small", "--yolo"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_chosen_value_beats_a_saved_one() {
+    let (mut daemon, project, dir, out) = recording_daemon("settings-chosen-over-saved");
+    save_settings(&dir, "[record]\nmodel = \"small\"\n");
+    let _inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+
+    spawn_with(&mut daemon, project, "record", &[("model", "large")]);
+
+    assert_eq!(
+        recorded(&mut daemon, &out),
+        vec!["--model", "large", "--yolo"]
+    );
+}
+
+#[test]
+fn a_setting_the_harness_does_not_have_is_refused_and_nothing_starts() {
+    let (mut daemon, project, _dir) = daemon("settings-unknown");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    let _ = drain(&inbox);
+
+    spawn_with(&mut daemon, project, "shell", &[("colour", "red")]);
+
+    let text = error_text(&drain(&inbox)).expect("the spawn is refused");
+    assert!(text.contains("colour"), "{text}");
+    assert_eq!(daemon.pane_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_value_the_harness_cannot_take_is_refused_and_nothing_starts() {
+    // Refused, not dropped: a dropped `bypass = false` would start an agent
+    // with its prompts off.
+    for (key, value) in [
+        ("model", "x&calc"),
+        ("model", "--yolo"),
+        ("effort", "extreme"),
+        ("bypass", "yes"),
+    ] {
+        let (mut daemon, project, _dir, _out) = recording_daemon("settings-refused");
+        let inbox = daemon.attach_for_test(1);
+        daemon.request_for_test(1, hello());
+        let _ = drain(&inbox);
+
+        spawn_with(&mut daemon, project, "record", &[(key, value)]);
+
+        let text = error_text(&drain(&inbox))
+            .unwrap_or_else(|| panic!("{key} = {value:?} was not refused"));
+        assert!(text.contains(key), "{key} = {value:?}: {text}");
+        assert_eq!(daemon.pane_count(), 0, "{key} = {value:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_subagent_starts_with_the_saved_settings() {
+    let (mut daemon, project, dir, out) = recording_daemon("settings-delegated");
+    save_settings(&dir, "[record]\nmodel = \"large\"\n");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "record".into(),
+            task: "anything".into(),
+            size: (80, 24),
+        },
+    );
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    assert_eq!(
+        recorded(&mut daemon, &out),
+        vec!["--model", "large", "--yolo"]
+    );
+}
