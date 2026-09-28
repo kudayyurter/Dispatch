@@ -6,6 +6,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 /// One row of a picker.
@@ -48,6 +49,8 @@ pub struct Picker {
     /// The frame's colour, set by whoever draws the overlay so it matches
     /// the rest of the interface.
     border: Style,
+    /// What the keys do, drawn on the bottom border.
+    hint: Option<String>,
 }
 
 impl Picker {
@@ -59,12 +62,33 @@ impl Picker {
             items,
             selected: 0,
             border: Style::default().fg(Color::Cyan),
+            hint: None,
         }
     }
 
     /// Draws the frame in `style`.
     pub fn set_border(&mut self, style: Style) {
         self.border = style;
+    }
+
+    /// The same picker, saying on its bottom border what its keys do.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// What the bottom border says, if anything.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+
+    /// Moves the highlight to the row whose id is `id`, if there is one.
+    pub fn select(&mut self, id: &str) {
+        if let Some(index) = self.items.iter().position(|item| item.id == id) {
+            self.selected = index;
+        }
     }
 
     /// The rows.
@@ -139,7 +163,8 @@ impl Widget for &Picker {
             .max()
             .unwrap_or(0);
 
-        let width = u16::try_from(widest.max(self.title.chars().count()) + 6)
+        let hint_width = self.hint.as_ref().map_or(0, |hint| hint.chars().count());
+        let width = u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
             .unwrap_or(u16::MAX)
             .clamp(20, area.width);
         let height = u16::try_from(self.items.len() + 2)
@@ -152,10 +177,14 @@ impl Widget for &Picker {
         // rather than left showing through.
         Clear.render(rect, buf);
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
             .border_style(self.border);
+        if let Some(hint) = &self.hint {
+            block =
+                block.title_bottom(Line::styled(format!(" {hint} "), self.border).right_aligned());
+        }
         let inner = block.inner(rect);
         block.render(rect, buf);
 
