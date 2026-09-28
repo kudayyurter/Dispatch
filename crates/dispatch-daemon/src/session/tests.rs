@@ -334,24 +334,27 @@ fn pane_output_reaches_the_client() {
     assert!(!seen.is_empty());
 }
 
-/// Round 3, item 3: `fit` must send what the daemon has already read for a
-/// pane before it broadcasts `PaneResized`, not only what `pump_panes`
-/// happens to have drained by the time a resize lands -- a tick drains a
-/// bounded amount, so output already read can still be waiting.
+/// Waits, without ticking the daemon, until it has read some of `pane`'s
+/// output and not yet sent it: what a resize then has to deal with.
 ///
-/// These tests drive a real shell process, so there is no way to know the
-/// instant its reader thread -- which runs on its own, independent of
-/// anything a test calls -- has pushed a write's output into the pane's
-/// channel; only `dispatch-pty`'s own tests can fill that channel directly
-/// and know exactly how much is waiting (see `drain_from`'s doc, in
-/// `dispatch-pty`). This sleeps long enough for a one-line `sh` command to
-/// run and be read, then resizes through `request_for_test`, which -- unlike
-/// `Daemon::tick` -- never calls `pump_panes` on its own. So the marker's
-/// `PaneOutput` can only appear at this point if `fit` drained it itself;
-/// the sleep is the only non-determinism, and it fails safe -- too short
-/// just means the marker is still missing, the same as the bug this pins.
+/// A bounded poll rather than a fixed sleep, so a slow machine waits longer
+/// instead of failing. `request_for_test`, unlike `Daemon::tick`, never
+/// drains panes on its own, so what is waiting stays waiting.
+fn until_output_is_waiting(daemon: &Daemon, pane: PaneId) {
+    let deadline = Instant::now() + WAIT_FOR_DEADLINE;
+    while daemon.pane_waiting_for_test(pane) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the pane's output was never read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `fit` must send what the daemon has already read for a pane before it
+/// broadcasts `PaneResized`, not only what `pump_panes` happens to have
+/// drained by the time a resize lands: a tick drains a bounded amount.
 #[test]
-#[cfg(unix)]
 fn fit_sends_what_it_already_read_before_it_resizes() {
     let (mut daemon, project, _dir) = daemon("fit-drains-first");
     let ui = daemon.attach_for_test(1);
@@ -367,7 +370,7 @@ fn fit_sends_what_it_already_read_before_it_resizes() {
             bytes: b"echo before-resize-marker\r".to_vec(),
         },
     );
-    std::thread::sleep(Duration::from_millis(300));
+    until_output_is_waiting(&daemon, pane);
 
     daemon.request_for_test(
         1,
@@ -377,15 +380,12 @@ fn fit_sends_what_it_already_read_before_it_resizes() {
         },
     );
 
+    // Nothing ticked the daemon since the output was read, so any output
+    // here was sent by the resize itself.
     let seen = drain(&ui);
-    let output_at = seen.iter().position(|m| {
-        matches!(
-            m,
-            ServerMessage::PaneOutput { pane: p, bytes }
-                if *p == pane
-                    && String::from_utf8_lossy(bytes).contains("before-resize-marker")
-        )
-    });
+    let output_at = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneOutput { pane: p, .. } if *p == pane));
     let resized_at = seen.iter().position(|m| {
         matches!(
             m,
@@ -395,8 +395,7 @@ fn fit_sends_what_it_already_read_before_it_resizes() {
 
     assert!(
         output_at.is_some(),
-        "the marker never arrived before the resize -- fit did not drain what \
-         the daemon had already read: {seen:#?}"
+        "fit did not send what the daemon had already read: {seen:#?}"
     );
     assert!(
         resized_at.is_some(),
@@ -406,6 +405,52 @@ fn fit_sends_what_it_already_read_before_it_resizes() {
         output_at < resized_at,
         "output the daemon had already read must reach every window before \
          PaneResized, not after: {seen:#?}"
+    );
+}
+
+#[test]
+fn a_window_leaving_while_its_pane_is_resized_leaves_the_right_size() {
+    // Sending a pane's waiting output ahead of a resize can hang up a window
+    // that has fallen behind. If that window was the one deciding the size,
+    // its departure hands the pane to the next window mid-resize, and the
+    // resize must not then go ahead with the size of the window that left.
+    let (mut daemon, project, _dir) = daemon("fit-decider-leaves");
+    let first = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &first, project);
+    // Window 2 is never read from here on: it is the one that falls behind.
+    let _second = attach_window(&mut daemon, 2);
+    // Window 1's size takes hold (window 2 has asked for none), and the
+    // `PaneResized` saying so is left queued, unread, for window 2: traffic
+    // it is behind on.
+    ask_size(&mut daemon, 1, pane, 90, 28);
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(90, 28)));
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"echo waiting\r".to_vec(),
+        },
+    );
+    until_output_is_waiting(&daemon, pane);
+    daemon.request_for_test(2, ClientMessage::Active);
+    let _ = drain(&first);
+
+    // Past this point, a client with anything live queued and unread is
+    // `Refused::Behind` on its next send: window 2 is, window 1 is not.
+    daemon.set_budgets(Budgets {
+        outbox_bytes: 0,
+        ..Budgets::default()
+    });
+
+    // Window 2, the one in use, asks for 60x20. Sending the waiting output
+    // first hangs it up, and the pane goes back to window 1's size.
+    ask_size(&mut daemon, 2, pane, 60, 20);
+
+    assert_eq!(
+        daemon.pane_size_for_test(pane),
+        Some(Size::new(90, 28)),
+        "window 2 was hung up before its size took hold, so window 1's stands"
     );
 }
 

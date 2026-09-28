@@ -155,6 +155,11 @@ impl Backlog {
         self.room.notify_all();
     }
 
+    /// How much is waiting now, in bytes plus [`READ_OVERHEAD`] per read.
+    fn weight(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).weight
+    }
+
     /// Nothing drains any more. A reader waiting for room is woken, and
     /// never waits again.
     fn close(&self) {
@@ -379,6 +384,17 @@ impl Pty {
             self.finished = true;
         }
         drained.output
+    }
+
+    /// How much output has been read from the child and not yet drained, in
+    /// bytes plus a fixed overhead per read. Zero means a [`Pty::drain`] now
+    /// would return nothing.
+    ///
+    /// Takes nothing: for a caller that has to know output is waiting without
+    /// taking it, as a test of what happens to it next does.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.backlog.weight()
     }
 
     /// Whether the child exited *and* everything it printed has been delivered.

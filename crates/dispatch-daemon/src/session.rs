@@ -919,9 +919,19 @@ impl Daemon {
             self.broadcast(message);
         }
 
+        // Decided again, from what is true now: a window hung up above may
+        // have been the one deciding, and the `fit` its departure re-entered
+        // has already given the pane to the next window. The size chosen on
+        // the way in would undo that.
+        let Some(size) = self.sizes.wanted(pane) else {
+            return;
+        };
         let Some(target) = self.panes.get_mut(&pane) else {
             return;
         };
+        if target.session.size() == size {
+            return;
+        }
         if let Err(error) = target.session.resize(size) {
             tracing::warn!(%error, "failed to resize a pane");
             return;
@@ -2347,6 +2357,16 @@ impl Daemon {
     #[must_use]
     pub fn pane_size_for_test(&self, pane: PaneId) -> Option<Size> {
         self.panes.get(&pane).map(|target| target.session.size())
+    }
+
+    /// How much of a pane's output has been read and not yet sent, for tests
+    /// of what a resize does with it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_waiting_for_test(&self, pane: PaneId) -> usize {
+        self.panes
+            .get(&pane)
+            .map_or(0, |target| target.session.waiting())
     }
 }
 
