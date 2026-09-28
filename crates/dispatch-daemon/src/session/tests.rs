@@ -334,6 +334,81 @@ fn pane_output_reaches_the_client() {
     assert!(!seen.is_empty());
 }
 
+/// Round 3, item 3: `fit` must send what the daemon has already read for a
+/// pane before it broadcasts `PaneResized`, not only what `pump_panes`
+/// happens to have drained by the time a resize lands -- a tick drains a
+/// bounded amount, so output already read can still be waiting.
+///
+/// These tests drive a real shell process, so there is no way to know the
+/// instant its reader thread -- which runs on its own, independent of
+/// anything a test calls -- has pushed a write's output into the pane's
+/// channel; only `dispatch-pty`'s own tests can fill that channel directly
+/// and know exactly how much is waiting (see `drain_from`'s doc, in
+/// `dispatch-pty`). This sleeps long enough for a one-line `sh` command to
+/// run and be read, then resizes through `request_for_test`, which -- unlike
+/// `Daemon::tick` -- never calls `pump_panes` on its own. So the marker's
+/// `PaneOutput` can only appear at this point if `fit` drained it itself;
+/// the sleep is the only non-determinism, and it fails safe -- too short
+/// just means the marker is still missing, the same as the bug this pins.
+#[test]
+#[cfg(unix)]
+fn fit_sends_what_it_already_read_before_it_resizes() {
+    let (mut daemon, project, _dir) = daemon("fit-drains-first");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let pane = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"echo before-resize-marker\r".to_vec(),
+        },
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::ResizePane {
+            pane,
+            size: (100, 30),
+        },
+    );
+
+    let seen = drain(&ui);
+    let output_at = seen.iter().position(|m| {
+        matches!(
+            m,
+            ServerMessage::PaneOutput { pane: p, bytes }
+                if *p == pane
+                    && String::from_utf8_lossy(bytes).contains("before-resize-marker")
+        )
+    });
+    let resized_at = seen.iter().position(|m| {
+        matches!(
+            m,
+            ServerMessage::PaneResized { pane: p, size: (100, 30) } if *p == pane
+        )
+    });
+
+    assert!(
+        output_at.is_some(),
+        "the marker never arrived before the resize -- fit did not drain what \
+         the daemon had already read: {seen:#?}"
+    );
+    assert!(
+        resized_at.is_some(),
+        "the resize itself was never sent: {seen:#?}"
+    );
+    assert!(
+        output_at < resized_at,
+        "output the daemon had already read must reach every window before \
+         PaneResized, not after: {seen:#?}"
+    );
+}
+
 #[test]
 fn every_subscribed_client_sees_the_same_panes() {
     // This is what lets a MacBook and a desktop show one fleet, so output goes

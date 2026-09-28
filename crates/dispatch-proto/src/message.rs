@@ -328,9 +328,12 @@ pub enum ServerMessage {
 
     /// A pane's pty is now `size`, as `(cols, rows)`.
     ///
-    /// Sent after the pty was resized, so output drawn at the new size always
-    /// follows it on the connection, and output drawn at the old size comes
-    /// before it.
+    /// Sent after the pty was resized, and after everything the daemon had
+    /// already read from it is sent, so that always precedes this on the
+    /// connection and output drawn at the new size always follows it. Bytes
+    /// still sitting in the pty's own kernel buffer, not yet read by the
+    /// daemon at all, can still arrive after this — a program that redraws
+    /// on `SIGWINCH`, as most full-screen ones do, covers that gap itself.
     PaneResized {
         /// Which pane.
         pane: PaneId,

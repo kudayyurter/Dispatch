@@ -860,17 +860,48 @@ impl Daemon {
     ///
     /// The pty first, then the message: output the program draws at the new
     /// size then always follows the message on every connection, and output
-    /// drawn at the old size always precedes it.
+    /// drawn at the old size always precedes it. That includes output the
+    /// daemon had already read but not yet forwarded: `pump_panes` drains
+    /// only a bounded amount per tick, so bytes can be sitting read and
+    /// unsent right up to the moment a resize lands. Flushed here, before the
+    /// resize, so they are never stranded on the wrong side of it.
+    ///
+    /// `broadcast`, below, can hang up on a client that has fallen behind,
+    /// which reaches `abandon`, which forgets that client's asks and calls
+    /// this again for every pane it had sized. That re-entry is bounded --
+    /// each hang-up removes a client before recursing, so it cannot repeat
+    /// forever -- and every broadcast here still goes out in the order
+    /// queued, since a client removed mid-loop simply stops receiving the
+    /// rest.
     fn fit(&mut self, pane: PaneId) {
         let Some(size) = self.sizes.wanted(pane) else {
             return;
         };
+        let Some(current) = self.panes.get(&pane).map(|target| target.session.size()) else {
+            return;
+        };
+        if current == size {
+            return;
+        }
+
+        let mut waiting = Vec::new();
+        loop {
+            let Some(target) = self.panes.get_mut(&pane) else {
+                return;
+            };
+            let output = drain_pane_output(target);
+            if output.is_empty() {
+                break;
+            }
+            waiting.push(ServerMessage::PaneOutput { pane, bytes: output });
+        }
+        for message in waiting {
+            self.broadcast(message);
+        }
+
         let Some(target) = self.panes.get_mut(&pane) else {
             return;
         };
-        if target.session.size() == size {
-            return;
-        }
         if let Err(error) = target.session.resize(size) {
             tracing::warn!(%error, "failed to resize a pane");
             return;
@@ -1796,9 +1827,8 @@ impl Daemon {
         let mut exited = Vec::new();
 
         for (id, pane) in &mut self.panes {
-            let output = pane.session.drain();
+            let output = drain_pane_output(pane);
             if !output.is_empty() {
-                pane.remember(&output);
                 messages.push(ServerMessage::PaneOutput {
                     pane: *id,
                     bytes: output,
@@ -2126,6 +2156,20 @@ impl Daemon {
             self.hang_up(id);
         }
     }
+}
+
+/// Takes what `pane` has produced since it was last drained and records it
+/// for a client attaching later. Empty once nothing is waiting.
+///
+/// Shared by `pump_panes`, which calls this once per pane per tick, and
+/// `fit`, which calls it in a loop to flush everything already read before a
+/// resize -- see `fit`'s own doc for why.
+fn drain_pane_output(pane: &mut DaemonPane) -> Vec<u8> {
+    let output = pane.session.drain();
+    if !output.is_empty() {
+        pane.remember(&output);
+    }
+    output
 }
 
 /// The directory holding the `dispatch` client binary, when it sits beside this
