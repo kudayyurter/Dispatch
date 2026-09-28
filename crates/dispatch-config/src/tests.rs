@@ -601,26 +601,36 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
     // Byte for byte what each release wrote, oldest first: an installation
     // made at any of them and never edited has one of these, and the unsafe
     // Windows form in all but the first.
-    let written_before: [(&str, [&str; 5]); 2] = [
+    let written_before: Vec<(&str, Vec<&str>)> = vec![
         (
             "claude",
-            [
+            vec![
                 include_str!("../harnesses/superseded/claude-1.toml"),
                 include_str!("../harnesses/superseded/claude-2.toml"),
                 include_str!("../harnesses/superseded/claude-3.toml"),
                 include_str!("../harnesses/superseded/claude-4.toml"),
                 include_str!("../harnesses/superseded/claude-5.toml"),
+                include_str!("../harnesses/superseded/claude-6.toml"),
             ],
         ),
         (
             "codex",
-            [
+            vec![
                 include_str!("../harnesses/superseded/codex-1.toml"),
                 include_str!("../harnesses/superseded/codex-2.toml"),
                 include_str!("../harnesses/superseded/codex-3.toml"),
                 include_str!("../harnesses/superseded/codex-4.toml"),
                 include_str!("../harnesses/superseded/codex-5.toml"),
+                include_str!("../harnesses/superseded/codex-6.toml"),
             ],
+        ),
+        (
+            "agy",
+            vec![include_str!("../harnesses/superseded/agy-1.toml")],
+        ),
+        (
+            "opencode",
+            vec![include_str!("../harnesses/superseded/opencode-1.toml")],
         ),
     ];
 
@@ -1219,5 +1229,115 @@ fn reloading_keeps_the_shell() {
     assert_eq!(
         reloaded.get(SHELL).map(|def| def.launch.command.as_str()),
         Some("/bin/zsh")
+    );
+}
+
+/// The built-ins, written and loaded as a first run does.
+fn shipped() -> (TempDir, HarnessRegistry) {
+    let dir = TempDir::new("shipped-settings");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+    (dir, registry)
+}
+
+#[test]
+fn every_built_in_skips_permission_prompts_by_default() {
+    let (_dir, registry) = shipped();
+
+    for (id, flags) in [
+        ("claude", vec!["--permission-mode", "bypassPermissions"]),
+        ("codex", vec!["--dangerously-bypass-approvals-and-sandbox"]),
+        ("agy", vec!["--dangerously-skip-permissions"]),
+        ("opencode", vec!["--auto"]),
+    ] {
+        let def = registry.get(id).expect("it ships");
+        let values = def
+            .resolve(&Choices::new(), &Choices::new())
+            .expect("nothing chosen is nothing to refuse");
+
+        assert_eq!(def.launch_with("linux", &values).args, flags, "{id}");
+
+        let windows = def.launch_with("windows", &values).args;
+        assert_eq!(windows[..2], ["/c", id], "{id}");
+        assert_eq!(windows[2..], flags[..], "{id}");
+    }
+}
+
+#[test]
+fn built_in_models_and_efforts_ship_unset() {
+    // Each agent keeps its own default, and whatever its own configuration
+    // says, until the user saves one.
+    let (_dir, registry) = shipped();
+
+    for def in registry.all().filter(|def| def.id != SHELL) {
+        let values = def
+            .resolve(&Choices::new(), &Choices::new())
+            .expect("nothing chosen");
+        for key in ["model", "effort"] {
+            if let Some(value) = values.get(key) {
+                assert_eq!(value, "", "{}'s {key}", def.id);
+            }
+        }
+        assert!(values.contains_key("model"), "{} offers a model", def.id);
+    }
+}
+
+#[test]
+fn no_built_in_setting_or_option_is_dropped_on_load() {
+    // A shipped option the character rule refused would vanish quietly from
+    // the popup.
+    let (_dir, registry) = shipped();
+
+    for built_in in defaults::BUILT_INS {
+        let raw: HarnessDef = toml::from_str(built_in.toml).expect("it parses");
+        assert!(!raw.settings.is_empty(), "{} ships settings", built_in.id);
+        assert_eq!(
+            registry.get(built_in.id).expect("it loads").settings,
+            raw.settings,
+            "{}",
+            built_in.id
+        );
+    }
+}
+
+#[test]
+fn a_delegated_built_in_skips_its_prompts_too() {
+    // A one-shot agent that must ask before using a tool has nobody to ask.
+    let (_dir, registry) = shipped();
+
+    for (id, expected) in [
+        (
+            "claude",
+            vec!["-p", "x", "--permission-mode", "bypassPermissions"],
+        ),
+        (
+            "codex",
+            vec!["exec", "x", "--dangerously-bypass-approvals-and-sandbox"],
+        ),
+    ] {
+        let def = registry.get(id).expect("it ships");
+        let values = def
+            .resolve(&Choices::new(), &Choices::new())
+            .expect("nothing chosen");
+        let run = def
+            .task_launch_with("linux", "x", &values)
+            .expect("it can be delegated to");
+        assert_eq!(run.launch.args, expected, "{id}");
+    }
+
+    let claude = registry.get("claude").expect("it ships");
+    let values = claude
+        .resolve(&Choices::new(), &Choices::new())
+        .expect("nothing chosen");
+    let windows = claude
+        .task_launch_with("windows", "x", &values)
+        .expect("it can be delegated to on Windows");
+    assert_eq!(
+        windows.launch.args[windows.launch.args.len() - 3..],
+        [
+            "<%DISPATCH_TASK_FILE%",
+            "--permission-mode",
+            "bypassPermissions"
+        ]
     );
 }

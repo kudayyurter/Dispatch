@@ -8,7 +8,19 @@ args = []
 command = "cmd.exe"
 args = ["/c", "opencode"]
 
+# opencode's interactive mode has no model flag; its inline configuration
+# variable carries one instead. It knows about two hundred models, too many
+# to ship, so the model is typed, as provider/model with an optional
+# #variant.
 [[settings]]
 key = "model"
 label = "Model"
 kind = "text"
+env = { OPENCODE_CONFIG_CONTENT = '{"model":"{value}"}' }
+
+[[settings]]
+key = "bypass"
+label = "Auto-approve"
+kind = "bool"
+default = true
+args = ["--auto"]

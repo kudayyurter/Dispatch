@@ -17,14 +17,28 @@ args = ["exec", "{task}"]
 args = ["/d", "/v:off", "/c", "codex", "exec", "-", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 
+# See claude.toml for how settings become flags.
 [[settings]]
 key = "model"
 label = "Model"
-kind = "text"
+kind = "choice"
+options = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+custom = true
+args = ["-m", "{value}"]
 
+# -c parses its value as TOML and falls back to the raw string, so the level
+# needs no quotes, which would sit on cmd.exe's command line on Windows.
 [[settings]]
 key = "effort"
-label = "Reasoning effort"
+label = "Effort"
 kind = "choice"
-options = ["low", "medium", "high"]
-default = "medium"
+options = ["low", "medium", "high", "xhigh", "max", "ultra"]
+args = ["-c", "model_reasoning_effort={value}"]
+
+# Codex's only way to skip every prompt also drops its sandbox.
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--dangerously-bypass-approvals-and-sandbox"]

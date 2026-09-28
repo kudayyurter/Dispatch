@@ -1,0 +1,9 @@
+id = "agy"
+icon = ""
+display_name = "agy"
+command = "agy"
+args = []
+
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "agy"]
