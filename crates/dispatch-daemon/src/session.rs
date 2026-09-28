@@ -784,8 +784,18 @@ impl Daemon {
                     );
                     return;
                 }
-                self.sizes.ask(id, pane, Size::new(size.0, size.1));
-                self.fit(pane);
+                // A `dispatch delegate` connection never decides a pane's
+                // size: it is not a window, and nobody is looking at it.
+                // Ignored silently rather than answered with an error, since
+                // this is not a mistake a well-behaved client makes.
+                if self
+                    .clients
+                    .get(&id)
+                    .is_some_and(|client| client.role == Role::Interface)
+                {
+                    self.sizes.ask(id, pane, Size::new(size.0, size.1));
+                    self.fit(pane);
+                }
             }
 
             ClientMessage::ClosePane { pane } => self.close_pane(id, pane),
@@ -842,8 +852,17 @@ impl Daemon {
             ClientMessage::Active => {}
 
             ClientMessage::HidePane { pane } => {
-                self.sizes.hide(id, pane);
-                self.fit(pane);
+                // Gated the same way as `ResizePane`, for symmetry: a
+                // delegate connection never has an entry here to withdraw in
+                // the first place, since it can never make one.
+                if self
+                    .clients
+                    .get(&id)
+                    .is_some_and(|client| client.role == Role::Interface)
+                {
+                    self.sizes.hide(id, pane);
+                    self.fit(pane);
+                }
             }
 
             ClientMessage::Unknown => {

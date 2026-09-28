@@ -5590,3 +5590,40 @@ fn a_delegate_connection_never_decides_a_size() {
 
     assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(60, 20)));
 }
+
+/// Round 3, item 4: with no interface window asking for a pane at all, a
+/// delegate connection's own `ResizePane` must still not decide it -- the
+/// test above only shows a delegate loses to an interface window that
+/// outranks it, not that a delegate is refused outright.
+#[test]
+fn a_delegate_connection_never_sizes_a_pane_nobody_else_asks_for() {
+    let (mut daemon, project, _dir) = daemon("size-delegate-alone");
+    let ui = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &ui, project);
+    // Withdraws the ask `SpawnPane` recorded on its own, so nothing but the
+    // delegate connection below ever asks for this pane's size.
+    daemon.request_for_test(1, ClientMessage::HidePane { pane });
+    let before = daemon.pane_size_for_test(pane);
+
+    // Kept alive for the rest of the test: dropped, its `Outbox::send_all`
+    // for the `Welcome` reply below would fail as `Refused::Gone`, which
+    // forgets the client outright and would make the `ResizePane` after it
+    // a no-op for a reason that has nothing to do with what this pins.
+    let _caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    ask_size(&mut daemon, 9, pane, 40, 10);
+
+    assert_eq!(
+        daemon.pane_size_for_test(pane),
+        before,
+        "a pane no interface window has a size for keeps the size it has, \
+         not whatever a delegate connection last asked"
+    );
+}
