@@ -3529,8 +3529,8 @@ impl App {
     /// A pane that tracks the mouse receives the event. One that does not gets
     /// nothing, and a wheel event then scrolls its scrollback instead, which
     /// is what a terminal without mouse tracking does.
-    fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
-        use dispatch_pty::MouseButton;
+    fn send_mouse(&mut self, id: PaneId, mut input: MouseInput) {
+        use dispatch_pty::{MouseAction, MouseButton};
 
         let now = self.now();
         let wheel = match input.button {
@@ -3570,10 +3570,25 @@ impl App {
         // not an accident of however the encoder currently draws its own
         // line, and it holds even if a future encoder clamps everywhere.
         if input.col >= size.cols || input.row >= size.rows {
-            if let Some(rows) = wheel {
-                self.scroll_pane(id, rows);
+            match input.action {
+                // A release, or a drag with a button held, can have started
+                // inside the pane and wandered out here — dropping it would
+                // leave the program's selection stuck with no release ever
+                // delivered. Clamped to the pane's last cell and forwarded,
+                // the same as a real terminal does at its own edge.
+                MouseAction::Release | MouseAction::Motion => {
+                    input.col = size.cols.saturating_sub(1);
+                    input.row = size.rows.saturating_sub(1);
+                }
+                // A fresh press past the edge lands on nothing the program
+                // drew, and a wheel there scrolls this client's own copy.
+                MouseAction::Press => {
+                    if let Some(rows) = wheel {
+                        self.scroll_pane(id, rows);
+                    }
+                    return;
+                }
             }
-            return;
         }
 
         let bytes = match pane.mouse.encode(pane.backend.terminal(), size, input) {
@@ -5610,6 +5625,66 @@ mod tests {
         assert!(
             !app.panes[&pane].scrolled_back,
             "and does not also scroll this client's own copy"
+        );
+    }
+
+    #[test]
+    fn a_release_or_drag_past_the_edge_of_a_smaller_pane_still_reaches_it() {
+        // A drag that starts in a pane's content and wanders into the
+        // padding another window's window left it with must still deliver
+        // its release, or the program's selection is left stuck there
+        // forever. Only a fresh press past the edge is dropped.
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 10, 5);
+        // The program asks for mouse reports and drag events, as an agent's
+        // interface does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h\x1b[?1002h");
+        let _ = sent.try_iter().count();
+
+        let past_the_edge = |action, button| MouseInput {
+            action,
+            button,
+            col: 20,
+            row: 2,
+            modifiers: dispatch_pty::Modifiers::default(),
+        };
+
+        app.send_mouse(
+            pane,
+            past_the_edge(dispatch_pty::MouseAction::Press, dispatch_pty::MouseButton::Left),
+        );
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a fresh press past the edge still reaches nothing"
+        );
+
+        app.send_mouse(
+            pane,
+            past_the_edge(
+                dispatch_pty::MouseAction::Motion,
+                dispatch_pty::MouseButton::Left,
+            ),
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "a drag that has wandered into the padding still reaches the program"
+        );
+
+        app.send_mouse(
+            pane,
+            past_the_edge(
+                dispatch_pty::MouseAction::Release,
+                dispatch_pty::MouseButton::Left,
+            ),
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "and its release past the edge must still be delivered"
         );
     }
 
