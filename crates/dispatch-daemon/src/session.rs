@@ -692,6 +692,7 @@ impl Daemon {
                 harness,
                 size,
                 place,
+                settings: _,
             } => self.spawn_pane(id, project, &harness, Size::new(size.0, size.1), place),
 
             ClientMessage::WritePane { pane, bytes } => {

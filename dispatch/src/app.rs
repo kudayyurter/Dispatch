@@ -1245,6 +1245,7 @@ impl App {
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
                 place,
+                settings: Default::default(),
             });
             self.status = format!("starting {display_name}…");
             return Ok(());

@@ -492,6 +492,7 @@ fn a_second_connection_is_replayed_what_a_pane_printed() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");
@@ -585,6 +586,7 @@ fn a_client_drives_a_pane_through_the_socket() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");
@@ -661,6 +663,7 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");

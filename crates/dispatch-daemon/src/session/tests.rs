@@ -268,6 +268,7 @@ fn spawning_a_pane_starts_a_process_and_tells_the_client() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -298,6 +299,7 @@ fn pane_output_reaches_the_client() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -356,6 +358,7 @@ fn every_subscribed_client_sees_the_same_panes() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     daemon.tick();
@@ -390,6 +393,7 @@ fn a_client_that_has_not_subscribed_is_left_quiet() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     daemon.tick();
@@ -417,6 +421,7 @@ fn a_client_attaching_later_is_told_what_already_exists() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &first, |m| {
@@ -452,6 +457,7 @@ fn panes_outlive_the_client_that_started_them() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -482,6 +488,7 @@ fn closing_a_pane_removes_it_and_tells_everyone() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -549,6 +556,7 @@ fn spawning_into_an_unknown_project_is_reported() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -574,6 +582,7 @@ fn spawning_an_unknown_harness_is_reported_with_its_name() {
             harness: "nonexistent".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -605,6 +614,7 @@ fn an_exited_pane_is_reported_and_kept() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -670,6 +680,7 @@ fn a_requested_shutdown_stops_the_loop_and_kills_the_panes() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -729,6 +740,7 @@ fn a_subscriber_is_told_the_projects_before_the_panes() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -929,6 +941,7 @@ fn a_client_attaching_later_is_replayed_what_a_pane_printed() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -980,6 +993,7 @@ fn a_pane_remembers_only_its_most_recent_output() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -1026,6 +1040,7 @@ fn a_client_attaching_after_a_pane_exited_is_told_it_exited() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -1103,6 +1118,7 @@ fn spawn_pane_for_test(daemon: &mut Daemon, inbox: &Inbox, project: ProjectId) -
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -2122,6 +2138,7 @@ fn a_project_with_panes_is_not_closed() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -2351,6 +2368,7 @@ fn spawn_request(project: ProjectId) -> ClientMessage {
         harness: "shell".into(),
         size: (80, 24),
         place: Placement::Auto,
+        settings: Default::default(),
     }
 }
 
@@ -2457,6 +2475,7 @@ fn a_stalled_pane_does_not_stall_the_daemon() {
             harness: "stall".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     let seen = wait_for(&mut daemon, &ui, |m| {
@@ -2802,6 +2821,7 @@ fn a_client_that_never_reads_costs_no_more_than_its_budget() {
             harness: "flood".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -2883,6 +2903,7 @@ fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
             harness: "count".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");
@@ -2971,6 +2992,7 @@ fn a_late_subscriber_is_not_hung_up_for_the_replay_it_asked_for() {
             harness: "flood".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -3373,6 +3395,7 @@ fn a_seat_held_by_a_stuck_writer_is_freed_once_the_daemon_notices() {
             harness: "flood".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");
@@ -3473,6 +3496,7 @@ fn a_seat_held_by_a_refused_clients_stuck_writer_is_not_released_early() {
             harness: "flood".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     )
     .expect("writing succeeds");
@@ -3564,6 +3588,7 @@ fn shutting_down_ends_every_panes_whole_tree() {
             harness: "tree".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -4441,6 +4466,7 @@ fn a_pane_reports_the_branch_of_the_directory_its_shell_is_in() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
 
@@ -4491,6 +4517,7 @@ fn an_exited_pane_keeps_the_branch_it_last_had() {
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Auto,
+            settings: Default::default(),
         },
     );
     let seen = wait_for(&mut daemon, &inbox, |messages| {
@@ -4584,6 +4611,7 @@ fn spawn_placed(
             harness: "shell".into(),
             size: (80, 24),
             place,
+            settings: Default::default(),
         },
     );
 
@@ -5015,6 +5043,7 @@ fn tab_commands(
             harness: "shell".into(),
             size: (80, 24),
             place: Placement::Into { tab: first },
+            settings: Default::default(),
         },
         ClientMessage::MovePane {
             pane,
