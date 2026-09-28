@@ -214,6 +214,10 @@ A model that is not on the list is typed on the setting's **Custom…** value.
 configuration says. Beside each harness, the picker shows what you have saved
 that differs from its file.
 
+opencode takes its model from a variable its shared background service never
+sees, so an opencode pane with a chosen model runs a private opencode server
+of its own.
+
 Saved defaults live beside `config.toml`:
 
 ```toml

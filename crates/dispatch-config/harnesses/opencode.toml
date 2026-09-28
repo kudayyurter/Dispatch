@@ -9,13 +9,16 @@ command = "cmd.exe"
 args = ["/c", "opencode"]
 
 # opencode's interactive mode has no model flag; its inline configuration
-# variable carries one instead. It knows about two hundred models, too many
-# to ship, so the model is typed, as provider/model with an optional
-# #variant.
+# variable carries one instead. The shared background service a pane
+# normally talks to never sees a variable set on the pane, so a chosen model
+# also starts the pane with a private server of its own (--standalone),
+# which reads it. It knows about two hundred models, too many to ship, so
+# the model is typed, as provider/model with an optional #variant.
 [[settings]]
 key = "model"
 label = "Model"
 kind = "text"
+args = ["--standalone"]
 env = { OPENCODE_CONFIG_CONTENT = '{"model":"{value}"}' }
 
 [[settings]]

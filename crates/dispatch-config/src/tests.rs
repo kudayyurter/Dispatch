@@ -1341,3 +1341,40 @@ fn a_delegated_built_in_skips_its_prompts_too() {
         ]
     );
 }
+
+#[test]
+fn opencodes_model_reaches_it_through_a_private_server() {
+    // opencode's shared background service never sees a variable set on the
+    // terminal client; a private server, started with --standalone, reads it.
+    let (_dir, registry) = shipped();
+    let opencode = registry.get("opencode").expect("it ships");
+
+    let chosen: Choices = [(
+        "model".to_string(),
+        "google/gemini-3.5-flash-lite".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let values = opencode
+        .resolve(&chosen, &Choices::new())
+        .expect("a typed model is usable");
+    let launch = opencode.launch_with("linux", &values);
+
+    assert_eq!(launch.args, vec!["--standalone", "--auto"]);
+    assert_eq!(
+        launch
+            .env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"model":"google/gemini-3.5-flash-lite"}"#)
+    );
+
+    let defaults = opencode
+        .resolve(&Choices::new(), &Choices::new())
+        .expect("nothing chosen");
+    assert_eq!(
+        opencode.launch_with("linux", &defaults).args,
+        vec!["--auto"],
+        "with no model chosen, the pane uses the shared service"
+    );
+}

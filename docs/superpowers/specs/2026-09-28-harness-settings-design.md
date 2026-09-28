@@ -202,6 +202,7 @@ args = ["--dangerously-skip-permissions"]
 key = "model"
 label = "Model"
 kind = "text"
+args = ["--standalone"]
 env = { OPENCODE_CONFIG_CONTENT = '{"model":"{value}"}' }
 
 [[settings]]
@@ -212,12 +213,12 @@ default = true
 args = ["--auto"]
 ```
 
-opencode's model row must be **verified by hand before it ships**. Its
-interactive mode connects to a background service, and a variable set on the
-terminal client may never reach that service. If it does not, the fallback is
-to add `"--standalone"` to the setting's `args`, which gives the pane a
-private server that does read the variable. If neither works, the row is
-removed and opencode's popup shows only Auto-approve.
+opencode's model row was checked by hand on 2026-09-28. Through the shared
+background service, the variable was ignored: the session used opencode's
+default model. With `--standalone` it was read. So the model setting also
+passes `--standalone`, and an opencode pane with a chosen model runs a
+private server of its own. With no model chosen, the pane uses the shared
+service as before.
 
 The model and effort lists above are what each CLI reported on 2026-09-28:
 `claude --help`, `codex debug models`, and `agy models`.
