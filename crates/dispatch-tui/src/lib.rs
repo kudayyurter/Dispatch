@@ -8,6 +8,7 @@ pub mod motion;
 pub mod pane;
 pub mod picker;
 pub mod prompt;
+pub mod settings_form;
 pub mod sidebar;
 pub mod theme;
 
@@ -16,5 +17,6 @@ pub use keymap::{Chord, Command, Keymap};
 pub use pane::PaneWidget;
 pub use picker::{Item, Picker};
 pub use prompt::{Note, Prompt};
+pub use settings_form::{FormAction, SettingsForm};
 pub use sidebar::{Sidebar, truncate};
 pub use theme::Theme;
