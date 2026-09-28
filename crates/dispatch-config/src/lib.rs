@@ -3,6 +3,7 @@
 pub mod config;
 pub mod defaults;
 pub mod harness;
+pub mod harness_settings;
 pub mod machines;
 pub mod projects;
 pub mod settings;
