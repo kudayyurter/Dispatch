@@ -1,6 +1,6 @@
 # Harness settings: auto-approve by default, and a model/effort popup
 
-Status: designed, not yet planned.
+Status: implemented on branch `feat/harness-settings`.
 Date: 2026-09-28.
 Branch: `feat/harness-settings`, cut from `main` at 4045531.
 

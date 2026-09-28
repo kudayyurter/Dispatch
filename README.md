@@ -45,6 +45,8 @@ its socket can do anything a client can. Delegation approval keeps
 well-meaning agents in check; it is not a sandbox for untrusted ones. See
 [docs/security-model.md](docs/security-model.md).
 
+Agents also start without their own permission prompts; see [Harness settings](#harness-settings) to turn them back on.
+
 ## Layout
 
 | Crate | Responsibility |
@@ -186,6 +188,72 @@ Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
 `COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
 runs in, so a program never sends it another terminal's private sequences.
 A harness's own `env` still wins.
+
+## Harness settings
+
+Every agent Dispatch ships starts **without its permission prompts**: Claude
+Code in `bypassPermissions` mode, Codex with
+`--dangerously-bypass-approvals-and-sandbox` (which also drops its sandbox),
+agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
+[docs/security-model.md](docs/security-model.md) before running an agent you
+do not trust this way.
+
+In the new-pane picker, `e` opens the highlighted harness's settings:
+
+| Key | Does |
+|---|---|
+| `↑` `↓` | move between settings |
+| `←` `→` | step through a setting's values; `Space` flips one that is on or off |
+| `Enter` | open a pane with what is shown, saving nothing |
+| `s` | save what is shown as the harness's default |
+| `Esc` | back to the picker |
+
+A model that is not on the list is typed on the setting's **Custom…** value.
+**agent default** passes nothing, and the agent decides as its own
+configuration says. Beside each harness, the picker shows what you have saved
+that differs from its file.
+
+Saved defaults live beside `config.toml`:
+
+```toml
+# ~/.config/dispatch/harness-settings.toml
+[claude]
+model = "opus"
+permissions = ""   # agent default: Claude asks, as it does outside Dispatch
+
+[codex]
+bypass = false     # Codex's prompts and sandbox are back
+```
+
+A subagent started by `dispatch delegate` uses them too.
+
+A harness file says what its settings are, and how each becomes a flag, so a
+harness you add can have them as well:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"                 # choice | text | bool
+options = ["low", "medium", "high", "xhigh", "max"]
+custom = false                  # true adds a typed value to a choice
+args = ["--effort", "{value}"]  # after the launch's own; nothing when unset
+# env = { NAME = "{value}" }    # or a variable
+
+[[settings]]
+key = "permissions"
+label = "Permissions"
+kind = "choice"
+options = ["bypassPermissions", "auto", "acceptEdits", "plan", "manual"]
+default = "bypassPermissions"
+args = ["--permission-mode", "{value}"]
+```
+
+A `bool` adds its `args` when it is on. A value may hold only letters, digits
+and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
+`cmd.exe`'s command line. The daemon reads harness files when it starts, so
+restart it after editing one.
 
 ## The sidebar
 
@@ -417,7 +485,8 @@ args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 ```
 
-`claude` and `codex` ship with one. On Windows the daemon refuses a form that
+`claude` and `codex` ship with one. A subagent starts with the harness's saved settings, auto-approve included, so it can use its tools without waiting on a prompt nobody would see.
+On Windows the daemon refuses a form that
 would put the task on `cmd.exe`'s command line, and says which file to fix.
 Caps live in `config.toml`, and refuse rather than prompt:
 

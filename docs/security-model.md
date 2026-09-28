@@ -38,6 +38,24 @@ If the agents themselves are not trusted, run them under an operating-system
 boundary — a separate user, a container, a VM — and give that boundary its
 own daemon. A role check or a token in the environment would not be one.
 
+## Agents start without permission prompts
+
+Every harness Dispatch ships starts its agent in that agent's own
+auto-approve mode: Claude Code's `bypassPermissions`, Codex's
+`--dangerously-bypass-approvals-and-sandbox`, agy's
+`--dangerously-skip-permissions`, opencode's `--auto`. An agent can then edit
+files, run commands and reach the network as the user without asking first.
+Codex's flag also turns off the sandbox it would otherwise run commands in.
+A subagent started by delegation runs the same way: approval decides whether
+it starts, not what it may do once it has.
+
+This trades a guard rail for flow, and the user can trade it back. In the
+new-pane picker, `e` on a harness opens its settings. Set Claude's
+**Permissions** to another mode, or turn **Skip prompts** or
+**Auto-approve** off, then press `s` to save the agent's own prompts as that
+harness's default. The advice above stands: an agent that is not trusted
+belongs under an operating-system boundary, not behind its own prompts.
+
 ## Opening a project means trusting it
 
 Agents run inside the project directory and read its configuration. On
