@@ -5446,6 +5446,10 @@ fn a_setting_the_harness_does_not_have_is_refused_and_nothing_starts() {
 
     let text = error_text(&drain(&inbox)).expect("the spawn is refused");
     assert!(text.contains("colour"), "{text}");
+    assert_eq!(
+        text, "not starting a pane: shell has no setting \"colour\"",
+        "{text}"
+    );
     assert_eq!(daemon.pane_count(), 0);
 }
 

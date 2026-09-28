@@ -966,7 +966,10 @@ impl Daemon {
                 self.send(
                     client,
                     ServerMessage::Error {
-                        error: ProtocolError::Other(format!("not starting {harness}: {reason}")),
+                        // `reason` already names the harness (`HarnessDef::resolve`
+                        // puts it first), so naming it again here would read as
+                        // "not starting claude: claude: …".
+                        error: ProtocolError::Other(format!("not starting a pane: {reason}")),
                     },
                 );
                 return;
