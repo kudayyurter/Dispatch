@@ -272,6 +272,7 @@ fn main() -> Result<ExitCode> {
 
     // Set before the projects are added, so opening one is what keeps it.
     app.keep_projects_in(&config_dir);
+    app.keep_settings_in(&config_dir);
 
     // Browsing starts next to the project Dispatch was pointed at: a second
     // project usually lives beside the first, not in whatever directory the
