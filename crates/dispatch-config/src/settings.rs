@@ -5,7 +5,14 @@
 //! `{value}` standing for the value -- so a harness Dispatch has never seen
 //! gets a settings popup from its file alone.
 
-use crate::harness::{SettingDef, SettingKind};
+use std::collections::BTreeMap;
+
+use crate::harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskRun};
+
+/// Each setting's value, by key, as the popup, the saved file and the
+/// protocol carry it: a choice or text as itself, `""` for agent default,
+/// and a flag as `"true"` or `"false"`.
+pub type Choices = BTreeMap<String, String>;
 
 /// What a value may be made of, for telling the user.
 pub const SAFE_CHARACTERS: &str = "letters, digits and . _ : / @ # + -, not starting with -";
@@ -200,6 +207,153 @@ pub(crate) fn usable(id: &str, settings: Vec<SettingDef>) -> Vec<SettingDef> {
 /// Logs a setting left out of harness `id`, and why.
 fn skip(id: &str, key: &str, reason: &str) {
     tracing::warn!(harness = id, setting = key, reason, "skipping a setting");
+}
+
+impl HarnessDef {
+    /// The values in `saved` this harness can take.
+    ///
+    /// A key it has no setting for, or a value that setting cannot take, is
+    /// logged and left out: the saved file is the user's, and a stale entry
+    /// in it must not stop the harness opening.
+    #[must_use]
+    pub fn usable_saved(&self, saved: &Choices) -> Choices {
+        saved
+            .iter()
+            .filter(|(key, value)| {
+                let Some(setting) = self.settings.iter().find(|setting| &setting.key == *key)
+                else {
+                    tracing::info!(
+                        harness = %self.id,
+                        setting = %key,
+                        "ignoring a saved value for a setting this harness does not have"
+                    );
+                    return false;
+                };
+                match setting.check(value) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        tracing::warn!(harness = %self.id, %reason, "ignoring a saved value");
+                        false
+                    }
+                }
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Each setting's value for one launch: what was `chosen` for it, else
+    /// what was `saved`, else the file's default.
+    ///
+    /// A `chosen` value this harness cannot take is refused, naming the
+    /// setting. It comes from whoever asked for the pane, and dropping it
+    /// quietly could start an agent with its prompts off when the user
+    /// turned them on. A `saved` one is only left out, as
+    /// [`HarnessDef::usable_saved`] says.
+    pub fn resolve(&self, chosen: &Choices, saved: &Choices) -> Result<Choices, String> {
+        if let Some(key) = chosen
+            .keys()
+            .find(|key| !self.settings.iter().any(|setting| &setting.key == *key))
+        {
+            return Err(format!("{} has no setting {key:?}", self.id));
+        }
+
+        let saved = self.usable_saved(saved);
+        let mut values = Choices::new();
+        for setting in &self.settings {
+            let value = match chosen.get(&setting.key) {
+                Some(value) => {
+                    setting
+                        .check(value)
+                        .map_err(|reason| format!("{}: {reason}", self.id))?;
+                    value.clone()
+                }
+                None => saved
+                    .get(&setting.key)
+                    .cloned()
+                    .unwrap_or_else(|| setting.file_default()),
+            };
+            values.insert(setting.key.clone(), value);
+        }
+
+        Ok(values)
+    }
+
+    /// The launch for `os`, with the flags and variables `values` turn on
+    /// added after its own.
+    #[must_use]
+    pub fn launch_with(&self, os: &str, values: &Choices) -> Launch {
+        let mut launch = self.launch_for(os);
+        self.apply_settings(&mut launch, values);
+        launch
+    }
+
+    /// The one-shot run of `task` on `os`, with the flags and variables
+    /// `values` turn on added after its own.
+    ///
+    /// A subagent gets them as an interactive pane does: without them, a
+    /// one-shot agent that must ask before using a tool cannot ask anyone.
+    #[must_use]
+    pub fn task_launch_with(&self, os: &str, task: &str, values: &Choices) -> Option<TaskRun> {
+        let mut run = self.task_launch_for(os, task)?;
+        self.apply_settings(&mut run.launch, values);
+        Some(run)
+    }
+
+    /// Each value in `values` that differs from the file's default, as the
+    /// new-pane picker names it beside the harness: a choice or text as
+    /// itself, agent default and flags by their label.
+    #[must_use]
+    pub fn describe_changes(&self, values: &Choices) -> Vec<String> {
+        self.settings
+            .iter()
+            .filter_map(|setting| {
+                let value = values.get(&setting.key)?;
+                if *value == setting.file_default() {
+                    return None;
+                }
+                Some(if setting.is_flag() {
+                    let state = if value == "true" { "on" } else { "off" };
+                    format!("{} {state}", setting.label)
+                } else if value.is_empty() {
+                    format!("{} agent default", setting.label)
+                } else {
+                    value.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// Adds to `launch` what each setting's value in `values` turns on.
+    fn apply_settings(&self, launch: &mut Launch, values: &Choices) {
+        for setting in &self.settings {
+            let value = values.get(&setting.key).map_or("", String::as_str);
+
+            // Checked again, however `values` was come by: what is added
+            // lands on a command line cmd.exe parses.
+            if let Err(reason) = setting.check(value) {
+                tracing::warn!(harness = %self.id, %reason, "leaving out a setting");
+                continue;
+            }
+
+            let on = if setting.is_flag() {
+                value == "true"
+            } else {
+                !value.is_empty()
+            };
+            if !on {
+                continue;
+            }
+
+            launch
+                .args
+                .extend(setting.args.iter().map(|arg| arg.replace(VALUE, value)));
+            for (name, template) in &setting.env {
+                launch
+                    .env
+                    .insert(name.clone(), template.replace(VALUE, value));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

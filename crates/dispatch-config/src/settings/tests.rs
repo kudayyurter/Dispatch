@@ -296,3 +296,245 @@ args = ["--model", "{value}"]
     assert!(model.check("provider/model#high").is_ok());
     assert!(model.check("-x").is_err());
 }
+
+/// A permission setting with a default of its own, as Claude's has.
+const PERMISSIONS: &str = r#"
+[[settings]]
+key = "permissions"
+label = "Permissions"
+kind = "choice"
+options = ["ask", "never"]
+default = "never"
+args = ["--permissions", "{value}"]
+"#;
+
+/// `pairs` as [`Choices`].
+fn values(pairs: &[(&str, &str)]) -> Choices {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+#[test]
+fn what_was_chosen_beats_what_was_saved_which_beats_the_files_default() {
+    let def = demo_harness(DEMO_SETTINGS);
+
+    let resolved = def
+        .resolve(
+            &values(&[("model", "large")]),
+            &values(&[("model", "small"), ("effort", "high")]),
+        )
+        .expect("every value is usable");
+
+    assert_eq!(
+        resolved,
+        values(&[("model", "large"), ("effort", "high"), ("bypass", "true")])
+    );
+}
+
+#[test]
+fn agent_default_saved_over_a_files_default_stays_agent_default() {
+    let def = demo_harness(PERMISSIONS);
+
+    let resolved = def
+        .resolve(&Choices::new(), &values(&[("permissions", "")]))
+        .expect("agent default is usable");
+
+    assert_eq!(resolved, values(&[("permissions", "")]));
+    assert_eq!(
+        def.launch_with("linux", &resolved).args,
+        vec!["--tui"],
+        "agent default passes nothing"
+    );
+}
+
+#[test]
+fn a_chosen_setting_the_harness_does_not_have_is_refused() {
+    let def = demo_harness(DEMO_SETTINGS);
+
+    let refused = def
+        .resolve(&values(&[("colour", "red")]), &Choices::new())
+        .expect_err("refused");
+
+    assert_eq!(refused, "demo has no setting \"colour\"");
+}
+
+#[test]
+fn a_chosen_value_the_setting_cannot_take_is_refused_by_name() {
+    let def = demo_harness(DEMO_SETTINGS);
+
+    for (key, value) in [
+        ("effort", "extreme"),
+        ("model", "a&b"),
+        ("model", "--yolo"),
+        ("bypass", "yes"),
+    ] {
+        let refused = def
+            .resolve(&values(&[(key, value)]), &Choices::new())
+            .expect_err("refused");
+        assert!(
+            refused.starts_with("demo: ") && refused.contains(key),
+            "{key} = {value:?}: {refused}"
+        );
+    }
+}
+
+#[test]
+fn a_saved_value_the_harness_cannot_take_is_ignored() {
+    // The saved file is the user's: a stale entry in it must not stop the
+    // harness opening.
+    let def = demo_harness(DEMO_SETTINGS);
+    let saved = values(&[("model", "large"), ("effort", "extreme"), ("colour", "red")]);
+
+    assert_eq!(def.usable_saved(&saved), values(&[("model", "large")]));
+    assert_eq!(
+        def.resolve(&Choices::new(), &saved)
+            .expect("nothing chosen"),
+        values(&[("model", "large"), ("effort", ""), ("bypass", "true")])
+    );
+}
+
+#[test]
+fn values_become_flags_after_the_launchs_own_arguments() {
+    let def = demo_harness(DEMO_SETTINGS);
+    let resolved = values(&[("model", "large"), ("effort", ""), ("bypass", "true")]);
+
+    assert_eq!(
+        def.launch_with("linux", &resolved).args,
+        vec!["--tui", "--model", "large", "--yolo"]
+    );
+}
+
+#[test]
+fn unset_values_and_flags_turned_off_add_nothing() {
+    let def = demo_harness(DEMO_SETTINGS);
+    let resolved = values(&[("model", ""), ("effort", ""), ("bypass", "false")]);
+
+    assert_eq!(def.launch_with("linux", &resolved).args, vec!["--tui"]);
+}
+
+#[test]
+fn a_windows_launch_gets_its_flags_after_the_wrapper() {
+    let def = demo_harness(DEMO_SETTINGS);
+    let resolved = values(&[("model", "large"), ("effort", ""), ("bypass", "true")]);
+
+    let launch = def.launch_with("windows", &resolved);
+
+    assert_eq!(launch.command, "cmd.exe");
+    assert_eq!(
+        launch.args,
+        vec!["/c", "demo", "--model", "large", "--yolo"]
+    );
+}
+
+#[test]
+fn a_one_shot_run_gets_the_flags_after_its_task() {
+    let def = demo_harness(DEMO_SETTINGS);
+    let resolved = values(&[("model", "large"), ("effort", ""), ("bypass", "true")]);
+
+    let run = def
+        .task_launch_with("linux", "do it", &resolved)
+        .expect("it has a task form");
+
+    assert_eq!(
+        run.launch.args,
+        vec!["-p", "do it", "--model", "large", "--yolo"]
+    );
+}
+
+#[test]
+fn a_windows_file_form_keeps_its_redirect_and_gets_the_flags() {
+    // cmd.exe reads a redirect wherever it stands, so flags after it still
+    // reach the agent, and the task still never touches the command line.
+    let def = demo_harness(DEMO_SETTINGS);
+    let resolved = values(&[("model", "large"), ("effort", ""), ("bypass", "true")]);
+
+    let run = def
+        .task_launch_with("windows", "x & y", &resolved)
+        .expect("it has a Windows task form");
+
+    assert_eq!(run.input, crate::TaskInput::File);
+    assert_eq!(
+        run.launch.args,
+        vec![
+            "/d",
+            "/c",
+            "demo",
+            "-p",
+            "<%DISPATCH_TASK_FILE%",
+            "--model",
+            "large",
+            "--yolo"
+        ]
+    );
+}
+
+#[test]
+fn a_settings_variable_carries_the_value_and_wins_over_the_harnesss_own() {
+    let def = demo_harness(
+        r#"
+[env]
+MODEL_JSON = "stale"
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "text"
+env = { MODEL_JSON = '{"model":"{value}"}' }
+"#,
+    );
+
+    let launch = def.launch_with("linux", &values(&[("model", "p/m#high")]));
+
+    assert_eq!(
+        launch.env.get("MODEL_JSON").map(String::as_str),
+        Some(r#"{"model":"p/m#high"}"#)
+    );
+}
+
+#[test]
+fn a_launch_leaves_out_a_value_that_is_not_safe_however_it_arrived() {
+    // `launch_with` is handed resolved values, but what it adds lands on a
+    // command line cmd.exe parses, so it checks again.
+    let def = demo_harness(DEMO_SETTINGS);
+
+    let launch = def.launch_with(
+        "linux",
+        &values(&[("model", "a&b"), ("effort", ""), ("bypass", "true")]),
+    );
+
+    assert_eq!(launch.args, vec!["--tui", "--yolo"]);
+}
+
+#[test]
+fn only_what_differs_from_the_files_defaults_is_described() {
+    let def = demo_harness(DEMO_SETTINGS);
+
+    assert_eq!(
+        def.describe_changes(&values(&[
+            ("model", "large"),
+            ("effort", ""),
+            ("bypass", "false")
+        ])),
+        vec!["large", "Skip prompts off"]
+    );
+    assert!(
+        def.describe_changes(&values(&[
+            ("model", ""),
+            ("effort", ""),
+            ("bypass", "true")
+        ]))
+        .is_empty()
+    );
+}
+
+#[test]
+fn agent_default_over_a_files_default_is_described_by_name() {
+    let def = demo_harness(PERMISSIONS);
+
+    assert_eq!(
+        def.describe_changes(&values(&[("permissions", "")])),
+        vec!["Permissions agent default"]
+    );
+}
