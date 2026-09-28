@@ -5634,9 +5634,9 @@ mod tests {
     #[test]
     fn a_release_or_drag_past_the_edge_of_a_smaller_pane_still_reaches_it() {
         // A drag that starts in a pane's content and wanders into the
-        // padding another window's window left it with must still deliver
-        // its release, or the program's selection is left stuck there
-        // forever. Only a fresh press past the edge is dropped.
+        // padding another window's size left it with must still deliver its
+        // release, or the program's selection is left stuck there forever.
+        // Only a fresh press past the edge is dropped.
         let (mut app, project, daemon, sent) = attached_app();
         let pane = spawn_several(&mut app, &daemon, project, 1)[0];
         say_size(&mut app, &daemon, pane, 10, 5);
