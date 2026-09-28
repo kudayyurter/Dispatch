@@ -45,7 +45,8 @@ its socket can do anything a client can. Delegation approval keeps
 well-meaning agents in check; it is not a sandbox for untrusted ones. See
 [docs/security-model.md](docs/security-model.md).
 
-Agents also start without their own permission prompts; see [Harness settings](#harness-settings) to turn them back on.
+Agents also start without their own permission prompts; see
+[Harness settings](#harness-settings) to turn them back on.
 
 ## Layout
 
@@ -485,10 +486,12 @@ args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 ```
 
-`claude` and `codex` ship with one. A subagent starts with the harness's saved settings, auto-approve included, so it can use its tools without waiting on a prompt nobody would see.
-On Windows the daemon refuses a form that
-would put the task on `cmd.exe`'s command line, and says which file to fix.
-Caps live in `config.toml`, and refuse rather than prompt:
+`claude` and `codex` ship with one. A subagent starts with the
+harness's saved settings, auto-approve included, so it can use its
+tools without waiting on a prompt nobody would see. On Windows the
+daemon refuses a form that would put the task on `cmd.exe`'s
+command line, and says which file to fix. Caps live in `config.toml`,
+and refuse rather than prompt:
 
 ```toml
 [delegation]
