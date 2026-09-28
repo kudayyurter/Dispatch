@@ -4,6 +4,11 @@
 //! it is Dispatch's own ConPTY spawn: a pane's process has to be created
 //! suspended and put in a Job Object before it runs, or anything it starts
 //! first escapes the job -- and `portable-pty` starts it running.
+//!
+//! On Unix a pane's process is kept unreaped from its exit until the pane is
+//! closed. Its pid is its process group's id, which closing the pane ends the
+//! group by, and a pid reaped at the exit could be another process's by then
+//! (see [`Child`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -37,9 +42,9 @@ pub struct PtyProcess {
     pub writer: Box<dyn Write + Send>,
     /// The pseudoterminal. Held for as long as the process should have one.
     pub terminal: Terminal,
-    /// The process, for waiting on.
+    /// The process, for waiting on and for ending its tree.
     pub child: Child,
-    /// Its process id, which `process::terminate_tree` ends the tree by.
+    /// Its process id.
     pub pid: Option<u32>,
 }
 
@@ -78,7 +83,14 @@ impl Terminal {
     }
 }
 
-/// A process to wait on.
+/// A pane's process, shared between whatever waits for it and whatever ends
+/// it.
+///
+/// On Unix the process is not reaped when it exits. It is left a zombie
+/// until [`Child::end_tree`], so its pid, which is also its process group's
+/// id, cannot be given to another process first. Ending the group by that id
+/// long after the exit then reaches only what the pane started. The cost is
+/// one zombie per pane that has exited and not yet been closed.
 pub struct Child(imp::Child);
 
 impl std::fmt::Debug for Child {
@@ -88,13 +100,23 @@ impl std::fmt::Debug for Child {
 }
 
 impl Child {
-    /// Waits for the process to exit.
+    /// Waits for the process to exit, and says how, without letting its pid
+    /// go.
     ///
     /// 0 for success, the process's code otherwise, and 1 for a failure
     /// that carried no code: a failed exit must never read as a clean one.
+    /// Safe to call from one thread while another ends the tree.
     #[must_use]
-    pub fn wait(self) -> i32 {
-        self.0.wait()
+    pub fn wait_exit(&self) -> i32 {
+        self.0.wait_exit()
+    }
+
+    /// Ends the process and everything in its tree, then lets its pid go.
+    ///
+    /// Only the first call does anything: once the pid has been let go, a
+    /// second ending by it could reach another process.
+    pub fn end_tree(&self, grace: std::time::Duration) -> Result<(), crate::process::ProcessError> {
+        self.0.end_tree(grace)
     }
 }
 
@@ -320,7 +342,29 @@ fn find_with_pathext(path: &Path, pathext: &str) -> Option<PathBuf> {
 
 #[cfg(unix)]
 mod imp {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
     use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+    use crate::process::{KILL_TIMEOUT, ProcessError, signal_group, wait_for_group_to_exit};
+
+    /// How long `wait_exit` waits before asking again about a leader that
+    /// has only stopped, not exited. Doubles each time, up to
+    /// [`STOPPED_POLL_MAX`]: a fixed rate would poll a Ctrl-Z'd program at
+    /// 100 Hz for as long as it stayed stopped, which can be days.
+    pub(super) const STOPPED_POLL_FIRST: Duration = Duration::from_millis(10);
+
+    /// The longest `wait_exit` waits between asking again about a stopped
+    /// leader.
+    pub(super) const STOPPED_POLL_MAX: Duration = Duration::from_secs(1);
+
+    /// The next wait after `current`, doubled and capped at
+    /// [`STOPPED_POLL_MAX`].
+    pub(super) fn next_stopped_poll(current: Duration) -> Duration {
+        (current * 2).min(STOPPED_POLL_MAX)
+    }
 
     pub(super) struct Terminal(Box<dyn MasterPty + Send>);
 
@@ -337,16 +381,199 @@ mod imp {
         }
     }
 
-    pub(super) struct Child(Box<dyn portable_pty::Child + Send + Sync>);
+    /// A pane's process, kept unreaped until its tree is ended.
+    pub(super) struct Child {
+        pid: libc::pid_t,
+        /// `portable-pty`'s handle, through which the process is finally
+        /// reaped. Taken when it is.
+        handle: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+        /// How the process exited, once anything has seen it.
+        exit: Mutex<Option<i32>>,
+        /// Whether the tree has been ended.
+        ended: AtomicBool,
+    }
 
     impl Child {
-        pub(super) fn wait(mut self) -> i32 {
-            match self.0.wait() {
-                Ok(status) if status.success() => 0,
-                Ok(status) => i32::try_from(status.exit_code()).unwrap_or(1),
-                Err(_) => 1,
+        fn new(handle: Box<dyn portable_pty::Child + Send + Sync>) -> std::io::Result<Self> {
+            let pid = handle
+                .process_id()
+                .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                .ok_or_else(|| std::io::Error::other("the pane's process has no pid"))?;
+            Ok(Self {
+                pid,
+                handle: Mutex::new(Some(handle)),
+                exit: Mutex::new(None),
+                ended: AtomicBool::new(false),
+            })
+        }
+
+        fn seen(&self) -> Option<i32> {
+            *self.exit.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn record(&self, code: i32) {
+            *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+        }
+
+        pub(super) fn wait_exit(&self) -> i32 {
+            let mut backoff = STOPPED_POLL_FIRST;
+            loop {
+                if let Some(code) = self.seen() {
+                    return code;
+                }
+                match wait_without_reaping(self.pid, true) {
+                    Ok(Some(code)) => {
+                        self.record(code);
+                        return code;
+                    }
+                    // An answer that was not an exit: the leader is stopped,
+                    // on a kernel that keeps answering WEXITED for one anyway
+                    // (see `wait_without_reaping`). Backed off rather than
+                    // polled at a fixed rate, so a leader left stopped for
+                    // days does not cost a thread parked at 100 Hz for all of
+                    // it.
+                    Ok(None) => {
+                        std::thread::sleep(backoff);
+                        backoff = next_stopped_poll(backoff);
+                    }
+                    // The wait was genuinely interrupted rather than answered
+                    // at once, so the leader was not caught in that loop:
+                    // the next answer starts the backoff over.
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                        backoff = STOPPED_POLL_FIRST;
+                    }
+                    // Reaped under this wait by `end_tree`, which recorded
+                    // the exit before it reaped.
+                    Err(_) => return self.seen().unwrap_or(1),
+                }
             }
         }
+
+        /// Polls for the exit until `deadline`, without reaping. Returns
+        /// whether the process has exited.
+        fn exited_by(&self, deadline: Instant) -> bool {
+            loop {
+                if self.seen().is_some() {
+                    return true;
+                }
+                if let Ok(Some(code)) = wait_without_reaping(self.pid, false) {
+                    self.record(code);
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Reaps the process, once it is known to have exited. One stuck in
+        /// the kernel is left alone rather than waited on for good.
+        fn reap(&self) {
+            if self.seen().is_none() {
+                return;
+            }
+            if let Some(mut handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = handle.wait();
+            }
+        }
+
+        pub(super) fn end_tree(&self, grace: Duration) -> Result<(), ProcessError> {
+            if self.ended.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            let pid = self.pid.unsigned_abs();
+            let map = |source| ProcessError::Terminate { pid, source };
+            let deadline = Instant::now() + grace;
+
+            // The leader is unreaped, so its pid is still its group's id and
+            // the group is certainly this pane's.
+            signalled(signal_group(pid, libc::SIGTERM)).map_err(map)?;
+            if !self.exited_by(deadline) {
+                signalled(signal_group(pid, libc::SIGKILL)).map_err(map)?;
+                self.exited_by(Instant::now() + KILL_TIMEOUT);
+            }
+
+            // Reaped before the group is waited on: an unreaped leader counts
+            // as a member, and the wait would run out every time. From here
+            // the group's id is held by whatever is left in it, and once a
+            // probe finds it gone nothing signals it again. Two windows are
+            // left, both needing the pid space to wrap within microseconds:
+            // one between this reap and the first probe, when the leader was
+            // the group's last member and the id is briefly unheld; the other
+            // between a probe that found members and the kill straight after
+            // it.
+            self.reap();
+            let rest = deadline.saturating_duration_since(Instant::now());
+            if !wait_for_group_to_exit(pid, rest)
+                && signalled(signal_group(pid, libc::SIGKILL)).map_err(map)?
+            {
+                wait_for_group_to_exit(pid, KILL_TIMEOUT);
+            }
+            Ok(())
+        }
+    }
+
+    /// What a signal to a pane's group says, with "not permitted" read as
+    /// "nothing left in it to signal".
+    ///
+    /// macOS answers a signal to a group whose only member is a zombie -- the
+    /// exited leader, kept unreaped for its number -- with EPERM, where Linux
+    /// answers success. Either way nothing is left to signal, and the leader
+    /// still has to be reaped: returned as a failure, it ended the close
+    /// before the reap, and the zombie stayed for good.
+    pub(super) fn signalled(result: std::io::Result<bool>) -> std::io::Result<bool> {
+        match result {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(false),
+            other => other,
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            // A child whose tree was never ended is reaped if it has exited;
+            // one still running when its last holder lets go is left
+            // unreaped, because blocking a drop on it would be worse.
+            if let Some(mut handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = handle.try_wait();
+            }
+        }
+    }
+
+    /// Waits for `pid` to exit without reaping it, or with `block` false
+    /// looks once. Returns how it exited, once it has.
+    pub(super) fn wait_without_reaping(
+        pid: libc::pid_t,
+        block: bool,
+    ) -> std::io::Result<Option<i32>> {
+        // SAFETY: an all-zero siginfo_t is a valid place for waitid to write.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let mut options = libc::WEXITED | libc::WNOWAIT;
+        if !block {
+            options |= libc::WNOHANG;
+        }
+        // SAFETY: P_PID with this process's own child's pid, and `info` is a
+        // valid siginfo_t to write to.
+        let result = unsafe { libc::waitid(libc::P_PID, pid.unsigned_abs(), &mut info, options) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // With WNOHANG and nothing to report, waitid leaves the pid zero.
+        // SAFETY: waitid filled `info` in for a child event.
+        let (who, code, status) = unsafe { (info.si_pid(), info.si_code, info.si_status()) };
+        if who == 0 {
+            return Ok(None);
+        }
+        // Only an exit is one. WEXITED asks for nothing else, but macOS has
+        // been seen to answer for a child that has only stopped
+        // (golang/go#19314), and a stopped leader taken for exited would be
+        // reaped by a wait lasting as long as it stays stopped.
+        Ok(match code {
+            libc::CLD_EXITED => Some(status),
+            libc::CLD_KILLED | libc::CLD_DUMPED => Some(1),
+            _ => None,
+        })
     }
 
     pub(super) fn spawn(
@@ -401,7 +628,7 @@ mod imp {
             reader,
             writer,
             terminal: super::Terminal(Terminal(pair.master)),
-            child: super::Child(Child(child)),
+            child: super::Child(Child::new(child)?),
             pid,
         })
     }
@@ -414,6 +641,8 @@ use self::windows as imp;
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::ErrorKind;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     use super::{
         PtyCommand, WindowsEnvironment, find_with_pathext, quote_for_crt, refuse_nul,
@@ -654,5 +883,247 @@ mod tests {
         assert_eq!(quote_for_crt(r#"a\"b"#), r#""a\\\"b""#);
         assert_eq!(quote_for_crt(r"C:\a b\"), r#""C:\a b\\""#);
         assert_eq!(quote_for_crt(r"C:\a\b c"), r#""C:\a\b c""#);
+    }
+
+    /// `sh -c script` in a pseudoterminal, nothing set or removed.
+    #[cfg(unix)]
+    fn sh(script: &str) -> super::PtyProcess {
+        let args = vec!["-c".to_string(), script.to_string()];
+        spawn(
+            &PtyCommand {
+                program: "sh",
+                args: &args,
+                env: &BTreeMap::new(),
+                env_remove: &BTreeSet::new(),
+                cwd: &std::env::temp_dir(),
+            },
+            24,
+            80,
+        )
+        .expect("sh starts")
+    }
+
+    /// The first line `reader` prints, within five seconds.
+    #[cfg(unix)]
+    fn first_line(mut reader: Box<dyn std::io::Read + Send>) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).unwrap_or(0) == 1 {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                seen.push(byte[0]);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&seen).trim().to_string());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the script printed a line")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_group_that_cannot_be_signalled_is_taken_for_one_with_nothing_left() {
+        // macOS answers a signal to a group whose only member is a zombie --
+        // the exited leader, kept unreaped for its number -- with EPERM,
+        // where Linux answers success. Taken as a failure, it ended the close
+        // before the leader was reaped, and the zombie stayed for good.
+        let refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(matches!(super::imp::signalled(Err(refused)), Ok(false)));
+        assert!(matches!(super::imp::signalled(Ok(true)), Ok(true)));
+        assert!(matches!(super::imp::signalled(Ok(false)), Ok(false)));
+
+        let other = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            super::imp::signalled(Err(other)).is_err(),
+            "any other failure is still one"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_exited_leader_is_kept_unreaped_until_its_tree_is_ended() {
+        // Reaped at once, its pid -- its process group's id -- would be free
+        // for another process, and ending the group by it later would reach a
+        // stranger's.
+        let process = sh("exit 3");
+        let pid = libc::pid_t::try_from(process.pid.expect("a pid")).expect("fits");
+
+        assert_eq!(process.child.wait_exit(), 3);
+        assert_eq!(
+            super::imp::wait_without_reaping(pid, false).expect("still this process's child"),
+            Some(3),
+            "the leader is kept, unreaped"
+        );
+
+        process
+            .child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+        assert!(
+            super::imp::wait_without_reaping(pid, false).is_err(),
+            "and reaped once its tree is ended"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ending_an_exited_panes_tree_reaches_what_it_left_and_returns_promptly() {
+        // The unreaped leader still counts as a member of its group. Were it
+        // not reaped before the wait for the group, every close would wait out
+        // the grace and the kill timeout too. A grace much longer than the 1 s
+        // bound below is what makes that failure visible: reaping promptly
+        // finishes in about 0.01 s regardless, but a version that reaps only
+        // after waiting out the group would cost this whole grace, every time.
+        let process = sh("trap '' HUP; sleep 30 & echo $!; exit 0");
+        let left: u32 = first_line(process.reader)
+            .parse()
+            .expect("the script printed the sleep's pid");
+        assert_eq!(process.child.wait_exit(), 0);
+        assert!(
+            crate::process::is_running(left),
+            "the sleep outlived its shell"
+        );
+
+        let started = Instant::now();
+        process
+            .child
+            .end_tree(Duration::from_secs(3))
+            .expect("ending succeeds");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "ending took {:?}",
+            started.elapsed()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::process::is_running(left) {
+            assert!(Instant::now() < deadline, "what the pane left outlived it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_leader_that_ignores_sigterm_is_killed_and_reaped() {
+        let process = sh("trap '' TERM; echo ready; sleep 30");
+        let pid = libc::pid_t::try_from(process.pid.expect("a pid")).expect("fits");
+        assert_eq!(first_line(process.reader), "ready");
+
+        process
+            .child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+
+        assert!(
+            super::imp::wait_without_reaping(pid, false).is_err(),
+            "killed after the grace, and reaped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stopped_leaders_poll_backs_off_and_caps() {
+        // `wait_exit` cannot be driven through the real busy loop here --
+        // the spurious wakeups it backs off are a macOS kernel quirk this
+        // Linux test cannot reproduce -- so this pins the sequence the
+        // backoff itself must produce: doubling from the first wait, capped
+        // at the longest one, for as long as the leader keeps answering
+        // "not yet".
+        use super::imp::{STOPPED_POLL_FIRST, STOPPED_POLL_MAX, next_stopped_poll};
+
+        let mut wait = STOPPED_POLL_FIRST;
+        let mut waits = vec![wait];
+        for _ in 0..8 {
+            wait = next_stopped_poll(wait);
+            waits.push(wait);
+        }
+
+        assert_eq!(
+            waits,
+            [10, 20, 40, 80, 160, 320, 640, 1000, 1000].map(Duration::from_millis),
+            "it doubles from {STOPPED_POLL_FIRST:?} and caps at {STOPPED_POLL_MAX:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stopped_leader_is_not_taken_for_one_that_exited() {
+        // macOS has been seen to answer a wait for exits for a child that has
+        // only stopped (golang/go#19314). Taken for exited, the leader would
+        // be reported so, and reaped by a wait lasting as long as it stays
+        // stopped.
+        let process = sh("echo ready; kill -STOP $$; exit 0");
+        let pid = process.pid.expect("a pid");
+        assert_eq!(first_line(process.reader), "ready");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps runs");
+            if String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .starts_with('T')
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the shell never stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = libc::pid_t::try_from(pid).expect("fits");
+        assert_eq!(
+            super::imp::wait_without_reaping(pid, false).expect("still this process's child"),
+            None,
+            "a stop is not an exit"
+        );
+
+        let started = Instant::now();
+        process
+            .child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ending took {:?}",
+            started.elapsed()
+        );
+        assert_ne!(
+            process.child.wait_exit(),
+            0,
+            "a killed process never reads as a clean exit"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_waiter_parked_on_the_exit_hears_it_when_the_tree_is_ended() {
+        // The pane's waiter thread is parked on the exit while a close ends
+        // the tree and reaps the leader under it. It still hears how the
+        // process ended, once.
+        let process = sh("sleep 30");
+        let child = std::sync::Arc::new(process.child);
+        let waiter = {
+            let child = std::sync::Arc::clone(&child);
+            std::thread::spawn(move || child.wait_exit())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+
+        child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "the waiter never heard the exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            waiter.join().expect("the waiter finishes"),
+            0,
+            "a killed process never reads as a clean exit"
+        );
     }
 }

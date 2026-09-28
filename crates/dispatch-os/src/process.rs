@@ -87,11 +87,12 @@ pub fn spawn_detached_with_env(
 /// and it is gone.
 ///
 /// A caller that also owns the `Child` should wait for it on another thread
-/// meanwhile, as a pane's waiter thread does. On Linux a leader nobody has
-/// waited for is still a member of its group, so calling this and only then
-/// waiting for the `Child` sits out the whole kill timeout on the caller's
-/// own zombie. A command transport's reap does the other thing that works:
-/// signals, waits for the leader, and only then for the rest.
+/// meanwhile. On Linux a leader nobody has waited for is still a member of
+/// its group, so calling this and only then waiting for the `Child` sits out
+/// the whole kill timeout on the caller's own zombie. A command transport's
+/// reap does the other thing that works: signals, waits for the leader, and
+/// only then for the rest. So does a pane's close on Unix, through
+/// `pty::Child::end_tree`.
 pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::terminate_tree(pid, grace)
 }
@@ -166,6 +167,12 @@ pub fn descendants(pid: u32) -> Vec<u32> {
 /// cannot do. It is to be ended as one [`spawn_contained`] started is.
 #[cfg(windows)]
 pub(crate) use imp::contain;
+
+/// Signalling and waiting on a process group by its leader's pid, for a
+/// pane's tree: see `pty::Child::end_tree`, which keeps that pid its own
+/// until it is done.
+#[cfg(unix)]
+pub(crate) use imp::{KILL_TIMEOUT, signal_group, wait_for_group_to_exit};
 
 /// The pids reachable downward from `root` through `(pid, parent)` pairs,
 /// breadth first.
@@ -246,13 +253,13 @@ mod imp {
     ///
     /// Only bounds the wait; a process that ignores SIGKILL is stuck in the
     /// kernel and no amount of waiting will change that.
-    const KILL_TIMEOUT: Duration = Duration::from_secs(2);
+    pub(crate) const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Sends `signal` to the process group led by `pid`.
     ///
     /// Returns `Ok(false)` when no such group exists, which means the tree has
     /// already exited.
-    fn signal_group(pid: u32, signal: i32) -> Result<bool, std::io::Error> {
+    pub(crate) fn signal_group(pid: u32, signal: i32) -> Result<bool, std::io::Error> {
         // A pid that does not fit in pid_t cannot name a real process, and
         // negating it would address an unrelated group.
         let pid: libc::pid_t = pid
@@ -282,7 +289,7 @@ mod imp {
     /// Polls until the group has no members, or `timeout` elapses.
     ///
     /// Returns whether the group is gone.
-    fn wait_for_group_to_exit(pid: u32, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_group_to_exit(pid: u32, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if !group_is_alive(pid) {

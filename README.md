@@ -76,6 +76,10 @@ A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
 what it printed — `Ctrl p x` (or `^a x`) is what removes it for good.
 
+On Linux and macOS, a pane whose program has exited keeps its process as a
+`<defunct>` entry under `dispatchd` until you close the pane; closing it
+clears the entry.
+
 ## Tabs
 
 The row across the top names each tab after its first pane's title, or the
@@ -394,7 +398,8 @@ dispatch delegate "write the tests for the http client"
 Dispatch asks you first, every time — unless you have approved that pane
 wholesale with `A`, which lasts until the daemon stops. The subagent runs as a
 pane under the one that asked, and the caller gets its output and exit code when
-it finishes.
+it finishes. Focus stays where it was: open the subagent with `Ctrl p s` (or
+`^a s`) to watch it.
 
 Delegation needs two things. The daemon must own the panes (`--attach`), because
 it is what starts the subagent; and the harness must declare a non-interactive

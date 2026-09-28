@@ -126,6 +126,54 @@ pub fn endpoint() -> Result<PathBuf, IpcError> {
 /// not in two seconds is not a Dispatch client, or not a working one.
 const PREAMBLE_PATIENCE: Duration = Duration::from_secs(2);
 
+/// How long accepting waits after a failure that passes before it tries
+/// again, the first time. Each failure in a row doubles it, up to
+/// [`ACCEPT_BACKOFF_MAX`].
+const ACCEPT_BACKOFF_FIRST: Duration = Duration::from_millis(10);
+
+/// The longest accepting waits between tries while failures keep coming.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// How long one slice of a backoff sleeps, so a listener being dropped is
+/// never held up by a whole backoff.
+const ACCEPT_BACKOFF_SLICE: Duration = Duration::from_millis(10);
+
+/// How accepting should answer a failed accept.
+enum AcceptFailure {
+    /// One connection's own trouble -- gone before it could be accepted, say
+    /// -- rather than anything wrong with the listener. Retried at once, with
+    /// no backoff, and not counted toward a run: a client probing whether a
+    /// daemon is listening connects and drops right away, and on macOS and
+    /// BSD that routine probe is indistinguishable from this at the OS level.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "Windows has no error code of its own connecting probes trip, so its classify never returns this"
+        )
+    )]
+    Connection,
+    /// Descriptors, buffers or memory short for a moment. Waited out with a
+    /// growing backoff, logged once per run.
+    Shortage,
+    /// Nothing accepting can get past. Reported once, and the accepting
+    /// thread stops.
+    Fatal,
+}
+
+/// Classifies an accept failure.
+///
+/// Ending on a shortage left a daemon that ran short of descriptors for a
+/// moment running its panes with no way for a client to reach them; treating
+/// one connection's own trouble as a shortage instead would warn and back off
+/// on every routine probe.
+fn classify(error: &IpcError) -> AcceptFailure {
+    match error {
+        IpcError::Io { source, .. } => imp::classify(source),
+        _ => AcceptFailure::Fatal,
+    }
+}
+
 /// How many connections may be announcing themselves at once.
 ///
 /// Each holds a thread until it has said which half it is or run out of
@@ -551,6 +599,13 @@ pub struct Listener {
     /// Where it listens, so dropping it can wake the accepting thread.
     endpoint: PathBuf,
     accepting: Option<std::thread::JoinHandle<()>>,
+    /// Which file the socket is, recorded at bind, so a drop removes the
+    /// path only while it still names this listener's socket.
+    socket: Option<imp::Identity>,
+    /// The listening socket's descriptor, for a test to copy as a forked
+    /// child would.
+    #[cfg(all(test, unix))]
+    socket_fd: std::os::fd::RawFd,
 }
 
 impl std::fmt::Debug for Listener {
@@ -571,18 +626,30 @@ impl Listener {
     /// that stands one up, without steering the process-wide configuration
     /// directory to put it there.
     pub fn bind_to(path: &Path) -> Result<Self, IpcError> {
+        Self::bind_with(path, imp::accept)
+    }
+
+    /// [`Listener::bind_to`], taking each stream through `accept`: a test
+    /// passes one that fails on cue before handing over to the platform's.
+    fn bind_with(
+        path: &Path,
+        accept: impl FnMut(&imp::Listener) -> Result<imp::Stream, IpcError> + Send + 'static,
+    ) -> Result<Self, IpcError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| IpcError::io(format!("creating {}", parent.display()), e))?;
         }
 
         let inner = imp::bind(path)?;
+        let socket = imp::identity(path);
+        #[cfg(all(test, unix))]
+        let socket_fd = std::os::fd::AsRawFd::as_raw_fd(&inner);
         let (sender, paired) = channel();
         let stopping = Arc::new(AtomicBool::new(false));
 
         let accepting = {
             let stopping = Arc::clone(&stopping);
-            std::thread::spawn(move || accept_all(&inner, &sender, &stopping))
+            std::thread::spawn(move || accept_all(&inner, accept, &sender, &stopping))
         };
 
         Ok(Self {
@@ -590,6 +657,9 @@ impl Listener {
             stopping,
             endpoint: path.to_path_buf(),
             accepting: Some(accepting),
+            socket,
+            #[cfg(all(test, unix))]
+            socket_fd,
         })
     }
 
@@ -633,27 +703,73 @@ impl Drop for Listener {
             let _ = accepting.join();
         }
         drop(wake);
+
+        // The file goes with the listener. Left behind, the next bind finds
+        // the path in use and probes it, and a copy of the old socket that a
+        // forked child holds for an instant answers as if a daemon were
+        // running. Removed only while it is still this listener's socket: a
+        // daemon that has since replaced it keeps its own.
+        if let Some(socket) = self.socket.take() {
+            imp::remove_if_same(&self.endpoint, socket);
+        }
     }
 }
 
-/// Accepts until the listener fails or is dropped, reading each preamble on
-/// a thread of its own and handing on each connection once both of its
-/// halves are in.
+/// Accepts until the listener fails for good or is dropped, reading each
+/// preamble on a thread of its own and handing on each connection once both
+/// of its halves are in.
+///
+/// A [`AcceptFailure::Shortage`] is waited out, backing off from
+/// [`ACCEPT_BACKOFF_FIRST`] to [`ACCEPT_BACKOFF_MAX`]. It is logged once per
+/// run rather than once per try, and the recovery says how many there were.
+/// A [`AcceptFailure::Connection`] is retried at once, logged quietly, and
+/// never counted toward that run.
 fn accept_all(
     inner: &imp::Listener,
+    mut accept: impl FnMut(&imp::Listener) -> Result<imp::Stream, IpcError>,
     paired: &Sender<Result<Connection, IpcError>>,
     stopping: &AtomicBool,
 ) {
     let halves = Arc::new(Mutex::new(pairing::Halves::new()));
     let announcing = Arc::new(AtomicUsize::new(0));
+    let mut backoff = ACCEPT_BACKOFF_FIRST;
+    let mut failures = 0usize;
 
     loop {
-        let stream = match imp::accept(inner) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = paired.send(Err(error));
-                return;
+        let stream = match accept(inner) {
+            Ok(stream) => {
+                if failures > 0 {
+                    tracing::info!(failures, "accepting connections again");
+                }
+                failures = 0;
+                backoff = ACCEPT_BACKOFF_FIRST;
+                stream
             }
+            Err(error) => match classify(&error) {
+                // One connection's own trouble, not the listener's: probing
+                // whether a daemon is listening connects and drops at once,
+                // and clients do that routinely. Retried at once, so a probe
+                // costs nothing here.
+                AcceptFailure::Connection => {
+                    tracing::debug!(%error, "a connection failed before it was accepted");
+                    continue;
+                }
+                AcceptFailure::Shortage => {
+                    if failures == 0 {
+                        tracing::warn!(%error, "accepting failed for now; trying again");
+                    }
+                    failures += 1;
+                    if !wait_unless_stopping(backoff, stopping) {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                    continue;
+                }
+                AcceptFailure::Fatal => {
+                    let _ = paired.send(Err(error));
+                    return;
+                }
+            },
         };
 
         if stopping.load(Ordering::Relaxed) {
@@ -708,6 +824,22 @@ fn accept_all(
     }
 }
 
+/// Sleeps for `wait` a slice at a time. Returns false as soon as `stopping`
+/// is set.
+fn wait_unless_stopping(wait: Duration, stopping: &AtomicBool) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(ACCEPT_BACKOFF_SLICE));
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -717,6 +849,25 @@ mod imp {
 
     pub(super) type Stream = UnixStream;
     pub(super) type Listener = UnixListener;
+
+    /// A socket file's device and inode.
+    pub(super) type Identity = (u64, u64);
+
+    /// Which file `path` is now, if there is one.
+    pub(super) fn identity(path: &Path) -> Option<Identity> {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    /// Removes `path` if it is still the file `socket` was.
+    pub(super) fn remove_if_same(path: &Path, socket: Identity) {
+        if identity(path) == Some(socket) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
         UnixStream::connect(path).map_err(|e| match e.kind() {
@@ -766,6 +917,26 @@ mod imp {
             .accept()
             .map(|(stream, _)| stream)
             .map_err(|e| IpcError::io("accepting a connection", e))
+    }
+
+    /// Classifies a failed accept.
+    ///
+    /// `ECONNABORTED`, `EPROTO` and `EINTR` are one connection's own trouble:
+    /// a client that hung up while it was being accepted, or a signal that
+    /// interrupted the call. Clients probe whether a daemon is listening by
+    /// connecting and dropping at once, and on macOS and BSD that gives
+    /// `ECONNABORTED` if the drop lands before `accept` reaches it -- a
+    /// routine event, not a shortage. `EMFILE`, `ENFILE`, `ENOBUFS` and
+    /// `ENOMEM` are descriptors, buffers or memory short for a moment.
+    pub(super) fn classify(error: &std::io::Error) -> super::AcceptFailure {
+        use super::AcceptFailure;
+        match error.raw_os_error() {
+            Some(libc::ECONNABORTED | libc::EPROTO | libc::EINTR) => AcceptFailure::Connection,
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                AcceptFailure::Shortage
+            }
+            _ => AcceptFailure::Fatal,
+        }
     }
 
     /// A second handle onto the same socket, for a [`super::Closer`].
@@ -821,6 +992,15 @@ mod imp {
 
     use super::IpcError;
     use crate::owner_only::{OwnerOnly, current_user_sid, sid_string};
+
+    /// A pipe has no file to remove; nothing to identify.
+    pub(super) type Identity = ();
+
+    pub(super) fn identity(_path: &Path) -> Option<Identity> {
+        None
+    }
+
+    pub(super) fn remove_if_same(_path: &Path, _socket: Identity) {}
 
     /// Named pipes are addressed by name rather than by a filesystem path, so
     /// the endpoint is hashed into one. Two configurations therefore get two
@@ -1133,6 +1313,14 @@ mod imp {
     pub(super) fn accept(listener: &Listener) -> Result<Stream, IpcError> {
         let mut pending = listener.pending.lock().unwrap_or_else(|e| e.into_inner());
 
+        // The last accept could not open the next instance, so none is
+        // waiting. Opening it is this accept's first job, and a failure here
+        // is reported like any other, to be waited out if it passes.
+        if *pending == INVALID_HANDLE_VALUE as isize {
+            *pending = create_instance(&listener.name, false, &listener.security)
+                .map_err(|e| IpcError::io(format!("reopening {}", listener.name), e))?;
+        }
+
         let handle = *pending;
 
         loop {
@@ -1172,14 +1360,52 @@ mod imp {
 
         // Open the next instance before handing this one over, so the pipe is
         // never absent between clients.
-        *pending = create_instance(&listener.name, false, &listener.security)
-            .map_err(|e| IpcError::io(format!("reopening {}", listener.name), e))?;
+        //
+        // A failure here is not this client's: it has connected and is
+        // served. The next accept opens the instance, and backs off if it
+        // still cannot. Returning the error instead would leave this handle
+        // connected and still pending, to be handed out a second time.
+        *pending = match create_instance(&listener.name, false, &listener.security) {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::warn!(%error, "could not open the next pipe instance yet");
+                INVALID_HANDLE_VALUE as isize
+            }
+        };
 
         // SAFETY: the handle is a connected instance and ownership moves into
         // the File, which closes it exactly once.
         Ok(Stream::new(unsafe {
             std::fs::File::from_raw_handle(handle as _)
         }))
+    }
+
+    /// Classifies a failed accept: memory, system resources or handles short
+    /// for a moment are a shortage; everything else is fatal. Windows has no
+    /// code of its own connecting probes trip, so there is nothing here to
+    /// class as one connection's own trouble.
+    pub(super) fn classify(error: &std::io::Error) -> super::AcceptFailure {
+        use super::AcceptFailure;
+        use windows_sys::Win32::Foundation::{
+            ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY,
+            ERROR_TOO_MANY_OPEN_FILES,
+        };
+
+        let shortage = error.raw_os_error().is_some_and(|code| {
+            [
+                ERROR_NOT_ENOUGH_MEMORY,
+                ERROR_OUTOFMEMORY,
+                ERROR_NO_SYSTEM_RESOURCES,
+                ERROR_TOO_MANY_OPEN_FILES,
+            ]
+            .iter()
+            .any(|&known| code == known as i32)
+        });
+        if shortage {
+            AcceptFailure::Shortage
+        } else {
+            AcceptFailure::Fatal
+        }
     }
 
     /// A second handle onto the same pipe, for a [`super::Closer`].
@@ -1889,6 +2115,233 @@ mod tests {
         drop(first);
 
         let _second = Listener::bind().expect("the endpoint is free once the first is dropped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_of_the_socket_held_elsewhere_does_not_keep_the_endpoint() {
+        // A child forked while the listener is open holds a copy of its
+        // socket until it execs. The next bind must not take that copy for a
+        // running daemon. This is what made the test above fail about half
+        // the time beside the tests that spawn processes.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("held");
+
+        let first = Listener::bind().expect("binding succeeds");
+        // SAFETY: dup takes a descriptor by value; this one is the listener's
+        // and is open until the listener is dropped.
+        let copy = unsafe { libc::dup(first.socket_fd) };
+        assert!(copy >= 0, "the socket can be copied");
+        drop(first);
+
+        let second = Listener::bind();
+        // SAFETY: closes the copy made above, and nothing else.
+        unsafe { libc::close(copy) };
+        second.expect("a copy of the old socket does not keep the endpoint");
+    }
+
+    /// An accept failure that is a shortage: too many files open, for a
+    /// moment.
+    fn a_passing_failure() -> IpcError {
+        #[cfg(unix)]
+        let code = libc::EMFILE;
+        #[cfg(windows)]
+        let code = windows_sys::Win32::Foundation::ERROR_TOO_MANY_OPEN_FILES as i32;
+        IpcError::io(
+            "accepting a connection",
+            std::io::Error::from_raw_os_error(code),
+        )
+    }
+
+    /// An accept failure that is one connection's own trouble: gone before
+    /// it was accepted, which is `ECONNABORTED` on macOS and BSD.
+    #[cfg(unix)]
+    fn a_connection_failure() -> IpcError {
+        IpcError::io(
+            "accepting a connection",
+            std::io::Error::from_raw_os_error(libc::ECONNABORTED),
+        )
+    }
+
+    /// An accept failure that is fatal: one with no OS code at all.
+    fn a_fatal_failure() -> IpcError {
+        IpcError::io(
+            "accepting a connection",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+    }
+
+    /// A listener on this test's endpoint whose first accepts fail with
+    /// `failures`, in order, before the platform's own accept takes over.
+    fn listener_failing_with(failures: Vec<IpcError>) -> Listener {
+        let mut failures = std::collections::VecDeque::from(failures);
+        Listener::bind_with(&endpoint().expect("resolves"), move |inner| {
+            failures.pop_front().map_or_else(|| imp::accept(inner), Err)
+        })
+        .expect("binding succeeds")
+    }
+
+    #[test]
+    fn accepting_carries_on_after_a_failure_that_passes() {
+        // A daemon that ran out of file descriptors for a moment must still
+        // be reachable once they are back.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("passing");
+
+        let listener = listener_failing_with(vec![a_passing_failure(), a_passing_failure()]);
+        let server = std::thread::spawn(move || listener.accept());
+
+        let _client = Connection::connect().expect("connecting succeeds");
+        server
+            .join()
+            .expect("the server thread finishes")
+            .expect("the connection after the failures is delivered");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_connection_failure_is_retried_at_once_with_no_backoff() {
+        // A probe that closes before it is accepted gives ECONNABORTED on
+        // macOS and BSD, and clients probe routinely. Counting it as a
+        // shortage would cost every probe a warning and a 10 ms backoff --
+        // this takes well under a millisecond without one, so 5 ms is a
+        // generous margin that still catches that misclassification.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("connection-failure");
+
+        let started = Instant::now();
+        let listener = listener_failing_with(vec![a_connection_failure()]);
+        let server = std::thread::spawn(move || listener.accept());
+        let _client = Connection::connect().expect("connecting succeeds");
+        server
+            .join()
+            .expect("the server thread finishes")
+            .expect("the connection after the failure is delivered");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(5),
+            "a connection failure waited {:?}, as if it were a shortage",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_failure_that_does_not_pass_ends_accepting() {
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("fatal");
+
+        let listener = listener_failing_with(vec![a_fatal_failure()]);
+
+        assert!(
+            matches!(listener.accept(), Err(IpcError::Io { .. })),
+            "the failure is reported, not retried"
+        );
+    }
+
+    #[test]
+    fn a_run_of_passing_failures_backs_off_rather_than_spinning() {
+        // Five failures in a row wait 10 + 20 + 40 + 80 + 160 ms between
+        // them. A loop that retried at once would spin a core for as long as
+        // the descriptors stayed short.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("backoff");
+
+        let started = Instant::now();
+        let listener = listener_failing_with((0..5).map(|_| a_passing_failure()).collect());
+        let server = std::thread::spawn(move || listener.accept());
+        let _client = Connection::connect().expect("connecting succeeds");
+        server
+            .join()
+            .expect("the server thread finishes")
+            .expect("the connection is delivered");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "five failures were retried in {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn dropping_a_listener_that_is_backing_off_returns_promptly() {
+        // Many failures push the backoff to its full second; a drop must not
+        // wait one out.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("backoff-drop");
+
+        let listener = listener_failing_with((0..1000).map(|_| a_passing_failure()).collect());
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let (dropped, done) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            drop(listener);
+            let _ = dropped.send(());
+        });
+
+        assert!(
+            done.recv_timeout(Duration::from_millis(500)).is_ok(),
+            "the drop waited out a backoff"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn accept_failures_are_classified_into_connection_shortage_and_fatal() {
+        #[cfg(unix)]
+        let (connection, shortage, fatal) = (
+            vec![libc::ECONNABORTED, libc::EPROTO, libc::EINTR],
+            vec![libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM],
+            vec![libc::EBADF, libc::EINVAL, libc::ENOTSOCK],
+        );
+        #[cfg(windows)]
+        let (connection, shortage, fatal) = {
+            use windows_sys::Win32::Foundation::{
+                ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NO_SYSTEM_RESOURCES,
+                ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY, ERROR_TOO_MANY_OPEN_FILES,
+            };
+            (
+                Vec::<i32>::new(),
+                vec![
+                    ERROR_NOT_ENOUGH_MEMORY as i32,
+                    ERROR_OUTOFMEMORY as i32,
+                    ERROR_NO_SYSTEM_RESOURCES as i32,
+                    ERROR_TOO_MANY_OPEN_FILES as i32,
+                ],
+                vec![ERROR_ACCESS_DENIED as i32, ERROR_INVALID_HANDLE as i32],
+            )
+        };
+
+        let failure = |code| IpcError::io("accepting", std::io::Error::from_raw_os_error(code));
+        for code in connection {
+            assert!(
+                matches!(classify(&failure(code)), AcceptFailure::Connection),
+                "{code} is one connection's own trouble"
+            );
+        }
+        for code in shortage {
+            assert!(
+                matches!(classify(&failure(code)), AcceptFailure::Shortage),
+                "{code} is a shortage"
+            );
+        }
+        for code in fatal {
+            assert!(
+                matches!(classify(&failure(code)), AcceptFailure::Fatal),
+                "{code} is fatal"
+            );
+        }
+        assert!(
+            matches!(classify(&a_fatal_failure()), AcceptFailure::Fatal),
+            "an error with no OS code is fatal"
+        );
+        assert!(
+            matches!(
+                classify(&IpcError::NotRunning("x".into())),
+                AcceptFailure::Fatal
+            ),
+            "only an I/O failure can be anything but fatal"
+        );
     }
 
     #[test]

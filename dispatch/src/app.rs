@@ -5046,6 +5046,33 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_whose_subagent_arrives_keeps_focus_and_is_not_marked_done() {
+        // The user was looking at the parent when the subagent arrived, so its
+        // going quiet afterwards is not something finished out of sight.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, "claude", Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(parent),
+            "the new subagent leaves focus where it was"
+        );
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, parent, b"delegated\r\n");
+        settle(&mut app, &clock);
+
+        assert_eq!(status_of(&app, parent), PaneStatus::Idle);
+        assert!(!app.state.is_unseen(parent), "the user was looking at it");
+    }
+
+    #[test]
     fn clearing_a_done_mark_asks_for_a_redraw() {
         // Focus can move with no input to draw a frame: the focused pane
         // closing hands it to another. With motion off nothing else is
@@ -5531,7 +5558,9 @@ mod tests {
             .expect("the app is listening");
         app.poll_daemon();
 
-        app.expanded.insert(child);
+        // Focus stays on the parent when the child arrives, so opening it
+        // (`^a s`) is what brings it into the grid and onto screen.
+        app.focus_pane(child);
 
         assert_eq!(
             app.tileable(),

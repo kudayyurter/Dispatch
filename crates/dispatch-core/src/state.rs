@@ -319,6 +319,9 @@ impl AppState {
     /// [`PaneRole::Orchestrator`]: that is the whole rule, and this is the one
     /// moment it can be applied, because a pane's first approved child is
     /// exactly what arrives here.
+    ///
+    /// A new top-level pane takes focus. A subagent takes it only when
+    /// nothing has it.
     pub fn adopt_pane(&mut self, pane: Pane) -> Result<PaneId, StateError> {
         let project = pane.project;
         if !self.projects.iter().any(|p| p.id == project) {
@@ -336,12 +339,20 @@ impl AppState {
             delegating.role = PaneRole::Orchestrator;
         }
 
+        let delegated = pane.parent.is_some();
         self.panes.push(pane);
 
+        // A new top-level pane is what the user is about to use, so it takes
+        // focus, and a zoomed pane would hide it. A subagent is not in the grid
+        // until it is opened, so it leaves both alone -- focus on it would be
+        // focus on nothing the user can see -- unless nothing had focus.
         if self.selected_project == Some(project) {
-            self.focused_pane = Some(id);
-            // A new pane changes the grid, so a zoomed pane would hide it.
-            self.zoomed_pane = None;
+            if !delegated || self.focused_pane.is_none() {
+                self.focused_pane = Some(id);
+            }
+            if !delegated {
+                self.zoomed_pane = None;
+            }
         }
 
         Ok(id)
@@ -1177,6 +1188,63 @@ mod tests {
             state.children_of(child).is_empty(),
             "a child has no children of its own"
         );
+    }
+
+    #[test]
+    fn a_new_child_leaves_focus_on_its_parent() {
+        // A subagent is not in the grid until it is opened, so focus on it is
+        // focus on nothing the user can see.
+        let (state, parent, _child) = parent_and_child(false);
+
+        assert_eq!(state.focused_pane(), Some(parent));
+    }
+
+    #[test]
+    fn a_new_child_leaves_a_zoomed_pane_zoomed() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        state.toggle_zoom();
+        assert_eq!(state.zoomed_pane(), Some(parent));
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        state.adopt_pane(child).expect("the project exists");
+
+        assert_eq!(state.zoomed_pane(), Some(parent), "the grid did not change");
+    }
+
+    #[test]
+    fn a_child_arriving_when_nothing_is_focused_is_focused() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(PaneId::new());
+        let id = child.id;
+        state.adopt_pane(child).expect("the project exists");
+
+        assert_eq!(state.focused_pane(), Some(id));
+    }
+
+    #[test]
+    fn a_reattach_leaves_focus_on_the_parent_not_its_last_child() {
+        // A reattach replays a parent and then its children. Focus ends on
+        // the pane the user can see.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = Pane::new(project, HarnessId::new("claude"));
+        let parent_id = parent.id;
+        state.adopt_pane(parent).expect("the project exists");
+        for _ in 0..2 {
+            let mut child = Pane::new(project, HarnessId::new("claude"));
+            child.parent = Some(parent_id);
+            state.adopt_pane(child).expect("the project exists");
+        }
+
+        assert_eq!(state.focused_pane(), Some(parent_id));
     }
 
     #[test]
