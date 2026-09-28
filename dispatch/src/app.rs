@@ -3578,7 +3578,10 @@ impl App {
                 // inside the pane and wandered out here — dropping it would
                 // leave the program's selection stuck with no release ever
                 // delivered. Clamped to the pane's last cell and forwarded,
-                // the same as a real terminal does at its own edge.
+                // the same as a real terminal does at its own edge. Every
+                // `Motion` that reaches here is a drag: the input router turns
+                // a plain hover into focusing the pane, never into a pointer
+                // event for the program.
                 MouseAction::Release | MouseAction::Motion => {
                     input.col = size.cols.saturating_sub(1);
                     input.row = size.rows.saturating_sub(1);
