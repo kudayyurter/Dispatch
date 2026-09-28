@@ -23,6 +23,7 @@ use crate::budgets::Budgets;
 use crate::delegation::Pending;
 use crate::outbox::{Inbox, Outbox, Refused};
 use crate::pane::DaemonPane;
+use crate::sizing::Sizes;
 use crate::task_file::{Leftovers, TaskFile};
 
 /// How much of a subagent's output its caller is given.
@@ -180,6 +181,28 @@ pub enum DaemonError {
 /// Identifies one attached client.
 type ClientId = u64;
 
+/// Whether `message` is the user using the window that sent it.
+///
+/// A resize is not: a window resizes its panes when another window changes
+/// the layout, which says nothing about where the user is.
+fn counts_as_use(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::Subscribe
+            | ClientMessage::WritePane { .. }
+            | ClientMessage::OpenProject { .. }
+            | ClientMessage::CloseProject { .. }
+            | ClientMessage::SpawnPane { .. }
+            | ClientMessage::ClosePane { .. }
+            | ClientMessage::MovePane { .. }
+            | ClientMessage::RenameTab { .. }
+            | ClientMessage::CloseTab { .. }
+            | ClientMessage::MoveTab { .. }
+            | ClientMessage::DelegateDecision { .. }
+            | ClientMessage::Active
+    )
+}
+
 /// Asks a running daemon to stop.
 ///
 /// Taken before [`Daemon::serve`] is called, because that consumes the daemon.
@@ -282,6 +305,9 @@ pub struct Daemon {
     /// How often they are looked at: [`dispatch_os::git::RECHECK`], or every
     /// tick in a test that cannot wait two seconds per step.
     branch_every: Duration,
+    /// Each window's asked size for each pane, and which window was used
+    /// last: what decides a pane's size when several windows show it.
+    sizes: Sizes,
 }
 
 impl Daemon {
@@ -321,6 +347,7 @@ impl Daemon {
             task_dir_lock: None,
             branches_checked: None,
             branch_every: dispatch_os::git::RECHECK,
+            sizes: Sizes::default(),
         }
     }
 
@@ -474,6 +501,7 @@ impl Daemon {
         for (id, mut pane) in self.panes.drain() {
             tracing::info!(pane = %id, "terminating a pane on shutdown");
             pane.session.terminate();
+            self.sizes.forget_pane(id);
         }
     }
 
@@ -545,6 +573,18 @@ impl Daemon {
             );
             self.refuse(id);
             return;
+        }
+
+        // The window in use decides the size of what it shows.
+        if counts_as_use(&message)
+            && self
+                .clients
+                .get(&id)
+                .is_some_and(|client| client.role == Role::Interface)
+        {
+            for pane in self.sizes.touch(id) {
+                self.fit(pane);
+            }
         }
 
         match message {
@@ -620,6 +660,14 @@ impl Daemon {
                         harness: pane.harness.clone(),
                         parent: pane.parent,
                         durable: pane.durable,
+                    });
+
+                    // Before anything replayed: the replay is drawn into a
+                    // copy of the size the pane has now.
+                    let size = pane.session.size();
+                    existing.push(ServerMessage::PaneResized {
+                        pane: pane.id,
+                        size: (size.cols, size.rows),
                     });
 
                     // Not part of `PaneSpawned`, so said straight after it:
@@ -727,7 +775,7 @@ impl Daemon {
             }
 
             ClientMessage::ResizePane { pane, size } => {
-                let Some(target) = self.panes.get_mut(&pane) else {
+                if !self.panes.contains_key(&pane) {
                     self.send(
                         id,
                         ServerMessage::Error {
@@ -735,11 +783,9 @@ impl Daemon {
                         },
                     );
                     return;
-                };
-
-                if let Err(error) = target.session.resize(Size::new(size.0, size.1)) {
-                    tracing::warn!(%error, "failed to resize a pane");
                 }
+                self.sizes.ask(id, pane, Size::new(size.0, size.1));
+                self.fit(pane);
             }
 
             ClientMessage::ClosePane { pane } => self.close_pane(id, pane),
@@ -792,7 +838,13 @@ impl Daemon {
                 self.change_tab(id, tab, |tabs| tabs.move_tab(tab, index));
             }
 
-            ClientMessage::Active | ClientMessage::HidePane { .. } => {}
+            // Use is counted above, before the match.
+            ClientMessage::Active => {}
+
+            ClientMessage::HidePane { pane } => {
+                self.sizes.hide(id, pane);
+                self.fit(pane);
+            }
 
             ClientMessage::Unknown => {
                 tracing::debug!(
@@ -801,6 +853,32 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// Gives `pane` the size its most recently used window asked for, when
+    /// that differs from the size it has, and tells every window.
+    ///
+    /// The pty first, then the message: output the program draws at the new
+    /// size then always follows the message on every connection, and output
+    /// drawn at the old size always precedes it.
+    fn fit(&mut self, pane: PaneId) {
+        let Some(size) = self.sizes.wanted(pane) else {
+            return;
+        };
+        let Some(target) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        if target.session.size() == size {
+            return;
+        }
+        if let Err(error) = target.session.resize(size) {
+            tracing::warn!(%error, "failed to resize a pane");
+            return;
+        }
+        self.broadcast(ServerMessage::PaneResized {
+            pane,
+            size: (size.cols, size.rows),
+        });
     }
 
     /// Resolves a client's path and registers it, telling everyone.
@@ -963,6 +1041,7 @@ impl Daemon {
         // client draws has to be what the daemon is holding.
         let durable = pane.durable;
         self.panes.insert(id, pane);
+        self.sizes.ask(client, id, size);
 
         // At INFO because a pane appearing and a pane surviving a client are the
         // two things a report about the daemon is usually about, and without
@@ -977,6 +1056,14 @@ impl Daemon {
             harness: harness.to_string(),
             parent: None,
             durable,
+        });
+
+        // Its size, said as for any other change of it, so every window's
+        // copy starts at the pty's size rather than a guess.
+        let actual = self.panes[&id].session.size();
+        self.broadcast(ServerMessage::PaneResized {
+            pane: id,
+            size: (actual.cols, actual.rows),
         });
 
         // After the announcement, so a snapshot never names a pane a client
@@ -1017,6 +1104,7 @@ impl Daemon {
             return;
         };
         let project = target.project;
+        self.sizes.forget_pane(pane);
 
         // Shared by `ClosePane` and `CloseTab`: closing a tab closes each of
         // its panes exactly as closing that pane alone does.
@@ -1471,6 +1559,14 @@ impl Daemon {
             parent: Some(parent),
             durable,
         });
+
+        // Its size, said as for any other change of it, so every window's
+        // copy starts at the pty's size rather than a guess.
+        let actual = self.panes[&id].session.size();
+        self.broadcast(ServerMessage::PaneResized {
+            pane: id,
+            size: (actual.cols, actual.rows),
+        });
     }
 
     /// Resolves a request: answers its caller, and tells every other interface
@@ -1554,6 +1650,12 @@ impl Daemon {
     /// `caller` and `request` are cleared so nothing later tries to answer a
     /// caller that is gone, and it is left for a person to close.
     fn abandon(&mut self, caller: ClientId) {
+        // Its tiles stop counting; each pane it sized follows the next
+        // window that shows it.
+        for pane in self.sizes.forget_client(caller) {
+            self.fit(pane);
+        }
+
         // Withdrawn rather than silently dropped. Ctrl-C on `dispatch delegate`
         // is the case the design names, and it is the one that used to leave a
         // prompt on screen for a request that no longer exists: the user presses
@@ -1641,6 +1743,7 @@ impl Daemon {
                 self.answer_for_a_closed_subagent(&mut pane);
                 pane.session.terminate();
                 self.blanket.remove(&id);
+                self.sizes.forget_pane(id);
                 self.broadcast(ServerMessage::PaneClosed { pane: id });
                 self.refuse_requests_from(id);
             }
@@ -2164,6 +2267,13 @@ impl Daemon {
             .values()
             .filter_map(|pane| pane.session.pid())
             .collect()
+    }
+
+    /// A pane's pty size, for tests of which window decides it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_size_for_test(&self, pane: PaneId) -> Option<Size> {
+        self.panes.get(&pane).map(|target| target.session.size())
     }
 }
 

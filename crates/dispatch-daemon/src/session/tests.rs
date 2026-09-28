@@ -5240,3 +5240,230 @@ fn a_pane_placed_on_a_tab_delegates_under_the_same_cap() {
         "the tab holds the two placed panes"
     );
 }
+
+/// Attaches interface client `id`, says hello and subscribes.
+fn attach_window(daemon: &mut Daemon, id: u64) -> Inbox {
+    let inbox = daemon.attach_for_test(id);
+    daemon.request_for_test(id, hello());
+    daemon.request_for_test(id, ClientMessage::Subscribe);
+    inbox
+}
+
+/// The last size `messages` said `pane` has.
+fn resized(messages: &[ServerMessage], pane: PaneId) -> Option<(u16, u16)> {
+    messages.iter().rev().find_map(|m| match m {
+        ServerMessage::PaneResized { pane: p, size } if *p == pane => Some(*size),
+        _ => None,
+    })
+}
+
+fn ask_size(daemon: &mut Daemon, id: u64, pane: PaneId, cols: u16, rows: u16) {
+    daemon.request_for_test(
+        id,
+        ClientMessage::ResizePane {
+            pane,
+            size: (cols, rows),
+        },
+    );
+}
+
+/// Two windows on one pane: window 1 asked 100×30 and window 2, used
+/// last, asked 60×20.
+fn two_windows(label: &str) -> (Daemon, TempDir, PaneId, Inbox, Inbox) {
+    let (mut daemon, project, dir) = daemon(label);
+    let first = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &first, project);
+    ask_size(&mut daemon, 1, pane, 100, 30);
+    let second = attach_window(&mut daemon, 2);
+    ask_size(&mut daemon, 2, pane, 60, 20);
+    let _ = drain(&first);
+    let _ = drain(&second);
+    (daemon, dir, pane, first, second)
+}
+
+#[test]
+fn a_pane_takes_the_size_of_the_window_last_used() {
+    let (mut daemon, _dir, pane, first, second) = two_windows("size-last-used");
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(60, 20)));
+
+    daemon.request_for_test(1, ClientMessage::Active);
+
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(100, 30)));
+    assert_eq!(resized(&drain(&first), pane), Some((100, 30)));
+    assert_eq!(
+        resized(&drain(&second), pane),
+        Some((100, 30)),
+        "the other window is told the real size too"
+    );
+}
+
+#[test]
+fn typing_counts_as_use_and_resizing_does_not() {
+    let (mut daemon, _dir, pane, _first, _second) = two_windows("size-typing");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"x".to_vec(),
+        },
+    );
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(100, 30)));
+
+    ask_size(&mut daemon, 2, pane, 70, 25);
+    assert_eq!(
+        daemon.pane_size_for_test(pane),
+        Some(Size::new(100, 30)),
+        "a resize is not use: window 1 still decides"
+    );
+}
+
+#[test]
+fn the_next_window_takes_over_when_the_one_in_use_leaves() {
+    let (mut daemon, _dir, pane, first, _second) = two_windows("size-leaves");
+
+    daemon.detach_for_test(2);
+
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(100, 30)));
+    assert_eq!(resized(&drain(&first), pane), Some((100, 30)));
+}
+
+#[test]
+fn a_window_that_stops_showing_a_pane_stops_sizing_it() {
+    let (mut daemon, _dir, pane, _first, _second) = two_windows("size-hides");
+
+    daemon.request_for_test(2, ClientMessage::HidePane { pane });
+
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(100, 30)));
+}
+
+#[test]
+fn a_pane_nobody_shows_keeps_its_size() {
+    let (mut daemon, project, _dir) = daemon("size-nobody");
+    let first = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &first, project);
+    ask_size(&mut daemon, 1, pane, 100, 30);
+    let _ = drain(&first);
+
+    daemon.request_for_test(1, ClientMessage::HidePane { pane });
+
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(100, 30)));
+    assert_eq!(resized(&drain(&first), pane), None, "nothing changed");
+}
+
+#[test]
+fn a_new_pane_is_announced_with_its_size() {
+    let (mut daemon, project, _dir) = daemon("size-new-pane");
+    let first = attach_window(&mut daemon, 1);
+    let _ = drain(&first);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (90, 33),
+            place: Placement::Auto,
+        },
+    );
+    let seen = drain(&first);
+    let spawned = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+        .expect("announced");
+    let ServerMessage::PaneSpawned { pane: new, .. } = &seen[spawned] else {
+        unreachable!()
+    };
+    let sized = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneResized { pane: p, .. } if p == new))
+        .expect("its size is said");
+    assert!(spawned < sized, "after the announcement");
+    assert_eq!(resized(&seen, *new), Some((90, 33)));
+}
+
+#[test]
+fn a_subagent_is_announced_with_its_size() {
+    let (mut daemon, project, _dir) = daemon("size-subagent");
+    let ui = attach_window(&mut daemon, 1);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    // The delegation helper, which asks at 80×24.
+    let _caller = ask(&mut daemon, parent, "echo sized");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = drain(&ui);
+    let child = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned {
+                pane,
+                parent: Some(p),
+                ..
+            } if *p == parent => Some(*pane),
+            _ => None,
+        })
+        .expect("the subagent is announced");
+    assert_eq!(resized(&seen, child), Some((80, 24)));
+}
+
+#[test]
+fn a_window_attaching_is_told_each_panes_size_before_its_output() {
+    let (mut daemon, project, _dir) = daemon("size-catch-up");
+    let first = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &first, project);
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"echo size-catch-up-marker\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &first, |m| {
+        output_of(m, pane).contains("size-catch-up-marker")
+    });
+
+    let second = attach_window(&mut daemon, 2);
+    let seen = drain(&second);
+
+    let spawned = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneSpawned { pane: p, .. } if *p == pane))
+        .expect("the pane is described");
+    let sized = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneResized { pane: p, .. } if *p == pane))
+        .expect("its size is said");
+    let replayed = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneOutput { pane: p, .. } if *p == pane))
+        .expect("its output is replayed");
+    assert!(spawned < sized && sized < replayed, "{seen:#?}");
+}
+
+#[test]
+fn a_delegate_connection_never_decides_a_size() {
+    let (mut daemon, _dir, pane, _first, _second) = two_windows("size-delegate");
+    let _caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+
+    ask_size(&mut daemon, 9, pane, 40, 10);
+    daemon.request_for_test(9, ClientMessage::Active);
+
+    assert_eq!(daemon.pane_size_for_test(pane), Some(Size::new(60, 20)));
+}
