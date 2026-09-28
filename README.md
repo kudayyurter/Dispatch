@@ -199,6 +199,14 @@ agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
 [docs/security-model.md](docs/security-model.md) before running an agent you
 do not trust this way.
 
+Claude Code refuses to start in bypass mode when it runs as root: on a
+machine where Dispatch's daemon runs as root — a container, many remote
+machines — every Claude pane and every delegated `claude -p` exits at once.
+Save another **Permissions** mode for Claude on that machine (`e`, then
+`s`), or, only when the machine really is a sandbox such as a container,
+set `IS_SANDBOX = "1"` in that machine's `claude.toml` under `[env]`, which
+Claude reads as permission to bypass.
+
 In the new-pane picker, `e` opens the highlighted harness's settings:
 
 | Key | Does |
@@ -230,7 +238,10 @@ permissions = ""   # agent default: Claude asks, as it does outside Dispatch
 bypass = false     # Codex's prompts and sandbox are back
 ```
 
-A subagent started by `dispatch delegate` uses them too.
+These are per machine: a subagent is started by the daemon on its own
+machine, so it follows that machine's saved defaults, not the file of the
+machine you are typing on, and not a one-off choice made in the pane that
+asked for it.
 
 A harness file says what its settings are, and how each becomes a flag, so a
 harness you add can have them as well:
@@ -258,7 +269,14 @@ args = ["--permission-mode", "{value}"]
 A `bool` adds its `args` when it is on. A value may hold only letters, digits
 and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
 `cmd.exe`'s command line. The daemon reads harness files when it starts, so
-restart it after editing one.
+restart it after editing one, and after upgrading Dispatch too: a daemon
+started before this release ignores the settings a newer client sends, and
+keeps the harness files it already loaded.
+
+A harness file you have edited is left as it is when Dispatch upgrades: it
+keeps its prompts and offers no settings until you delete it (Dispatch
+writes the current one back on its next start) or add `[[settings]]` to it
+yourself.
 
 ## The sidebar
 
@@ -490,9 +508,11 @@ args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
 input = "file"
 ```
 
-`claude` and `codex` ship with one. A subagent starts with the
-harness's saved settings, auto-approve included, so it can use its
-tools without waiting on a prompt nobody would see. On Windows the
+`claude` and `codex` ship with one. A subagent starts on the daemon's own
+machine and follows that machine's saved settings, auto-approve included,
+so it can use its tools without waiting on a prompt nobody would see —
+not a one-off choice made in the pane that asked for it, and not another
+machine's saved file. On Windows the
 daemon refuses a form that would put the task on `cmd.exe`'s
 command line, and says which file to fix. Caps live in `config.toml`,
 and refuse rather than prompt:

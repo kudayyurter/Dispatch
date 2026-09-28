@@ -49,12 +49,21 @@ Codex's flag also turns off the sandbox it would otherwise run commands in.
 A subagent started by delegation runs the same way: approval decides whether
 it starts, not what it may do once it has.
 
+Claude Code refuses to start in `bypassPermissions` mode when it runs as
+root, though, so on a machine where Dispatch's daemon runs as root — a
+container, many remote machines — every Claude pane and every delegated
+`claude -p` exits at once.
+
 This trades a guard rail for flow, and the user can trade it back. In the
 new-pane picker, `e` on a harness opens its settings. Set Claude's
 **Permissions** to another mode, or turn **Skip prompts** or
-**Auto-approve** off, then press `s` to save the agent's own prompts as that
-harness's default. The advice above stands: an agent that is not trusted
-belongs under an operating-system boundary, not behind its own prompts.
+**Auto-approve** off, then press `s` to save the agent's own prompts as
+that harness's default. That save reaches only this machine: a subagent
+runs on the daemon's own machine and follows that machine's saved
+defaults, not the one you just saved, so turning prompts back on
+everywhere means saving on each machine. The advice above stands: an agent
+that is not trusted belongs under an operating-system boundary, not behind
+its own prompts.
 
 ## Opening a project means trusting it
 
