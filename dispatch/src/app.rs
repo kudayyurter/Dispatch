@@ -2383,15 +2383,17 @@ impl App {
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
         // Anything the user does in this window makes it the one in use,
         // including what never reaches a daemon: moving focus, switching
-        // tabs, resizing the window.
-        if matches!(
-            event,
-            Event::Key(_)
-                | Event::Mouse(_)
-                | Event::Paste(_)
-                | Event::Resize(..)
-                | Event::FocusGained
-        ) {
+        // tabs, resizing the window. A bare `Moved` does not count: mouse
+        // capture reports plain hover, and a terminal usually sends pointer
+        // motion to the window under the pointer even without keyboard
+        // focus, so hovering over an idle window must not steal every
+        // shared pane's size.
+        let is_use = match event {
+            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
+            Event::Key(_) | Event::Paste(_) | Event::Resize(..) | Event::FocusGained => true,
+            _ => false,
+        };
+        if is_use {
             self.note_active();
         }
         let handled = self.act_on(event, area);
@@ -5472,6 +5474,33 @@ mod tests {
         advance(&clock, Duration::from_millis(500));
         press(&mut app, KeyCode::Char('z'));
         assert_eq!(actives(&sent), 1);
+    }
+
+    #[test]
+    fn hovering_does_not_tell_the_daemon_this_window_is_in_use() {
+        // Mouse capture reports plain hover, and a terminal usually sends
+        // pointer motion to the window under the pointer even when it lacks
+        // keyboard focus. So a `Moved` event must not count as use — only a
+        // button going down (or up, or dragging, or a wheel) does.
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        app.handle(
+            &Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Size::new(100, 30),
+        )
+        .expect("a hover is handled");
+        assert_eq!(actives(&sent), 0, "hovering is not use");
+
+        click(&mut app, 5, 5);
+        assert_eq!(actives(&sent), 1, "a press is use");
     }
 
     #[test]
