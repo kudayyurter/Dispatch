@@ -1985,6 +1985,8 @@ impl App {
                 .state
                 .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
 
+            ServerMessage::PaneResized { .. } => false,
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
             // clients. Unknown messages from newer peers are ignored.

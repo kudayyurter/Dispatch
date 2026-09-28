@@ -202,6 +202,19 @@ pub enum ClientMessage {
         size: (u16, u16),
     },
 
+    /// The user is using this window: it should decide the size of the panes
+    /// it shows.
+    ///
+    /// Sent on input the daemon would not otherwise see, such as moving focus
+    /// or resizing the window, at most twice a second.
+    Active,
+
+    /// This window no longer shows `pane`, so its size for it stops counting.
+    HidePane {
+        /// The pane it has stopped showing.
+        pane: PaneId,
+    },
+
     /// Closes a pane and terminates its process tree.
     ClosePane {
         /// Which pane.
@@ -311,6 +324,18 @@ pub enum ServerMessage {
         /// and re-rendering remotely would cost a full screen per frame.
         #[serde(with = "serde_bytes_compat")]
         bytes: Vec<u8>,
+    },
+
+    /// A pane's pty is now `size`, as `(cols, rows)`.
+    ///
+    /// Sent after the pty was resized, so output drawn at the new size always
+    /// follows it on the connection, and output drawn at the old size comes
+    /// before it.
+    PaneResized {
+        /// Which pane.
+        pane: PaneId,
+        /// Its size now, in cells, as `(cols, rows)`.
+        size: (u16, u16),
     },
 
     /// A pane changed in some way other than producing output.

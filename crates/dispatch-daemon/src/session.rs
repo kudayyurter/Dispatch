@@ -792,6 +792,8 @@ impl Daemon {
                 self.change_tab(id, tab, |tabs| tabs.move_tab(tab, index));
             }
 
+            ClientMessage::Active | ClientMessage::HidePane { .. } => {}
+
             ClientMessage::Unknown => {
                 tracing::debug!(
                     client = id,
