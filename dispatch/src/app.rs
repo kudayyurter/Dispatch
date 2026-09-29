@@ -2629,6 +2629,9 @@ impl App {
         match action {
             Action::None => {}
             Action::Quit => self.quit = true,
+            Action::SendKey(key, mods) if self.ctrl_z_closes_focused(key, mods) => {
+                self.close_focused();
+            }
             Action::SendKey(key, mods) => self.send_key(key, mods),
             Action::Paste(text) => self.paste(&text),
             Action::FocusPane(id) => self.focus_pane(id),
@@ -3997,6 +4000,28 @@ impl App {
         if let Some(id) = best {
             let _ = self.state.focus(id);
         }
+    }
+
+    /// Whether `key` is Ctrl Z on the focused pane, and that pane runs an
+    /// agent rather than a shell.
+    ///
+    /// An agent cannot be suspended in a pane: its program leads a process
+    /// group with no parent in its session, so the stop it sends itself is
+    /// discarded, and there is no shell to bring it back with `fg` anyway.
+    /// What an agent does instead varies -- it ignores the key, or exits and
+    /// leaves its pane behind -- so Dispatch takes the key and closes the
+    /// pane. A shell has job control, and keeps Ctrl Z for the job it runs.
+    fn ctrl_z_closes_focused(&self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) -> bool {
+        let ctrl_z = matches!(key, dispatch_pty::Key::Char('z' | 'Z'))
+            && mods.ctrl
+            && !mods.alt
+            && !mods.super_;
+        ctrl_z
+            && self
+                .state
+                .focused_pane()
+                .and_then(|id| self.state.pane(id))
+                .is_some_and(|pane| pane.harness.as_str() != SHELL)
     }
 
     fn close_focused(&mut self) {
@@ -10153,6 +10178,62 @@ mod tests {
             app.state.pane(pane).is_none_or(|pane| pane.closed),
             "its row goes with it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A standalone app with one pane running `harness` over `sh`, focused.
+    #[cfg(unix)]
+    fn app_with_a_pane_of(harness: &str, label: &str) -> (App, PaneId, PathBuf) {
+        let def = dispatch_config::HarnessDef {
+            id: harness.to_string(),
+            display_name: harness.to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dir = scratch(label);
+        let mut app = App::new([def].into_iter().collect());
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane(harness, Size::new(80, 24))
+            .expect("the pane starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+        (app, pane, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_z_in_an_agents_pane_closes_it() {
+        // An agent cannot be suspended in a pane -- its process group is
+        // orphaned, so the stop it sends itself is discarded -- and what it
+        // does instead varies: ignores the key, or exits and leaves the pane
+        // behind. Dispatch takes the key and closes the pane, as closing it
+        // any other way would.
+        let (mut app, pane, dir) = app_with_a_pane_of("agent", "ctrl-z-agent");
+
+        key_with(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+
+        assert!(!app.panes.contains_key(&pane), "the agent is ended");
+        assert!(
+            app.state.pane(pane).is_none_or(|pane| pane.closed),
+            "and its pane is closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_z_in_a_shell_pane_still_reaches_the_shell() {
+        // A shell has job control: Ctrl Z stops the job it runs, and the
+        // shell carries on.
+        let (mut app, pane, dir) = app_with_a_pane_of(SHELL, "ctrl-z-shell");
+
+        key_with(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+
+        assert!(app.panes.contains_key(&pane), "the shell's pane stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
