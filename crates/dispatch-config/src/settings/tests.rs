@@ -137,10 +137,10 @@ args = ["--model", "{value}"]
 "#,
     );
 
-    assert!(matches!(
-        &setting(&def, "model").kind,
-        SettingKind::Choice { options, .. } if options == &vec!["small".to_string()]
-    ));
+    assert_eq!(
+        setting(&def, "model").options(),
+        [ChoiceOption::new("small")]
+    );
 }
 
 #[test]
@@ -537,4 +537,95 @@ fn agent_default_over_a_files_default_is_described_by_name() {
         def.describe_changes(&values(&[("permissions", "")])),
         vec!["Permissions agent default"]
     );
+}
+
+/// A model whose options are tables with labels, mixed with a plain one.
+const LABELLED: &str = r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [{ value = "small", label = "Small" }, "large"]
+custom = true
+args = ["--model", "{value}"]
+"#;
+
+#[test]
+fn an_option_can_be_a_table_with_a_label_mixed_with_plain_ones() {
+    let def = demo_harness(LABELLED);
+    let model = setting(&def, "model");
+
+    let values: Vec<&str> = model.options().iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(values, ["small", "large"]);
+    assert_eq!(model.options()[0].label(), "Small");
+    assert_eq!(
+        model.options()[1].label(),
+        "large",
+        "a label defaults to the value"
+    );
+}
+
+#[test]
+fn a_table_option_with_no_value_is_dropped_and_the_rest_kept() {
+    let def = demo_harness(
+        r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["small", { label = "Nameless" }]
+args = ["--model", "{value}"]
+"#,
+    );
+
+    let model = setting(&def, "model");
+    let values: Vec<&str> = model.options().iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(values, ["small"]);
+}
+
+#[test]
+fn a_label_the_popup_cannot_draw_falls_back_to_the_value() {
+    // An escape sequence in a label would be written to the terminal as is.
+    let def = demo_harness(
+        r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [{ value = "small", label = "\u001b[2JSmall" }, { value = "large", label = "  " }]
+args = ["--model", "{value}"]
+"#,
+    );
+    let model = setting(&def, "model");
+
+    assert_eq!(model.options()[0].label(), "small");
+    assert_eq!(model.options()[1].label(), "large");
+}
+
+#[test]
+fn a_chosen_option_is_described_by_its_label_and_a_typed_one_as_itself() {
+    let def = demo_harness(LABELLED);
+
+    assert_eq!(
+        def.describe_changes(&values(&[("model", "small")])),
+        vec!["Small"]
+    );
+    assert_eq!(
+        def.describe_changes(&values(&[("model", "large")])),
+        vec!["large"]
+    );
+    assert_eq!(
+        def.describe_changes(&values(&[("model", "big-1")])),
+        vec!["big-1"]
+    );
+}
+
+#[test]
+fn an_option_written_back_reads_the_same() {
+    let model = setting(&demo_harness(LABELLED), "model");
+
+    let written = toml::Value::try_from(&model).expect("a setting serialises");
+    let back: SettingDef = written.try_into().expect("and reads back");
+
+    assert_eq!(back, model);
 }

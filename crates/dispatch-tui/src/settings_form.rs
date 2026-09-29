@@ -6,7 +6,7 @@
 //! open, save, or go back.
 
 use dispatch_config::{
-    Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, SettingDef, SettingKind, is_safe_char,
+    ChoiceOption, Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, SettingDef, SettingKind, is_safe_char,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -51,7 +51,10 @@ enum Shape {
     /// On or off.
     Flag,
     /// One of a list, and maybe a typed value after it.
-    Choice { options: Vec<String>, custom: bool },
+    Choice {
+        options: Vec<ChoiceOption>,
+        custom: bool,
+    },
     /// Typed.
     Text,
 }
@@ -126,7 +129,7 @@ impl Row {
             _ if self.value.is_empty() => Slot::Default,
             Shape::Choice { options, .. } => options
                 .iter()
-                .position(|option| *option == self.value)
+                .position(|option| option.value == self.value)
                 .map_or(Slot::Typed, Slot::Option),
             Shape::Text => Slot::Typed,
         }
@@ -154,7 +157,7 @@ impl Row {
             Shape::Choice { options, custom } => {
                 let option = options
                     .iter()
-                    .map(|option| option.chars().count())
+                    .map(|option| option.value.chars().count())
                     .max()
                     .unwrap_or(0);
                 option
@@ -403,7 +406,7 @@ impl SettingsForm {
             Slot::Default => row.value.clear(),
             Slot::Option(index) => {
                 if let Shape::Choice { options, .. } = &row.shape {
-                    row.value = options[index].clone();
+                    row.value = options[index].value.clone();
                 }
             }
             Slot::Typed => {

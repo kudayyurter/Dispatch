@@ -23,7 +23,7 @@ pub enum SettingKind {
     /// One of a fixed set of values, such as a model or effort level.
     Choice {
         /// The values on offer.
-        options: Vec<String>,
+        options: Vec<ChoiceOption>,
         /// Value used when the user does not supply one.
         #[serde(default)]
         default: Option<String>,
@@ -34,6 +34,94 @@ pub enum SettingKind {
         #[serde(default)]
         default: Option<bool>,
     },
+}
+
+/// One value a choice offers.
+///
+/// A harness file writes it as the value alone, or as a table naming how it
+/// is shown too: `{ value = "gemini-3.1-pro", label = "Gemini 3.1 Pro",
+/// effort = ["low", "high"] }`. Any other key in the table names a setting
+/// `limited_by` this one, and lists the values that setting may take while
+/// this option is chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "OptionForm", into = "OptionForm")]
+pub struct ChoiceOption {
+    /// What is passed to the agent and saved.
+    pub value: String,
+    /// What the popup and the picker show; the value when absent.
+    pub label: Option<String>,
+    /// For each setting limited by this one, by key: the values it may take
+    /// while this option is chosen. A limited setting this names nothing
+    /// for takes none.
+    pub allows: BTreeMap<String, Vec<String>>,
+}
+
+impl ChoiceOption {
+    /// An option with no label, limiting nothing.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: None,
+            allows: BTreeMap::new(),
+        }
+    }
+
+    /// What is shown for this option.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.value)
+    }
+}
+
+/// How an option is written in a harness file.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OptionForm {
+    /// The value alone.
+    Plain(String),
+    /// A table.
+    Table(OptionTable),
+}
+
+/// An option written as a table.
+#[derive(Clone, Serialize, Deserialize)]
+struct OptionTable {
+    /// Missing is empty, which no value may be, so the option is dropped
+    /// on load rather than failing the whole file.
+    #[serde(default)]
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(flatten)]
+    allows: BTreeMap<String, Vec<String>>,
+}
+
+impl From<OptionForm> for ChoiceOption {
+    fn from(form: OptionForm) -> Self {
+        match form {
+            OptionForm::Plain(value) => ChoiceOption::new(value),
+            OptionForm::Table(table) => ChoiceOption {
+                value: table.value,
+                label: table.label,
+                allows: table.allows,
+            },
+        }
+    }
+}
+
+impl From<ChoiceOption> for OptionForm {
+    fn from(option: ChoiceOption) -> Self {
+        if option.label.is_none() && option.allows.is_empty() {
+            OptionForm::Plain(option.value)
+        } else {
+            OptionForm::Table(OptionTable {
+                value: option.value,
+                label: option.label,
+                allows: option.allows,
+            })
+        }
+    }
 }
 
 /// One configurable setting a harness exposes.

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskRun};
+use crate::harness::{ChoiceOption, HarnessDef, Launch, SettingDef, SettingKind, TaskRun};
 
 /// Each setting's value, by key, as the popup, the saved file and the
 /// protocol carry it: a choice or text as itself, `""` for agent default,
@@ -55,6 +55,28 @@ impl SettingDef {
         matches!(self.kind, SettingKind::Bool { .. })
     }
 
+    /// A choice's options, in file order; none for text or a flag.
+    #[must_use]
+    pub fn options(&self) -> &[ChoiceOption] {
+        match &self.kind {
+            SettingKind::Choice { options, .. } => options,
+            SettingKind::Text { .. } | SettingKind::Bool { .. } => &[],
+        }
+    }
+
+    /// The option whose value is `value`, if there is one.
+    #[must_use]
+    pub fn option(&self, value: &str) -> Option<&ChoiceOption> {
+        self.options().iter().find(|option| option.value == value)
+    }
+
+    /// `value` as it is shown: an option by its label, anything else --
+    /// typed, or text -- as itself.
+    #[must_use]
+    pub fn label_of<'a>(&'a self, value: &'a str) -> &'a str {
+        self.option(value).map_or(value, ChoiceOption::label)
+    }
+
     /// The value this setting has when nothing was chosen or saved: the
     /// file's `default`, or agent default. A flag with no default is off.
     #[must_use]
@@ -83,7 +105,7 @@ impl SettingDef {
                 )),
             },
             SettingKind::Choice { options, .. } => {
-                if value.is_empty() || options.iter().any(|option| option == value) {
+                if value.is_empty() || options.iter().any(|option| option.value == value) {
                     Ok(())
                 } else if !self.custom {
                     Err(format!("{value:?} is not one of {key}'s options"))
@@ -167,12 +189,12 @@ pub(crate) fn usable(id: &str, settings: Vec<SettingDef>) -> Vec<SettingDef> {
             }
             SettingKind::Choice { options, default } => {
                 options.retain(|option| {
-                    let safe = is_safe_value(option);
+                    let safe = is_safe_value(&option.value);
                     if !safe {
                         tracing::warn!(
                             harness = id,
                             setting = %key,
-                            %option,
+                            option = %option.value,
                             "dropping an option a command line cannot safely carry"
                         );
                     }
@@ -183,9 +205,27 @@ pub(crate) fn usable(id: &str, settings: Vec<SettingDef>) -> Vec<SettingDef> {
                     continue;
                 }
 
+                // A label is written to the terminal as it is: an escape
+                // sequence in one would redraw the screen.
+                for option in options.iter_mut() {
+                    let drawable = option.label.as_deref().is_none_or(|label| {
+                        !label.trim().is_empty() && !label.chars().any(char::is_control)
+                    });
+                    if !drawable {
+                        tracing::warn!(
+                            harness = id,
+                            setting = %key,
+                            option = %option.value,
+                            "dropping a label the popup cannot draw; the value is shown"
+                        );
+                        option.label = None;
+                    }
+                }
+
                 let custom = setting.custom;
                 let fits = default.as_deref().is_none_or(|value| {
-                    options.iter().any(|option| option == value) || (custom && is_safe_value(value))
+                    options.iter().any(|option| option.value == value)
+                        || (custom && is_safe_value(value))
                 });
                 if !fits {
                     tracing::warn!(
@@ -300,8 +340,8 @@ impl HarnessDef {
     }
 
     /// Each value in `values` that differs from the file's default, as the
-    /// new-pane picker names it beside the harness: a choice or text as
-    /// itself, agent default and flags by their label.
+    /// new-pane picker names it beside the harness: an option by its label,
+    /// typed text as itself, agent default and flags by the setting's label.
     #[must_use]
     pub fn describe_changes(&self, values: &Choices) -> Vec<String> {
         self.settings
@@ -317,7 +357,7 @@ impl HarnessDef {
                 } else if value.is_empty() {
                     format!("{} agent default", setting.label)
                 } else {
-                    value.clone()
+                    setting.label_of(value).to_string()
                 })
             })
             .collect()
