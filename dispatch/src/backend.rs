@@ -110,6 +110,17 @@ impl Backend {
         }
     }
 
+    /// Whether the pane's process is stopped -- by Ctrl Z, say. Only a
+    /// process this client started can be: a daemon's pane is the daemon's
+    /// to notice, and to close.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        match self {
+            Self::Local(session) => session.is_stopped(),
+            Self::Remote(_) => false,
+        }
+    }
+
     /// Whether the pane's process is still running.
     #[must_use]
     pub fn state(&self) -> RunState {

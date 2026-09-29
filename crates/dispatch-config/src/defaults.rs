@@ -50,7 +50,10 @@ pub const BUILT_INS: &[BuiltIn] = &[
     BuiltIn {
         id: "agy",
         toml: include_str!("../harnesses/agy.toml"),
-        superseded: &[include_str!("../harnesses/superseded/agy-1.toml")],
+        superseded: &[
+            include_str!("../harnesses/superseded/agy-1.toml"),
+            include_str!("../harnesses/superseded/agy-2.toml"),
+        ],
     },
     BuiltIn {
         id: "opencode",

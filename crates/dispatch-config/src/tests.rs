@@ -626,7 +626,10 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
         ),
         (
             "agy",
-            vec![include_str!("../harnesses/superseded/agy-1.toml")],
+            vec![
+                include_str!("../harnesses/superseded/agy-1.toml"),
+                include_str!("../harnesses/superseded/agy-2.toml"),
+            ],
         ),
         (
             "opencode",
@@ -1261,6 +1264,23 @@ fn every_built_in_skips_permission_prompts_by_default() {
         assert_eq!(windows[..2], ["/c", id], "{id}");
         assert_eq!(windows[2..], flags[..], "{id}");
     }
+}
+
+#[test]
+fn agy_takes_its_effort_from_the_model_name_alone() {
+    // agy's models carry their effort in the name (`gemini-3.8-flash-high`).
+    // Its `--effort` conflicts with a different one -- agy then quietly
+    // falls back to another model altogether -- and is refused outright for
+    // a model without one, so there is no row for it.
+    let (_dir, registry) = shipped();
+    let agy = registry.get("agy").expect("it ships");
+
+    assert!(
+        agy.settings.iter().all(|setting| setting.key != "effort"),
+        "{:?}",
+        agy.settings
+    );
+    assert!(agy.settings.iter().any(|setting| setting.key == "model"));
 }
 
 #[test]

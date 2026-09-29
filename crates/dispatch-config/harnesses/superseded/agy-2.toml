@@ -24,9 +24,12 @@ options = [
 custom = true
 args = ["--model", "{value}"]
 
-# No effort row: agy's models carry their effort in their name. Its
-# --effort conflicts with a different one (agy then falls back to another
-# model altogether) and is refused for a model without one.
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+options = ["low", "medium", "high"]
+args = ["--effort", "{value}"]
 
 [[settings]]
 key = "bypass"

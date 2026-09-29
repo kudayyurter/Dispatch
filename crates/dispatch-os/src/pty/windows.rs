@@ -82,6 +82,12 @@ impl Child {
         }
     }
 
+    /// Windows has no job-control stop: nothing a key does in a pane
+    /// suspends its process.
+    pub(super) fn is_stopped(&self) -> bool {
+        false
+    }
+
     pub(super) fn end_tree(
         &self,
         grace: std::time::Duration,

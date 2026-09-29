@@ -92,6 +92,19 @@ fn motion_is_on_unless_turned_off() {
 }
 
 #[test]
+fn hovering_claims_panes_only_when_turned_on() {
+    assert!(!Config::default().interface.hover_claims_panes);
+
+    let config: Config =
+        toml::from_str("[interface]\nhover_claims_panes = true\n").expect("parses");
+    assert!(config.interface.hover_claims_panes);
+
+    let raw: toml::Table =
+        toml::from_str("[interface]\nhover_claims_panes = true\n").expect("parses");
+    assert!(unknown_keys(&raw).is_empty(), "a key this build knows");
+}
+
+#[test]
 fn the_interface_section_is_not_reported_unknown() {
     let raw: toml::Table = toml::from_str("[interface]\nmotion = false\n").expect("parses");
     assert!(unknown_keys(&raw).is_empty());

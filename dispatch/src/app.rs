@@ -692,6 +692,9 @@ pub struct App {
     /// [`App::note_active`] can hold `Active` to at most one per
     /// [`ACTIVE_EVERY`].
     active_sent: Option<Instant>,
+    /// Whether the pointer passing over this window counts as using it:
+    /// `[interface] hover_claims_panes`.
+    hover_claims_panes: bool,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -767,6 +770,7 @@ impl App {
             tab_hits: Vec::new(),
             fitted: HashSet::new(),
             active_sent: None,
+            hover_claims_panes: false,
         }
     }
 
@@ -868,6 +872,12 @@ impl App {
     pub fn set_motion(&mut self, on: bool) {
         self.motion = on;
         self.animations.set_enabled(on);
+    }
+
+    /// Makes the pointer passing over this window count as using it, so
+    /// the window under the pointer decides the size of shared panes.
+    pub fn set_hover_claims_panes(&mut self, on: bool) {
+        self.hover_claims_panes = on;
     }
 
     /// Reads keys through `keymap`: the defaults with the user's `[keys]`
@@ -2229,6 +2239,7 @@ impl App {
         let mut changed = false;
         let mut exited = Vec::new();
         let mut outputs = Vec::new();
+        let mut stopped = Vec::new();
 
         for (id, pane) in &mut self.panes {
             let output = pane.backend.drain();
@@ -2245,6 +2256,18 @@ impl App {
             if let RunState::Exited(code) = pane.backend.state() {
                 exited.push((*id, code));
             }
+            if pane.backend.is_stopped() {
+                stopped.push(*id);
+            }
+        }
+
+        // Ctrl Z in a pane stops its program, and a pane's program is its
+        // leader, with no shell behind it to bring it back: closed, as the
+        // user closing it would, rather than left frozen for good.
+        for id in stopped {
+            tracing::info!(pane = %id, "a pane's program stopped; closing it");
+            self.close_pane(id);
+            changed = true;
         }
 
         for (id, output) in outputs {
@@ -2448,9 +2471,9 @@ impl App {
         // capture reports plain hover, and a terminal usually sends pointer
         // motion to the window under the pointer even without keyboard
         // focus, so hovering over an idle window must not steal every
-        // shared pane's size.
+        // shared pane's size -- unless the user asked for exactly that.
         let is_use = match event {
-            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
+            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved || self.hover_claims_panes,
             Event::Key(_) | Event::Paste(_) | Event::Resize(..) | Event::FocusGained => true,
             _ => false,
         };
@@ -5714,6 +5737,38 @@ mod tests {
 
         click(&mut app, 5, 5);
         assert_eq!(actives(&sent), 1, "a press is use");
+    }
+
+    #[test]
+    fn hovering_claims_the_panes_when_the_user_asked_for_that() {
+        // `[interface] hover_claims_panes = true`: the window under the
+        // pointer becomes the one in use, throttled like any other use.
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.set_hover_claims_panes(true);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        let hover = |app: &mut App| {
+            app.handle(
+                &Event::Mouse(dispatch_tui::input::MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 5,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                Size::new(100, 30),
+            )
+            .expect("a hover is handled");
+        };
+
+        hover(&mut app);
+        assert_eq!(actives(&sent), 1, "hovering is use when asked for");
+
+        advance(&clock, Duration::from_millis(100));
+        hover(&mut app);
+        assert_eq!(actives(&sent), 0, "and throttled like the rest");
     }
 
     #[test]
@@ -10053,6 +10108,52 @@ mod tests {
             1,
             "the daemon's machine is the only one left"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_pane_whose_program_stops_is_closed() {
+        // Ctrl Z in a pane whose program is its leader leaves nothing to
+        // bring it back, so the pane is closed rather than left frozen.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dir = scratch("stopped-local");
+        let mut app = App::new([def].into_iter().collect());
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        app.panes
+            .get_mut(&pane)
+            .expect("the pane is held")
+            .backend
+            .write(b"kill -STOP $$\r")
+            .expect("the shell reads it");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.panes.contains_key(&pane) {
+            app.poll_panes();
+            assert!(
+                Instant::now() < deadline,
+                "the stopped pane was never closed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.state.pane(pane).is_none_or(|pane| pane.closed),
+            "its row goes with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

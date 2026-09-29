@@ -533,6 +533,7 @@ impl Daemon {
             self.handle(event);
         }
         self.pump_panes();
+        self.close_stopped_panes();
         self.enforce_deadlines();
     }
 
@@ -1209,13 +1210,41 @@ impl Daemon {
 
     /// Closes a pane and terminates its process tree.
     fn close_pane(&mut self, client: ClientId, pane: PaneId) {
-        let Some(mut target) = self.panes.remove(&pane) else {
+        if !self.panes.contains_key(&pane) {
             self.send(
                 client,
                 ServerMessage::Error {
                     error: ProtocolError::NoSuchPane(pane),
                 },
             );
+            return;
+        }
+        self.end_pane(pane);
+    }
+
+    /// Closes every pane whose program has stopped.
+    ///
+    /// Ctrl Z in a pane stops its program, and a pane's program is its
+    /// leader, with no shell behind it to bring it back with `fg`: left
+    /// alone it would sit frozen for good. So it is closed, as the user
+    /// closing it would. A shell pane is not touched by its own job being
+    /// stopped: the shell is the leader, and takes over again.
+    fn close_stopped_panes(&mut self) {
+        let stopped: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.session.is_stopped())
+            .map(|(id, _)| *id)
+            .collect();
+        for pane in stopped {
+            tracing::info!(%pane, "a pane's program stopped; closing it");
+            self.end_pane(pane);
+        }
+    }
+
+    /// Ends `pane` and everything that goes with it, telling every client.
+    fn end_pane(&mut self, pane: PaneId) {
+        let Some(mut target) = self.panes.remove(&pane) else {
             return;
         };
         let project = target.project;

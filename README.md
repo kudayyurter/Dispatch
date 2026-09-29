@@ -165,6 +165,11 @@ name and skipped, and the rest still applies. `Esc` always leaves a mode,
 lock always has a key that unlocks, and a config that leaves no key to quit
 is logged. Keys are read when Dispatch starts.
 
+`Ctrl z` reaches the pane like any other key. An agent that suspends itself on
+it has no shell behind it to bring it back with `fg`, so Dispatch closes that
+pane and ends the agent, as `Ctrl p x` would. In a shell pane, `Ctrl z`
+suspends the job the shell is running, and the shell and the pane carry on.
+
 ## Shell panes
 
 The picker's first entry is your own shell — `Shell · zsh`, or whatever
@@ -468,6 +473,16 @@ opened most recently. The other windows show it at that size, with blank space
 around it or its edges cut off to fit their tile. A client attaching to a pane
 that is already running is replayed the last 256 KiB it printed, so reattaching
 shows the work rather than a blank rectangle.
+
+Moving the pointer over a window does not count as using it, so a forgotten
+window cannot resize every agent as the pointer crosses it. To have the window
+under the pointer take the panes instead:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+hover_claims_panes = true
+```
 
 An attached client reconnects on its own: restart the daemon, or lose the socket,
 and it waits, says so, and rebuilds its view from what the daemon reports when it
