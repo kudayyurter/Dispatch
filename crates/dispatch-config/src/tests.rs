@@ -611,6 +611,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/claude-4.toml"),
                 include_str!("../harnesses/superseded/claude-5.toml"),
                 include_str!("../harnesses/superseded/claude-6.toml"),
+                include_str!("../harnesses/superseded/claude-7.toml"),
             ],
         ),
         (
@@ -622,6 +623,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/codex-4.toml"),
                 include_str!("../harnesses/superseded/codex-5.toml"),
                 include_str!("../harnesses/superseded/codex-6.toml"),
+                include_str!("../harnesses/superseded/codex-7.toml"),
             ],
         ),
         (
@@ -629,6 +631,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
             vec![
                 include_str!("../harnesses/superseded/agy-1.toml"),
                 include_str!("../harnesses/superseded/agy-2.toml"),
+                include_str!("../harnesses/superseded/agy-3.toml"),
             ],
         ),
         (
@@ -1266,21 +1269,124 @@ fn every_built_in_skips_permission_prompts_by_default() {
     }
 }
 
+/// `pairs` as [`Choices`].
+fn chosen(pairs: &[(&str, &str)]) -> Choices {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 #[test]
-fn agy_takes_its_effort_from_the_model_name_alone() {
-    // agy's models carry their effort in the name (`gemini-3.8-flash-high`).
-    // Its `--effort` conflicts with a different one -- agy then quietly
-    // falls back to another model altogether -- and is refused outright for
-    // a model without one, so there is no row for it.
+fn agy_is_passed_a_base_model_and_an_effort_it_offers() {
+    // agy refuses an effort its model does not have (gemini-3.1-pro has no
+    // medium) and any effort for a model with none (its Claude models).
+    let (_dir, registry) = shipped();
+    let agy = registry.get("agy").expect("it ships");
+    let args = |pairs: &[(&str, &str)]| {
+        let values = agy
+            .resolve(&chosen(pairs), &Choices::new())
+            .expect("fitted");
+        agy.launch_with("linux", &values).args
+    };
+
+    assert_eq!(
+        args(&[("model", "gemini-3.1-pro"), ("effort", "medium")]),
+        [
+            "--model",
+            "gemini-3.1-pro",
+            "--effort",
+            "high",
+            "--dangerously-skip-permissions"
+        ]
+    );
+    assert_eq!(
+        args(&[("model", "gemini-3.8-flash"), ("effort", "medium")]),
+        [
+            "--model",
+            "gemini-3.8-flash",
+            "--effort",
+            "medium",
+            "--dangerously-skip-permissions"
+        ]
+    );
+    assert_eq!(
+        args(&[("model", "claude-sonnet-4-6"), ("effort", "high")]),
+        [
+            "--model",
+            "claude-sonnet-4-6",
+            "--dangerously-skip-permissions"
+        ]
+    );
+    assert_eq!(
+        args(&[("model", "gpt-oss-120b")]),
+        [
+            "--model",
+            "gpt-oss-120b",
+            "--effort",
+            "medium",
+            "--dangerously-skip-permissions"
+        ]
+    );
+}
+
+#[test]
+fn an_agy_model_saved_before_this_change_still_launches() {
+    // `gemini-3.8-flash-high` was an option; now it is a typed model, which
+    // agy takes as it is, and the effort is left to the user.
     let (_dir, registry) = shipped();
     let agy = registry.get("agy").expect("it ships");
 
-    assert!(
-        agy.settings.iter().all(|setting| setting.key != "effort"),
-        "{:?}",
-        agy.settings
+    let values = agy
+        .resolve(
+            &Choices::new(),
+            &chosen(&[("model", "gemini-3.8-flash-high")]),
+        )
+        .expect("nothing chosen");
+
+    assert_eq!(
+        agy.launch_with("linux", &values).args,
+        [
+            "--model",
+            "gemini-3.8-flash-high",
+            "--dangerously-skip-permissions"
+        ]
     );
-    assert!(agy.settings.iter().any(|setting| setting.key == "model"));
+}
+
+#[test]
+fn every_shipped_option_has_a_clean_label() {
+    let (_dir, registry) = shipped();
+
+    for id in ["claude", "codex", "agy"] {
+        let def = registry.get(id).expect("it ships");
+        for setting in &def.settings {
+            for option in setting.options() {
+                let label = option.label.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "{id}'s {} option {:?} has no label",
+                        setting.key, option.value
+                    )
+                });
+                assert!(
+                    !label.contains('-') || label.starts_with("GPT"),
+                    "{id}: {label:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_picker_names_agys_choices_by_label() {
+    let (_dir, registry) = shipped();
+    let agy = registry.get("agy").expect("it ships");
+
+    let values = agy
+        .resolve(&chosen(&[("model", "gemini-3.1-pro")]), &Choices::new())
+        .expect("fitted");
+
+    assert_eq!(agy.describe_changes(&values), ["Gemini 3.1 Pro", "High"]);
 }
 
 #[test]
