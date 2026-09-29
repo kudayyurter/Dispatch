@@ -29,12 +29,16 @@ default = true
 args = ["--yolo"]
 "#;
 
-fn settings() -> Vec<SettingDef> {
+fn parse(settings: &str) -> Vec<SettingDef> {
     let def: HarnessDef = toml::from_str(&format!(
-        "id = \"demo\"\ndisplay_name = \"Demo\"\ncommand = \"demo\"\n{SETTINGS}"
+        "id = \"demo\"\ndisplay_name = \"Demo\"\ncommand = \"demo\"\n{settings}"
     ))
     .expect("a valid harness");
     def.settings
+}
+
+fn settings() -> Vec<SettingDef> {
+    parse(SETTINGS)
 }
 
 fn form_with(values: &[(&str, &str)]) -> SettingsForm {
@@ -345,4 +349,196 @@ fn a_popup_bigger_than_the_screen_is_clipped_not_a_panic() {
     for (width, height) in [(80, 10), (30, 4), (20, 3), (8, 3), (5, 2), (1, 1)] {
         let _ = render(&form, width, height);
     }
+}
+
+/// A model that decides which efforts may be chosen, and a flag after them.
+const LIMITED: &str = r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "flash", label = "Flash", effort = ["low", "medium", "high"] },
+  { value = "pro", label = "Pro", effort = ["low", "high"] },
+  { value = "plain", label = "Plain" },
+]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+args = ["--effort", "{value}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--yolo"]
+"#;
+
+fn limited_with(values: &[(&str, &str)]) -> SettingsForm {
+    let values: Choices = values
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    SettingsForm::new("New Demo pane", &parse(LIMITED), &values)
+}
+
+/// The style of the first cell of `text` where the popup draws it.
+fn style_of(form: &SettingsForm, width: u16, height: u16, text: &str) -> Style {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    form.render(area, &mut buf);
+    let len = u16::try_from(text.chars().count()).expect("short");
+    for y in 0..height {
+        for x in 0..width.saturating_sub(len) {
+            let here: String = (x..x + len)
+                .filter_map(|x| buf.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect();
+            if here == text {
+                return buf.cell((x, y)).expect("in the buffer").style();
+            }
+        }
+    }
+    panic!("{text:?} is not drawn");
+}
+
+#[test]
+fn a_choice_shows_its_options_by_label() {
+    let form = limited_with(&[("model", "pro"), ("effort", "high")]);
+
+    let drawn = render(&form, 60, 8);
+    assert!(drawn.contains("◂ Pro ▸"), "{drawn}");
+    assert!(drawn.contains("◂ High ▸"), "{drawn}");
+}
+
+#[test]
+fn values_are_fitted_when_the_popup_opens() {
+    assert_eq!(
+        value(
+            &limited_with(&[("model", "pro"), ("effort", "medium")]),
+            "effort"
+        ),
+        "high"
+    );
+    assert_eq!(
+        value(
+            &limited_with(&[("model", "plain"), ("effort", "high")]),
+            "effort"
+        ),
+        ""
+    );
+}
+
+#[test]
+fn a_limited_row_steps_only_through_what_the_model_offers() {
+    let mut form = limited_with(&[("model", "pro"), ("effort", "high")]);
+    press(&mut form, KeyCode::Down);
+
+    press(&mut form, KeyCode::Right);
+    assert_eq!(value(&form, "effort"), "low");
+    press(&mut form, KeyCode::Right);
+    assert_eq!(
+        value(&form, "effort"),
+        "high",
+        "no medium, and no agent default"
+    );
+    press(&mut form, KeyCode::Left);
+    assert_eq!(value(&form, "effort"), "low");
+}
+
+#[test]
+fn changing_the_model_refits_the_effort_at_once() {
+    let mut form = limited_with(&[("model", "flash"), ("effort", "medium")]);
+
+    press(&mut form, KeyCode::Right); // model: pro, which has no medium
+    assert_eq!(value(&form, "model"), "pro");
+    assert_eq!(value(&form, "effort"), "high");
+
+    press(&mut form, KeyCode::Right); // model: plain, which has no effort
+    assert_eq!(value(&form, "effort"), "");
+}
+
+#[test]
+fn an_unavailable_row_reads_not_available_faded_and_is_skipped() {
+    let mut form = limited_with(&[("model", "plain")]);
+
+    assert!(render(&form, 60, 8).contains(NOT_AVAILABLE));
+    assert_eq!(
+        style_of(&form, 60, 8, NOT_AVAILABLE).fg,
+        Some(Color::DarkGray),
+        "drawn faded"
+    );
+
+    press(&mut form, KeyCode::Down);
+    assert_eq!(
+        form.selected_index(),
+        2,
+        "down from the model skips the effort"
+    );
+    press(&mut form, KeyCode::Up);
+    assert_eq!(form.selected_index(), 0, "and so does up");
+}
+
+#[test]
+fn a_typed_model_frees_the_effort() {
+    let mut form = limited_with(&[("model", "big-1"), ("effort", "")]);
+    press(&mut form, KeyCode::Down);
+
+    for expected in ["low", "medium", "high", ""] {
+        press(&mut form, KeyCode::Right);
+        assert_eq!(value(&form, "effort"), expected);
+    }
+}
+
+#[test]
+fn stepping_off_a_typed_model_refits_the_effort() {
+    let mut form = limited_with(&[("model", "big-1"), ("effort", "medium")]);
+    press(&mut form, KeyCode::Right); // off the typed slot: wraps to agent default
+    assert_eq!(value(&form, "model"), "");
+    assert_eq!(
+        value(&form, "effort"),
+        "medium",
+        "agent default limits nothing"
+    );
+
+    press(&mut form, KeyCode::Left); // back onto typing
+    assert!(form.is_editing());
+    press(&mut form, KeyCode::Left); // drops the text, lands on plain
+    assert_eq!(value(&form, "model"), "plain");
+    assert_eq!(value(&form, "effort"), "");
+}
+
+#[test]
+fn an_unavailable_first_row_is_not_selected_when_the_popup_opens() {
+    // The effort row above the model row.
+    let parts: Vec<&str> = LIMITED
+        .split("[[settings]]")
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let text = format!(
+        "[[settings]]{}[[settings]]{}[[settings]]{}",
+        parts[1], parts[0], parts[2]
+    );
+    let values: Choices = [("model".to_string(), "plain".to_string())]
+        .into_iter()
+        .collect();
+
+    let form = SettingsForm::new("New Demo pane", &parse(&text), &values);
+
+    assert_eq!(
+        form.selected_index(),
+        1,
+        "the model row, not the faded effort"
+    );
 }
