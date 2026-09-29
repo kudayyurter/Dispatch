@@ -692,6 +692,9 @@ pub struct App {
     /// [`App::note_active`] can hold `Active` to at most one per
     /// [`ACTIVE_EVERY`].
     active_sent: Option<Instant>,
+    /// Whether the pointer passing over this window counts as using it:
+    /// `[interface] hover_claims_panes`.
+    hover_claims_panes: bool,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -767,6 +770,7 @@ impl App {
             tab_hits: Vec::new(),
             fitted: HashSet::new(),
             active_sent: None,
+            hover_claims_panes: false,
         }
     }
 
@@ -868,6 +872,12 @@ impl App {
     pub fn set_motion(&mut self, on: bool) {
         self.motion = on;
         self.animations.set_enabled(on);
+    }
+
+    /// Makes the pointer passing over this window count as using it, so
+    /// the window under the pointer decides the size of shared panes.
+    pub fn set_hover_claims_panes(&mut self, on: bool) {
+        self.hover_claims_panes = on;
     }
 
     /// Reads keys through `keymap`: the defaults with the user's `[keys]`
@@ -2448,9 +2458,9 @@ impl App {
         // capture reports plain hover, and a terminal usually sends pointer
         // motion to the window under the pointer even without keyboard
         // focus, so hovering over an idle window must not steal every
-        // shared pane's size.
+        // shared pane's size -- unless the user asked for exactly that.
         let is_use = match event {
-            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
+            Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved || self.hover_claims_panes,
             Event::Key(_) | Event::Paste(_) | Event::Resize(..) | Event::FocusGained => true,
             _ => false,
         };
@@ -5714,6 +5724,38 @@ mod tests {
 
         click(&mut app, 5, 5);
         assert_eq!(actives(&sent), 1, "a press is use");
+    }
+
+    #[test]
+    fn hovering_claims_the_panes_when_the_user_asked_for_that() {
+        // `[interface] hover_claims_panes = true`: the window under the
+        // pointer becomes the one in use, throttled like any other use.
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.set_hover_claims_panes(true);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        say_size(&mut app, &daemon, pane, 40, 12);
+        let _ = sent.try_iter().count();
+
+        let hover = |app: &mut App| {
+            app.handle(
+                &Event::Mouse(dispatch_tui::input::MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 5,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                Size::new(100, 30),
+            )
+            .expect("a hover is handled");
+        };
+
+        hover(&mut app);
+        assert_eq!(actives(&sent), 1, "hovering is use when asked for");
+
+        advance(&clock, Duration::from_millis(100));
+        hover(&mut app);
+        assert_eq!(actives(&sent), 0, "and throttled like the rest");
     }
 
     #[test]

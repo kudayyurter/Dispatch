@@ -55,11 +55,19 @@ pub struct InterfaceConfig {
     /// Whether things move: spinners, pulses, easing, transitions. Off, every
     /// change is shown at once and nothing animates.
     pub motion: bool,
+    /// Whether the pointer passing over a window makes it the one in use,
+    /// so it decides the size of every pane it shares with other windows.
+    /// Off by default: a pointer crossing a forgotten window would otherwise
+    /// resize every agent to it.
+    pub hover_claims_panes: bool,
 }
 
 impl Default for InterfaceConfig {
     fn default() -> Self {
-        Self { motion: true }
+        Self {
+            motion: true,
+            hover_claims_panes: false,
+        }
     }
 }
 
@@ -319,7 +327,7 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
             }
             ("interface", toml::Value::Table(table)) => {
                 for key in table.keys() {
-                    if key != "motion" {
+                    if key != "motion" && key != "hover_claims_panes" {
                         unknown.push(format!("interface.{key}"));
                     }
                 }

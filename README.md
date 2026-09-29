@@ -469,6 +469,16 @@ around it or its edges cut off to fit their tile. A client attaching to a pane
 that is already running is replayed the last 256 KiB it printed, so reattaching
 shows the work rather than a blank rectangle.
 
+Moving the pointer over a window does not count as using it, so a forgotten
+window cannot resize every agent as the pointer crosses it. To have the window
+under the pointer take the panes instead:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+hover_claims_panes = true
+```
+
 An attached client reconnects on its own: restart the daemon, or lose the socket,
 and it waits, says so, and rebuilds its view from what the daemon reports when it
 answers again. A connection that goes quiet is asked whether it is still there,
