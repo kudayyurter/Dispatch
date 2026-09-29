@@ -165,10 +165,11 @@ name and skipped, and the rest still applies. `Esc` always leaves a mode,
 lock always has a key that unlocks, and a config that leaves no key to quit
 is logged. Keys are read when Dispatch starts.
 
-`Ctrl z` reaches the pane like any other key. An agent that suspends itself on
-it has no shell behind it to bring it back with `fg`, so Dispatch closes that
-pane and ends the agent, as `Ctrl p x` would. In a shell pane, `Ctrl z`
-suspends the job the shell is running, and the shell and the pane carry on.
+`Ctrl z` in an agent's pane closes that pane and ends the agent, as `Ctrl p x`
+would. An agent cannot be suspended in a pane -- there is no shell behind it to
+bring it back with `fg` -- so the key never reaches it. In a shell pane,
+`Ctrl z` reaches the shell as usual: it suspends the job the shell is running,
+and the shell and the pane carry on.
 
 ## Shell panes
 
