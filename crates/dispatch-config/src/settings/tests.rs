@@ -894,3 +894,46 @@ fn an_options_list_keeps_only_what_it_may_name() {
     assert_eq!(pro.allows.get("effort"), Some(&vec!["low".to_string()]));
     assert!(!pro.allows.contains_key("colour"));
 }
+
+#[test]
+fn a_malformed_option_costs_that_option_or_list_not_the_harness() {
+    // A string where a list belongs is taken as a list of one; anything else
+    // that is not a list of strings, a label that is not a string, and an
+    // option that is neither a string nor a table are dropped.
+    let def = demo_harness(
+        r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "one", label = "One", effort = "medium" },
+  { value = "typo", lable = "Typo" },
+  { value = "flagged", hidden = true, effort = [1, 2] },
+  { value = "numbered", label = 3 },
+  { value = 4 },
+  5,
+  "plain",
+]
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = ["low", "medium"]
+args = ["--effort", "{value}"]
+"#,
+    );
+    let model = setting(&def, "model");
+
+    let kept: Vec<&str> = model.options().iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(kept, ["one", "typo", "flagged", "numbered", "plain"]);
+    let one = model.option("one").expect("kept");
+    assert_eq!(one.label(), "One");
+    assert_eq!(one.allows.get("effort"), Some(&vec!["medium".to_string()]));
+    assert!(model.option("typo").expect("kept").allows.is_empty());
+    assert!(model.option("flagged").expect("kept").allows.is_empty());
+    assert_eq!(model.option("numbered").expect("kept").label(), "numbered");
+}

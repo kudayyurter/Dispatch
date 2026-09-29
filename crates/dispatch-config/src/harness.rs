@@ -75,6 +75,9 @@ impl ChoiceOption {
 }
 
 /// How an option is written in a harness file.
+///
+/// Read leniently: a mistake in one option costs that option, or that part
+/// of it, and is logged, rather than stopping every harness loading.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum OptionForm {
@@ -82,30 +85,77 @@ enum OptionForm {
     Plain(String),
     /// A table.
     Table(OptionTable),
+    /// Anything else, which offers nothing: its value is empty, so it is
+    /// dropped when the harness is checked.
+    Other(toml::Value),
 }
 
-/// An option written as a table.
+/// An option written as a table, each field as it was written.
 #[derive(Clone, Serialize, Deserialize)]
 struct OptionTable {
-    /// Missing is empty, which no value may be, so the option is dropped
-    /// on load rather than failing the whole file.
-    #[serde(default)]
-    value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    label: Option<String>,
+    value: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<toml::Value>,
     #[serde(flatten)]
-    allows: BTreeMap<String, Vec<String>>,
+    allows: BTreeMap<String, toml::Value>,
 }
 
 impl From<OptionForm> for ChoiceOption {
     fn from(form: OptionForm) -> Self {
-        match form {
-            OptionForm::Plain(value) => ChoiceOption::new(value),
-            OptionForm::Table(table) => ChoiceOption {
-                value: table.value,
-                label: table.label,
-                allows: table.allows,
-            },
+        let table = match form {
+            OptionForm::Plain(value) => return ChoiceOption::new(value),
+            OptionForm::Other(written) => {
+                tracing::warn!(%written, "dropping an option that is neither a value nor a table");
+                return ChoiceOption::new("");
+            }
+            OptionForm::Table(table) => table,
+        };
+
+        // Missing, or not a string, is empty, which no value may be, so the
+        // option is dropped when the harness is checked.
+        let value = match table.value {
+            Some(toml::Value::String(value)) => value,
+            _ => String::new(),
+        };
+        let label = match table.label {
+            None => None,
+            Some(toml::Value::String(label)) => Some(label),
+            Some(written) => {
+                tracing::warn!(option = %value, %written, "dropping a label that is not text");
+                None
+            }
+        };
+        let allows = table
+            .allows
+            .into_iter()
+            .filter_map(|(key, written)| {
+                let listed = match &written {
+                    // One value, written without its brackets.
+                    toml::Value::String(one) => Some(vec![one.clone()]),
+                    toml::Value::Array(items) => items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_string))
+                        .collect(),
+                    _ => None,
+                };
+                if listed.is_none() {
+                    tracing::warn!(
+                        option = %value,
+                        key = %key,
+                        %written,
+                        "dropping what is not a list of values: a misspelt key, or a list \
+                         with something other than text in it"
+                    );
+                }
+                Some((key, listed?))
+            })
+            .collect();
+
+        ChoiceOption {
+            value,
+            label,
+            allows,
         }
     }
 }
@@ -116,9 +166,16 @@ impl From<ChoiceOption> for OptionForm {
             OptionForm::Plain(option.value)
         } else {
             OptionForm::Table(OptionTable {
-                value: option.value,
-                label: option.label,
-                allows: option.allows,
+                value: Some(toml::Value::String(option.value)),
+                label: option.label.map(toml::Value::String),
+                allows: option
+                    .allows
+                    .into_iter()
+                    .map(|(key, listed)| {
+                        let items = listed.into_iter().map(toml::Value::String).collect();
+                        (key, toml::Value::Array(items))
+                    })
+                    .collect(),
             })
         }
     }
