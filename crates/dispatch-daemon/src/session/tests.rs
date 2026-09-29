@@ -5958,3 +5958,72 @@ fn a_delegate_connection_never_sizes_a_pane_nobody_else_asks_for() {
          not whatever a delegate connection last asked"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_pane_whose_program_stops_is_closed() {
+    // Ctrl Z in a pane whose program is its leader: no shell is behind it to
+    // bring it back, so the pane is closed, the program ended, and every
+    // window told.
+    let (mut daemon, project, _dir) = daemon("stopped-pane");
+    let ui = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"kill -STOP $$\r".to_vec(),
+        },
+    );
+
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane: p } if *p == pane))
+    });
+    assert_eq!(daemon.pane_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_whose_job_is_stopped_stays_open() {
+    // Ctrl Z inside a shell pane stops the job the shell is running, not the
+    // shell: the shell takes over again, `fg` works, and the pane stays.
+    let (mut daemon, project, _dir) = daemon("stopped-job");
+    let ui = attach_window(&mut daemon, 1);
+    let pane = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"sleep 30\r".to_vec(),
+        },
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: vec![0x1a],
+        },
+    );
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"echo still-here-marker\r".to_vec(),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &ui, |m| {
+        output_of(m, pane).matches("still-here-marker").count() >= 2
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane: p } if *p == pane)),
+        "the shell's own stopped job must not close the pane"
+    );
+    assert_eq!(daemon.pane_count(), 1);
+}

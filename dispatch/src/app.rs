@@ -2239,6 +2239,7 @@ impl App {
         let mut changed = false;
         let mut exited = Vec::new();
         let mut outputs = Vec::new();
+        let mut stopped = Vec::new();
 
         for (id, pane) in &mut self.panes {
             let output = pane.backend.drain();
@@ -2255,6 +2256,18 @@ impl App {
             if let RunState::Exited(code) = pane.backend.state() {
                 exited.push((*id, code));
             }
+            if pane.backend.is_stopped() {
+                stopped.push(*id);
+            }
+        }
+
+        // Ctrl Z in a pane stops its program, and a pane's program is its
+        // leader, with no shell behind it to bring it back: closed, as the
+        // user closing it would, rather than left frozen for good.
+        for id in stopped {
+            tracing::info!(pane = %id, "a pane's program stopped; closing it");
+            self.close_pane(id);
+            changed = true;
         }
 
         for (id, output) in outputs {
@@ -10095,6 +10108,52 @@ mod tests {
             1,
             "the daemon's machine is the only one left"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_pane_whose_program_stops_is_closed() {
+        // Ctrl Z in a pane whose program is its leader leaves nothing to
+        // bring it back, so the pane is closed rather than left frozen.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dir = scratch("stopped-local");
+        let mut app = App::new([def].into_iter().collect());
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        app.panes
+            .get_mut(&pane)
+            .expect("the pane is held")
+            .backend
+            .write(b"kill -STOP $$\r")
+            .expect("the shell reads it");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.panes.contains_key(&pane) {
+            app.poll_panes();
+            assert!(
+                Instant::now() < deadline,
+                "the stopped pane was never closed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.state.pane(pane).is_none_or(|pane| pane.closed),
+            "its row goes with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

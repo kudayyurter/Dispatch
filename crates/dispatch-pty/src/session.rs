@@ -501,6 +501,14 @@ impl Pty {
         self.pid
     }
 
+    /// Whether the child is stopped -- by Ctrl Z, say. A pane's program is
+    /// its leader, with no shell behind it to bring it back, so a stopped one
+    /// stays stopped until something ends it.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.child.is_stopped()
+    }
+
     /// The current size.
     #[must_use]
     pub fn size(&self) -> Size {
@@ -635,6 +643,12 @@ impl PtySession {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pty.pid()
+    }
+
+    /// Whether the child is stopped; see [`Pty::is_stopped`].
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.pty.is_stopped()
     }
 
     /// The current size.

@@ -111,6 +111,17 @@ impl Child {
         self.0.wait_exit()
     }
 
+    /// Whether the process is stopped now -- by Ctrl Z, say -- rather than
+    /// running or gone.
+    ///
+    /// Asks without waiting and without taking the answer from anything
+    /// else waiting on the process. Always false where there is no such
+    /// thing as a stopped process, and once the tree has been ended.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.0.is_stopped()
+    }
+
     /// Ends the process and everything in its tree, then lets its pid go.
     ///
     /// Only the first call does anything: once the pid has been let go, a
@@ -478,6 +489,29 @@ mod imp {
             }
         }
 
+        pub(super) fn is_stopped(&self) -> bool {
+            if self.ended.load(Ordering::Acquire) || self.seen().is_some() {
+                return false;
+            }
+            // SAFETY: an all-zero siginfo_t is a valid place for waitid to
+            // write.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // WNOWAIT leaves the stop to be seen again, and to be seen by
+            // nothing else instead; WNOHANG answers at once.
+            let options = libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT;
+            // SAFETY: P_PID with this process's own child's pid, and `info`
+            // is a valid siginfo_t to write to.
+            let result =
+                unsafe { libc::waitid(libc::P_PID, self.pid.unsigned_abs(), &mut info, options) };
+            if result != 0 {
+                return false;
+            }
+            // SAFETY: waitid filled `info` in, or left the pid zero for
+            // nothing to report.
+            let (who, code) = unsafe { (info.si_pid(), info.si_code) };
+            who != 0 && code == libc::CLD_STOPPED
+        }
+
         pub(super) fn end_tree(&self, grace: Duration) -> Result<(), ProcessError> {
             if self.ended.swap(true, Ordering::AcqRel) {
                 return Ok(());
@@ -489,6 +523,10 @@ mod imp {
             // The leader is unreaped, so its pid is still its group's id and
             // the group is certainly this pane's.
             signalled(signal_group(pid, libc::SIGTERM)).map_err(map)?;
+            // A stopped process cannot act on SIGTERM until it is continued:
+            // without this, a pane stopped by Ctrl Z waited out the whole
+            // grace before the SIGKILL, holding up whoever was closing it.
+            signalled(signal_group(pid, libc::SIGCONT)).map_err(map)?;
             if !self.exited_by(deadline) {
                 signalled(signal_group(pid, libc::SIGKILL)).map_err(map)?;
                 self.exited_by(Instant::now() + KILL_TIMEOUT);
@@ -1044,6 +1082,70 @@ mod tests {
             waits,
             [10, 20, 40, 80, 160, 320, 640, 1000, 1000].map(Duration::from_millis),
             "it doubles from {STOPPED_POLL_FIRST:?} and caps at {STOPPED_POLL_MAX:?}"
+        );
+    }
+
+    /// Waits until `child` reports itself stopped, or gives up.
+    #[cfg(unix)]
+    fn until_stopped(child: &super::Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child.is_stopped() {
+            assert!(Instant::now() < deadline, "the stop was never seen");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stopped_leader_says_so() {
+        // What Ctrl Z does to a pane whose program is the leader itself:
+        // nothing is left to bring it back, so Dispatch has to notice.
+        let process = sh("echo ready; kill -STOP $$; exit 0");
+        assert_eq!(first_line(process.reader), "ready");
+
+        until_stopped(&process.child);
+
+        process
+            .child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+        assert!(!process.child.is_stopped(), "an ended child is not stopped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_running_leader_is_not_stopped() {
+        let process = sh("echo ready; sleep 30");
+        assert_eq!(first_line(process.reader), "ready");
+
+        assert!(!process.child.is_stopped());
+
+        process
+            .child
+            .end_tree(Duration::from_millis(250))
+            .expect("ending succeeds");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stopped_tree_ends_without_waiting_out_its_grace() {
+        // A stopped process cannot act on SIGTERM until it is continued, so
+        // without a SIGCONT after it, ending a stopped pane waited out the
+        // whole grace before the SIGKILL -- and the daemon loop with it.
+        let process = sh("echo ready; kill -STOP $$; sleep 30");
+        assert_eq!(first_line(process.reader), "ready");
+        until_stopped(&process.child);
+
+        let started = Instant::now();
+        process
+            .child
+            .end_tree(Duration::from_secs(5))
+            .expect("ending succeeds");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "ending a stopped tree took {:?}",
+            started.elapsed()
         );
     }
 
