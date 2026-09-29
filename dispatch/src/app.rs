@@ -11666,14 +11666,26 @@ args = ["--yolo"]
             .collect()
     }
 
-    /// An attached app holding [`registry_with_settings`], its settings
+    /// An attached app holding `def` and the user's shell, its settings
     /// kept in `dir` when one is given, with the new-pane picker open on
-    /// `demo`.
-    fn app_on_demo(
+    /// `def`.
+    fn app_on(
+        def: dispatch_config::HarnessDef,
         dir: Option<&std::path::Path>,
     ) -> (App, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        let id = def.id.clone();
+        let registry: HarnessRegistry = [
+            def,
+            dispatch_config::HarnessDef {
+                id: SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                ..dispatch_config::HarnessDef::default()
+            },
+        ]
+        .into_iter()
+        .collect();
         let (client, daemon, sent) = Client::for_test();
-        let mut app = App::attached(registry_with_settings(), client);
+        let mut app = App::attached(registry, client);
         if let Some(dir) = dir {
             app.keep_settings_in(dir);
         }
@@ -11688,9 +11700,16 @@ args = ["--yolo"]
         let Some(Overlay::Harness(picker)) = &mut app.overlay else {
             panic!("the picker is open");
         };
-        picker.select("demo");
+        picker.select(&id);
 
         (app, daemon, sent)
+    }
+
+    /// [`app_on`] over `demo`, carrying [`DEMO_SETTINGS`].
+    fn app_on_demo(
+        dir: Option<&std::path::Path>,
+    ) -> (App, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        app_on(with_settings("demo", "Demo", "demo"), dir)
     }
 
     /// The settings the last pane this app asked its daemon for was sent
@@ -11943,6 +11962,93 @@ args = ["--yolo"]
             Some("demo · large · Skip prompts off")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A harness `lim` whose Effort row follows its Model row, with labels.
+    fn limited() -> dispatch_config::HarnessDef {
+        toml::from_str(
+            r#"
+id = "lim"
+display_name = "Lim"
+command = "lim"
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "flash", label = "Flash", effort = ["low", "medium", "high"] },
+  { value = "pro", label = "Pro", effort = ["low", "high"] },
+  { value = "plain", label = "Plain" },
+]
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+args = ["--effort", "{value}"]
+"#,
+        )
+        .expect("a valid harness")
+    }
+
+    #[test]
+    fn the_picker_names_saved_options_by_label_fitted_to_the_model() {
+        let dir = scratch("settings-labels");
+        std::fs::write(
+            dir.join("harness-settings.toml"),
+            "[lim]\nmodel = \"pro\"\neffort = \"medium\"\n",
+        )
+        .expect("temp dir is writable");
+        let (app, _daemon, _sent) = app_on(limited(), Some(&dir));
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        let lim = picker
+            .items()
+            .iter()
+            .find(|item| item.id == "lim")
+            .expect("lim is offered");
+        assert_eq!(lim.detail.as_deref(), Some("lim · Pro · High"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_in_the_settings_sends_an_effort_the_model_offers() {
+        let (mut app, _daemon, sent) = app_on(limited(), None);
+        press(&mut app, KeyCode::Char('e'));
+
+        press(&mut app, KeyCode::Right); // model: flash, so effort: high
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            sent_settings(&sent),
+            Some(choices(&[("model", "flash"), ("effort", "high")]))
+        );
+    }
+
+    #[test]
+    fn enter_in_the_settings_sends_no_effort_for_a_model_with_none() {
+        let (mut app, _daemon, sent) = app_on(limited(), None);
+        press(&mut app, KeyCode::Char('e'));
+
+        press(&mut app, KeyCode::Right); // flash
+        press(&mut app, KeyCode::Right); // pro
+        press(&mut app, KeyCode::Right); // plain
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            sent_settings(&sent),
+            Some(choices(&[("model", "plain"), ("effort", "")]))
+        );
     }
 
     #[test]
