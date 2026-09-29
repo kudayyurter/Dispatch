@@ -23,10 +23,13 @@ pub use config::{
     LoginShell, ShellConfig,
 };
 pub use harness::{
-    HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput, TaskLaunch,
-    TaskRun,
+    ChoiceOption, HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput,
+    TaskLaunch, TaskRun,
 };
-pub use settings::{Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, is_safe_char, is_safe_value};
+pub use settings::{
+    Allowed, Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, allowed, fit_limits, is_safe_char,
+    is_safe_value,
+};
 pub use status::{RuleState, StatusInput, StatusRules};
 
 /// The id of the harness that runs the user's own shell.

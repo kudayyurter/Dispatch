@@ -271,6 +271,34 @@ default = "bypassPermissions"
 args = ["--permission-mode", "{value}"]
 ```
 
+An option can be a table instead, to show a clean name, and one choice can
+limit another. While a model is chosen, a setting `limited_by` the model
+offers only the values that model lists for it, and moves to the highest of
+them when the one set is not among them. A model that lists none fades the
+row out, and passes nothing for it. A model typed in by hand leaves it free.
+
+```toml
+# ~/.config/dispatch/harnesses/agy.toml
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "gemini-3.1-pro", label = "Gemini 3.1 Pro", effort = ["low", "high"] },
+  { value = "claude-sonnet-4-6", label = "Claude Sonnet 4.6" },  # no effort
+]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = [{ value = "low", label = "Low" }, { value = "high", label = "High" }]
+args = ["--effort", "{value}"]
+```
+
 A `bool` adds its `args` when it is on. A value may hold only letters, digits
 and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
 `cmd.exe`'s command line. The daemon reads harness files when it starts, so

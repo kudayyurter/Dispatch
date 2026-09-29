@@ -6,7 +6,8 @@
 //! open, save, or go back.
 
 use dispatch_config::{
-    Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, SettingDef, SettingKind, is_safe_char,
+    Allowed, ChoiceOption, Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, SettingDef, SettingKind,
+    allowed, fit_limits, is_safe_char,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -35,6 +36,10 @@ pub enum FormAction {
 /// What is shown for a value that leaves the choice to the agent.
 pub const AGENT_DEFAULT: &str = "agent default";
 
+/// What is shown for a setting the chosen value of another leaves nothing
+/// to choose from.
+pub const NOT_AVAILABLE: &str = "not available";
+
 /// What the keys do.
 const HINT: &str = "Enter open · s save as default · Esc back";
 
@@ -51,7 +56,10 @@ enum Shape {
     /// On or off.
     Flag,
     /// One of a list, and maybe a typed value after it.
-    Choice { options: Vec<String>, custom: bool },
+    Choice {
+        options: Vec<ChoiceOption>,
+        custom: bool,
+    },
     /// Typed.
     Text,
 }
@@ -78,6 +86,10 @@ struct Row {
     /// The last value typed on this row, offered again when the row steps
     /// back onto its typed slot.
     typed: String,
+    /// Whether another setting limits this one.
+    limited: bool,
+    /// What it may take while the others hold their values.
+    allowed: Allowed,
 }
 
 impl Row {
@@ -96,6 +108,8 @@ impl Row {
             shape,
             value,
             typed: String::new(),
+            limited: setting.limited_by.is_some(),
+            allowed: Allowed::Free,
         };
         if row.slot() == Slot::Typed {
             row.typed = row.value.clone();
@@ -107,14 +121,23 @@ impl Row {
     fn slots(&self) -> Vec<Slot> {
         match &self.shape {
             Shape::Flag => Vec::new(),
-            Shape::Choice { options, custom } => {
-                let mut slots = vec![Slot::Default];
-                slots.extend((0..options.len()).map(Slot::Option));
-                if *custom {
-                    slots.push(Slot::Typed);
+            Shape::Choice { options, custom } => match &self.allowed {
+                Allowed::Unavailable => Vec::new(),
+                Allowed::Only(only) => options
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, option)| only.contains(&option.value))
+                    .map(|(index, _)| Slot::Option(index))
+                    .collect(),
+                Allowed::Free => {
+                    let mut slots = vec![Slot::Default];
+                    slots.extend((0..options.len()).map(Slot::Option));
+                    if *custom {
+                        slots.push(Slot::Typed);
+                    }
+                    slots
                 }
-                slots
-            }
+            },
             Shape::Text => vec![Slot::Default, Slot::Typed],
         }
     }
@@ -126,22 +149,27 @@ impl Row {
             _ if self.value.is_empty() => Slot::Default,
             Shape::Choice { options, .. } => options
                 .iter()
-                .position(|option| *option == self.value)
+                .position(|option| option.value == self.value)
                 .map_or(Slot::Typed, Slot::Option),
             Shape::Text => Slot::Typed,
         }
     }
 
-    /// The value as the popup shows it.
+    /// The value as the popup shows it: an option by its label.
     fn shown(&self) -> String {
         match &self.shape {
             Shape::Flag if self.value == "true" => "on".to_string(),
             Shape::Flag => "off".to_string(),
+            _ if self.allowed == Allowed::Unavailable => NOT_AVAILABLE.to_string(),
             _ if self.value.is_empty() => AGENT_DEFAULT.to_string(),
-            Shape::Choice { .. } if self.slot() == Slot::Typed => {
-                format!("Custom: {}", self.value)
-            }
-            Shape::Choice { .. } | Shape::Text => self.value.clone(),
+            Shape::Choice { options, .. } => options
+                .iter()
+                .find(|option| option.value == self.value)
+                .map_or_else(
+                    || format!("Custom: {}", self.value),
+                    |option| option.label().to_string(),
+                ),
+            Shape::Text => self.value.clone(),
         }
     }
 
@@ -154,11 +182,13 @@ impl Row {
             Shape::Choice { options, custom } => {
                 let option = options
                     .iter()
-                    .map(|option| option.chars().count())
+                    .map(|option| option.label().chars().count())
                     .max()
                     .unwrap_or(0);
+                let unavailable = if self.limited { NOT_AVAILABLE.len() } else { 0 };
                 option
                     .max(AGENT_DEFAULT.len())
+                    .max(unavailable)
                     .max(if *custom { typed } else { 0 })
             }
             Shape::Text => AGENT_DEFAULT.len().max(typed),
@@ -181,6 +211,8 @@ struct Edit {
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
     title: String,
+    /// The settings the rows show, for working out what limits each one.
+    settings: Vec<SettingDef>,
     rows: Vec<Row>,
     selected: usize,
     editing: Option<Edit>,
@@ -209,15 +241,25 @@ impl SettingsForm {
             })
             .collect();
 
-        Self {
+        let mut form = Self {
             title: title.into(),
+            settings: settings.to_vec(),
             rows,
             selected: 0,
             editing: None,
             border: Style::default().fg(Color::Cyan),
             highlight: Style::default().bg(Color::DarkGray),
             faded: Style::default().fg(Color::DarkGray),
+        };
+        form.refit();
+        if form
+            .rows
+            .first()
+            .is_some_and(|row| row.allowed == Allowed::Unavailable)
+        {
+            form.move_row(true);
         }
+        form
     }
 
     /// Draws the frame in `style`.
@@ -350,14 +392,39 @@ impl SettingsForm {
     }
 
     fn previous_row(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.rows.len() - 1);
-        }
+        self.move_row(false);
     }
 
     fn next_row(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = (self.selected + 1) % self.rows.len();
+        self.move_row(true);
+    }
+
+    /// Moves to the next or previous row that has something to choose,
+    /// wrapping.
+    fn move_row(&mut self, forward: bool) {
+        let count = self.rows.len();
+        for _ in 0..count {
+            self.selected = if forward {
+                (self.selected + 1) % count
+            } else {
+                self.selected.checked_sub(1).unwrap_or(count - 1)
+            };
+            if self.rows[self.selected].allowed != Allowed::Unavailable {
+                return;
+            }
+        }
+    }
+
+    /// Brings every limited row within what the others now allow, and
+    /// notes what each may take.
+    fn refit(&mut self) {
+        let mut values = self.values();
+        fit_limits(&self.settings, &mut values);
+        for row in &mut self.rows {
+            row.allowed = allowed(&self.settings, &row.key, &values);
+            if let Some(value) = values.get(&row.key) {
+                row.value.clone_from(value);
+            }
         }
     }
 
@@ -385,6 +452,9 @@ impl SettingsForm {
         }
 
         let slots = row.slots();
+        if slots.is_empty() {
+            return;
+        }
         let here = if typing {
             slots.len() - 1
         } else {
@@ -403,7 +473,7 @@ impl SettingsForm {
             Slot::Default => row.value.clear(),
             Slot::Option(index) => {
                 if let Shape::Choice { options, .. } = &row.shape {
-                    row.value = options[index].clone();
+                    row.value = options[index].value.clone();
                 }
             }
             Slot::Typed => {
@@ -413,6 +483,7 @@ impl SettingsForm {
                 });
             }
         }
+        self.refit();
     }
 
     /// Stops typing and keeps the text: nothing typed is agent default.
@@ -424,6 +495,7 @@ impl SettingsForm {
             row.typed = edit.text.clone();
             row.value = edit.text;
         }
+        self.refit();
     }
 
     /// Stops typing and puts back the value from before it began.
@@ -434,6 +506,7 @@ impl SettingsForm {
         if let Some(row) = self.rows.get_mut(self.selected) {
             row.value = edit.before;
         }
+        self.refit();
     }
 
     /// The width of what a value being typed shows right now (its prefix,
@@ -532,6 +605,12 @@ impl Widget for &SettingsForm {
                 }
             }
 
+            if row.allowed == Allowed::Unavailable {
+                let faded = base.patch(self.faded);
+                write(buf, inner, inner.x + 1, y, &row.label, faded);
+                write(buf, inner, value_x + 2, y, NOT_AVAILABLE, faded);
+                continue;
+            }
             write(buf, inner, inner.x + 1, y, &row.label, base);
 
             let shown = match (&self.editing, chosen, &row.shape) {

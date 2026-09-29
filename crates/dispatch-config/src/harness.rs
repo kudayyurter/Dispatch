@@ -23,7 +23,7 @@ pub enum SettingKind {
     /// One of a fixed set of values, such as a model or effort level.
     Choice {
         /// The values on offer.
-        options: Vec<String>,
+        options: Vec<ChoiceOption>,
         /// Value used when the user does not supply one.
         #[serde(default)]
         default: Option<String>,
@@ -34,6 +34,151 @@ pub enum SettingKind {
         #[serde(default)]
         default: Option<bool>,
     },
+}
+
+/// One value a choice offers.
+///
+/// A harness file writes it as the value alone, or as a table naming how it
+/// is shown too: `{ value = "gemini-3.1-pro", label = "Gemini 3.1 Pro",
+/// effort = ["low", "high"] }`. Any other key in the table names a setting
+/// `limited_by` this one, and lists the values that setting may take while
+/// this option is chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "OptionForm", into = "OptionForm")]
+pub struct ChoiceOption {
+    /// What is passed to the agent and saved.
+    pub value: String,
+    /// What the popup and the picker show; the value when absent.
+    pub label: Option<String>,
+    /// For each setting limited by this one, by key: the values it may take
+    /// while this option is chosen. A limited setting this names nothing
+    /// for takes none.
+    pub allows: BTreeMap<String, Vec<String>>,
+}
+
+impl ChoiceOption {
+    /// An option with no label, limiting nothing.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: None,
+            allows: BTreeMap::new(),
+        }
+    }
+
+    /// What is shown for this option.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.value)
+    }
+}
+
+/// How an option is written in a harness file.
+///
+/// Read leniently: a mistake in one option costs that option, or that part
+/// of it, and is logged, rather than stopping every harness loading.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OptionForm {
+    /// The value alone.
+    Plain(String),
+    /// A table.
+    Table(OptionTable),
+    /// Anything else, which offers nothing: its value is empty, so it is
+    /// dropped when the harness is checked.
+    Other(toml::Value),
+}
+
+/// An option written as a table, each field as it was written.
+#[derive(Clone, Serialize, Deserialize)]
+struct OptionTable {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<toml::Value>,
+    #[serde(flatten)]
+    allows: BTreeMap<String, toml::Value>,
+}
+
+impl From<OptionForm> for ChoiceOption {
+    fn from(form: OptionForm) -> Self {
+        let table = match form {
+            OptionForm::Plain(value) => return ChoiceOption::new(value),
+            OptionForm::Other(written) => {
+                tracing::warn!(%written, "dropping an option that is neither a value nor a table");
+                return ChoiceOption::new("");
+            }
+            OptionForm::Table(table) => table,
+        };
+
+        // Missing, or not a string, is empty, which no value may be, so the
+        // option is dropped when the harness is checked.
+        let value = match table.value {
+            Some(toml::Value::String(value)) => value,
+            _ => String::new(),
+        };
+        let label = match table.label {
+            None => None,
+            Some(toml::Value::String(label)) => Some(label),
+            Some(written) => {
+                tracing::warn!(option = %value, %written, "dropping a label that is not text");
+                None
+            }
+        };
+        let allows = table
+            .allows
+            .into_iter()
+            .filter_map(|(key, written)| {
+                let listed = match &written {
+                    // One value, written without its brackets.
+                    toml::Value::String(one) => Some(vec![one.clone()]),
+                    toml::Value::Array(items) => items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_string))
+                        .collect(),
+                    _ => None,
+                };
+                if listed.is_none() {
+                    tracing::warn!(
+                        option = %value,
+                        key = %key,
+                        %written,
+                        "dropping what is not a list of values: a misspelt key, or a list \
+                         with something other than text in it"
+                    );
+                }
+                Some((key, listed?))
+            })
+            .collect();
+
+        ChoiceOption {
+            value,
+            label,
+            allows,
+        }
+    }
+}
+
+impl From<ChoiceOption> for OptionForm {
+    fn from(option: ChoiceOption) -> Self {
+        if option.label.is_none() && option.allows.is_empty() {
+            OptionForm::Plain(option.value)
+        } else {
+            OptionForm::Table(OptionTable {
+                value: Some(toml::Value::String(option.value)),
+                label: option.label.map(toml::Value::String),
+                allows: option
+                    .allows
+                    .into_iter()
+                    .map(|(key, listed)| {
+                        let items = listed.into_iter().map(toml::Value::String).collect();
+                        (key, toml::Value::Array(items))
+                    })
+                    .collect(),
+            })
+        }
+    }
 }
 
 /// One configurable setting a harness exposes.
@@ -53,6 +198,12 @@ pub struct SettingDef {
     /// For a choice, whether the popup also offers a value the user types.
     #[serde(default)]
     pub custom: bool,
+    /// For a choice, the key of another choice whose chosen option decides
+    /// which of this one's values may be used: the values that option lists
+    /// under this setting's key, or none when it lists nothing. A value of
+    /// the other's that is not one of its options limits nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_by: Option<String>,
     /// Arguments added after the launch's own. A choice or text puts its
     /// value where `{value}` is and adds nothing when unset; a flag adds
     /// them as written when it is on.

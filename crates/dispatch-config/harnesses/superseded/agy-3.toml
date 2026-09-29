@@ -1,0 +1,36 @@
+id = "agy"
+icon = ""
+display_name = "agy"
+command = "agy"
+args = []
+
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "agy"]
+
+# Each setting's args go after the launch's own, with {value} replaced by
+# what was chosen. Unset passes nothing and leaves the choice to agy.
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+  "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+  "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
+  "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+  "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
+]
+custom = true
+args = ["--model", "{value}"]
+
+# No effort row: agy's models carry their effort in their name. Its
+# --effort conflicts with a different one (agy then falls back to another
+# model altogether) and is refused for a model without one.
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+default = true
+args = ["--dangerously-skip-permissions"]
