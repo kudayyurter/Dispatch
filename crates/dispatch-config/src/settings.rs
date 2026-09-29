@@ -48,6 +48,76 @@ pub fn is_safe_value(value: &str) -> bool {
         && value.chars().all(is_safe_char)
 }
 
+/// Which values a setting may take, given the other settings' values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Allowed {
+    /// Any of its options, a typed value where it takes one, or agent
+    /// default.
+    Free,
+    /// Only these, in the setting's own option order, and never agent
+    /// default. Never empty.
+    Only(Vec<String>),
+    /// None: it is unset, and passes nothing.
+    Unavailable,
+}
+
+/// Which values the setting `key` of `settings` may take while the settings
+/// hold `values`.
+///
+/// Only a setting `limited_by` another is ever limited, and only while that
+/// other holds one of its options: a typed value, or agent default, limits
+/// nothing.
+#[must_use]
+pub fn allowed(settings: &[SettingDef], key: &str, values: &Choices) -> Allowed {
+    let find = |key: &str| settings.iter().find(|setting| setting.key == key);
+    let Some(setting) = find(key) else {
+        return Allowed::Free;
+    };
+    let Some(limiter) = setting.limited_by.as_deref().and_then(find) else {
+        return Allowed::Free;
+    };
+    let chosen = values.get(&limiter.key).map_or("", String::as_str);
+    let Some(option) = limiter.option(chosen) else {
+        return Allowed::Free;
+    };
+
+    let listed = option.allows.get(key).map_or(&[][..], Vec::as_slice);
+    let only: Vec<String> = setting
+        .options()
+        .iter()
+        .filter(|offered| listed.contains(&offered.value))
+        .map(|offered| offered.value.clone())
+        .collect();
+    if only.is_empty() {
+        Allowed::Unavailable
+    } else {
+        Allowed::Only(only)
+    }
+}
+
+/// Brings each limited setting in `values` within what [`allowed`] lets it
+/// take: an unavailable one is unset, and one holding a value its list does
+/// not have takes the highest the list does, the last in its own option
+/// order.
+///
+/// A limit is followed, never refused: whatever the saved file or an older
+/// client holds, the agent is only ever handed a pair it accepts.
+pub fn fit_limits(settings: &[SettingDef], values: &mut Choices) {
+    for setting in settings
+        .iter()
+        .filter(|setting| setting.limited_by.is_some())
+    {
+        let current = values.get(&setting.key).map_or("", String::as_str);
+        let fitted = match allowed(settings, &setting.key, values) {
+            Allowed::Free => continue,
+            Allowed::Unavailable => String::new(),
+            Allowed::Only(only) if only.iter().any(|value| value == current) => continue,
+            Allowed::Only(only) => only.last().cloned().unwrap_or_default(),
+        };
+        values.insert(setting.key.clone(), fitted);
+    }
+}
+
 impl SettingDef {
     /// Whether this is on or off, rather than a value.
     #[must_use]
@@ -241,7 +311,98 @@ pub(crate) fn usable(id: &str, settings: Vec<SettingDef>) -> Vec<SettingDef> {
         kept.push(setting);
     }
 
+    check_limits(id, &mut kept);
     kept
+}
+
+/// Drops each `limited_by` of harness `id` that cannot work, and from each
+/// option's lists whatever does not name a setting it limits, or a value
+/// that setting offers.
+///
+/// A limit must name another choice of the same harness that is not
+/// limited itself: one level only, judged on the limits as written, so the
+/// outcome does not depend on the order of the file.
+fn check_limits(id: &str, settings: &mut [SettingDef]) {
+    let written: Vec<(String, bool, bool)> = settings
+        .iter()
+        .map(|setting| {
+            (
+                setting.key.clone(),
+                matches!(setting.kind, SettingKind::Choice { .. }),
+                setting.limited_by.is_some(),
+            )
+        })
+        .collect();
+
+    for setting in settings.iter_mut() {
+        let Some(by) = setting.limited_by.as_deref() else {
+            continue;
+        };
+        let reason = if !matches!(setting.kind, SettingKind::Choice { .. }) {
+            Some("only a choice can be limited")
+        } else if by == setting.key {
+            Some("a setting cannot limit itself")
+        } else {
+            match written.iter().find(|(key, ..)| key == by) {
+                None => Some("limited_by names no setting of this harness"),
+                Some((_, false, _)) => Some("limited_by must name a choice"),
+                Some((_, _, true)) => Some("limited_by names a setting that is limited itself"),
+                Some(_) => None,
+            }
+        };
+        if let Some(reason) = reason {
+            tracing::warn!(harness = id, setting = %setting.key, reason, "dropping a limit");
+            setting.limited_by = None;
+        }
+    }
+
+    // (limiter, limited, the values the limited one offers)
+    let limits: Vec<(String, String, Vec<String>)> = settings
+        .iter()
+        .filter_map(|setting| {
+            let by = setting.limited_by.clone()?;
+            let offered = setting.options().iter().map(|o| o.value.clone()).collect();
+            Some((by, setting.key.clone(), offered))
+        })
+        .collect();
+
+    for setting in settings.iter_mut() {
+        let key = setting.key.clone();
+        let SettingKind::Choice { options, .. } = &mut setting.kind else {
+            continue;
+        };
+        for option in options.iter_mut() {
+            let value = option.value.clone();
+            option.allows.retain(|target, listed| {
+                let Some((.., offered)) = limits
+                    .iter()
+                    .find(|(by, limited, _)| *by == key && limited == target)
+                else {
+                    tracing::warn!(
+                        harness = id,
+                        setting = %key,
+                        option = %value,
+                        list = %target,
+                        "dropping a list for a setting this one does not limit"
+                    );
+                    return false;
+                };
+                listed.retain(|listed_value| {
+                    let offers = offered.contains(listed_value);
+                    if !offers {
+                        tracing::warn!(
+                            harness = id,
+                            setting = %target,
+                            value = %listed_value,
+                            "dropping a listed value the setting does not offer"
+                        );
+                    }
+                    offers
+                });
+                true
+            });
+        }
+    }
 }
 
 /// Logs a setting left out of harness `id`, and why.
@@ -282,7 +443,9 @@ impl HarnessDef {
     }
 
     /// Each setting's value for one launch: what was `chosen` for it, else
-    /// what was `saved`, else the file's default.
+    /// what was `saved`, else the file's default. A setting limited by
+    /// another is then fitted to it, as [`fit_limits`] says, rather than
+    /// refused.
     ///
     /// A `chosen` value this harness cannot take is refused, naming the
     /// setting. It comes from whoever asked for the pane, and dropping it
@@ -315,6 +478,7 @@ impl HarnessDef {
             values.insert(setting.key.clone(), value);
         }
 
+        fit_limits(&self.settings, &mut values);
         Ok(values)
     }
 
@@ -363,8 +527,12 @@ impl HarnessDef {
             .collect()
     }
 
-    /// Adds to `launch` what each setting's value in `values` turns on.
+    /// Adds to `launch` what each setting's value in `values` turns on,
+    /// once each limited setting is fitted to what limits it.
     fn apply_settings(&self, launch: &mut Launch, values: &Choices) {
+        let mut values = values.clone();
+        fit_limits(&self.settings, &mut values);
+
         for setting in &self.settings {
             let value = values.get(&setting.key).map_or("", String::as_str);
 

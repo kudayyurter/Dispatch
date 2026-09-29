@@ -141,6 +141,12 @@ pub struct SettingDef {
     /// For a choice, whether the popup also offers a value the user types.
     #[serde(default)]
     pub custom: bool,
+    /// For a choice, the key of another choice whose chosen option decides
+    /// which of this one's values may be used: the values that option lists
+    /// under this setting's key, or none when it lists nothing. A value of
+    /// the other's that is not one of its options limits nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_by: Option<String>,
     /// Arguments added after the launch's own. A choice or text puts its
     /// value where `{value}` is and adds nothing when unset; a flag adds
     /// them as written when it is on.

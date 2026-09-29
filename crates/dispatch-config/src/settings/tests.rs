@@ -629,3 +629,268 @@ fn an_option_written_back_reads_the_same() {
 
     assert_eq!(back, model);
 }
+
+/// A model that decides which efforts may be chosen: two list theirs, one
+/// lists none, and a model can be typed.
+const LIMITED: &str = r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "flash", label = "Flash", effort = ["low", "medium", "high"] },
+  { value = "pro", label = "Pro", effort = ["low", "high"] },
+  { value = "plain", label = "Plain" },
+]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+args = ["--effort", "{value}"]
+"#;
+
+/// What `chosen` resolves to for [`LIMITED`], nothing saved.
+fn fitted(chosen: &[(&str, &str)]) -> Choices {
+    demo_harness(LIMITED)
+        .resolve(&values(chosen), &Choices::new())
+        .expect("nothing here is refused")
+}
+
+#[test]
+fn an_effort_the_model_offers_is_kept() {
+    assert_eq!(
+        fitted(&[("model", "pro"), ("effort", "low")])["effort"],
+        "low"
+    );
+}
+
+#[test]
+fn an_effort_the_model_does_not_offer_becomes_its_highest() {
+    assert_eq!(
+        fitted(&[("model", "pro"), ("effort", "medium")])["effort"],
+        "high"
+    );
+    assert_eq!(
+        fitted(&[("model", "flash"), ("effort", "")])["effort"],
+        "high",
+        "a model that lists efforts takes one: agent default is not offered"
+    );
+}
+
+#[test]
+fn a_model_that_lists_no_effort_leaves_it_unset_and_passes_none() {
+    let def = demo_harness(LIMITED);
+    let values = def
+        .resolve(
+            &values(&[("model", "plain"), ("effort", "high")]),
+            &Choices::new(),
+        )
+        .expect("fitted, not refused");
+
+    assert_eq!(values["effort"], "");
+    assert_eq!(
+        def.launch_with("linux", &values).args,
+        ["--tui", "--model", "plain"]
+    );
+}
+
+#[test]
+fn a_typed_or_unset_model_limits_nothing() {
+    assert_eq!(
+        fitted(&[("model", "big-1"), ("effort", "medium")])["effort"],
+        "medium"
+    );
+    assert_eq!(fitted(&[("model", "big-1"), ("effort", "")])["effort"], "");
+    assert_eq!(
+        fitted(&[("model", ""), ("effort", "medium")])["effort"],
+        "medium"
+    );
+}
+
+#[test]
+fn a_chosen_effort_that_is_no_option_at_all_is_still_refused() {
+    let refused = demo_harness(LIMITED).resolve(
+        &values(&[("model", "pro"), ("effort", "ultra")]),
+        &Choices::new(),
+    );
+
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
+fn a_saved_pair_is_fitted_too() {
+    let values = demo_harness(LIMITED)
+        .resolve(
+            &Choices::new(),
+            &values(&[("model", "pro"), ("effort", "medium")]),
+        )
+        .expect("nothing chosen");
+
+    assert_eq!(values["effort"], "high");
+}
+
+#[test]
+fn a_launch_fits_the_values_it_is_handed_however_they_arrived() {
+    let def = demo_harness(LIMITED);
+
+    let args = def
+        .launch_with("linux", &values(&[("model", "pro"), ("effort", "medium")]))
+        .args;
+
+    assert_eq!(args, ["--tui", "--model", "pro", "--effort", "high"]);
+}
+
+#[test]
+fn allowed_says_what_a_limited_setting_may_take() {
+    let def = demo_harness(LIMITED);
+    let allowed_for = |model: &str| allowed(&def.settings, "effort", &values(&[("model", model)]));
+
+    assert_eq!(
+        allowed_for("pro"),
+        Allowed::Only(vec!["low".into(), "high".into()])
+    );
+    assert_eq!(allowed_for("plain"), Allowed::Unavailable);
+    assert_eq!(allowed_for("big-1"), Allowed::Free);
+    assert_eq!(allowed_for(""), Allowed::Free);
+    assert_eq!(
+        allowed(&def.settings, "model", &values(&[("model", "pro")])),
+        Allowed::Free,
+        "the model itself is limited by nothing"
+    );
+}
+
+#[test]
+fn a_limited_setting_declared_first_is_fitted_all_the_same() {
+    // The effort row above the model row in the file.
+    let mut parts: Vec<&str> = LIMITED
+        .split("[[settings]]")
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    parts.reverse();
+    let reordered: String = parts
+        .iter()
+        .map(|part| format!("[[settings]]{part}"))
+        .collect();
+    let def = demo_harness(&reordered);
+    assert_eq!(def.settings[0].key, "effort");
+
+    let values = def
+        .resolve(
+            &values(&[("model", "pro"), ("effort", "medium")]),
+            &Choices::new(),
+        )
+        .expect("fitted");
+
+    assert_eq!(values["effort"], "high");
+}
+
+#[test]
+fn a_limit_that_cannot_work_is_dropped_and_the_setting_kept() {
+    for limited_by in ["nothing", "bypass", "effort"] {
+        let def = demo_harness(&format!(
+            r#"
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "{limited_by}"
+options = ["low", "high"]
+args = ["--effort", "{{value}}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+args = ["--yolo"]
+"#
+        ));
+
+        assert_eq!(
+            setting(&def, "effort").limited_by,
+            None,
+            "limited_by = {limited_by:?}"
+        );
+    }
+}
+
+#[test]
+fn a_limit_on_a_flag_is_dropped() {
+    let def = demo_harness(
+        r#"
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["small"]
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "bypass"
+label = "Skip prompts"
+kind = "bool"
+limited_by = "model"
+args = ["--yolo"]
+"#,
+    );
+
+    assert_eq!(setting(&def, "bypass").limited_by, None);
+}
+
+#[test]
+fn a_chain_of_limits_is_cut_where_it_would_chain() {
+    let def = demo_harness(
+        r#"
+[[settings]]
+key = "a"
+label = "A"
+kind = "choice"
+options = ["x"]
+args = ["--a", "{value}"]
+
+[[settings]]
+key = "b"
+label = "B"
+kind = "choice"
+limited_by = "a"
+options = ["y"]
+args = ["--b", "{value}"]
+
+[[settings]]
+key = "c"
+label = "C"
+kind = "choice"
+limited_by = "b"
+options = ["z"]
+args = ["--c", "{value}"]
+"#,
+    );
+
+    assert_eq!(setting(&def, "b").limited_by.as_deref(), Some("a"));
+    assert_eq!(setting(&def, "c").limited_by, None);
+}
+
+#[test]
+fn an_options_list_keeps_only_what_it_may_name() {
+    // `ultra` is no effort option, and nothing called colour is limited by
+    // the model.
+    let def = demo_harness(&LIMITED.replace(
+        r#"effort = ["low", "high"] }"#,
+        r#"effort = ["low", "ultra"], colour = ["red"] }"#,
+    ));
+    let pro = setting(&def, "model")
+        .option("pro")
+        .cloned()
+        .expect("pro is offered");
+
+    assert_eq!(pro.allows.get("effort"), Some(&vec!["low".to_string()]));
+    assert!(!pro.allows.contains_key("colour"));
+}
