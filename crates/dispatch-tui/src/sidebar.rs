@@ -729,60 +729,117 @@ fn rows(state: &AppState, device: Option<DeviceId>) -> Vec<Row<'_>> {
         rows.push(Row::Project(project.id));
 
         let collapsed = state.is_project_collapsed(project.id);
-        let top: Vec<&Pane> = state
-            .panes_for(project.id)
-            .into_iter()
-            .filter(|pane| pane.parent.is_none())
-            .collect();
-
-        let Some(own) = project.branch.as_deref() else {
-            if !collapsed {
-                for pane in &top {
-                    push_pane(state, &mut rows, pane, PANE);
-                }
-            }
-            continue;
-        };
+        let groups = branch_groups(state, project);
 
         // The project's own branch stays when the project is folded: it is
         // part of what the project is, not one of the things folding hides.
-        rows.push(Row::Branch(project.id, own));
         if collapsed {
+            if let Some(own) = project.branch.as_deref() {
+                rows.push(Row::Branch(project.id, own));
+            }
             continue;
         }
 
-        // A pane whose branch is not known yet is shown with the project
-        // rather than held back until it is.
-        for pane in top
-            .iter()
-            .filter(|pane| pane.branch.as_deref().is_none_or(|branch| branch == own))
-        {
-            push_pane(state, &mut rows, pane, PANE);
-        }
-
-        // Every other branch, in the order its first pane was opened.
-        let mut others: Vec<&str> = Vec::new();
-        for pane in &top {
-            if let Some(branch) = pane.branch.as_deref()
-                && branch != own
-                && !others.contains(&branch)
-            {
-                others.push(branch);
+        for (branch, panes) in groups {
+            if let Some(branch) = branch {
+                rows.push(Row::Branch(project.id, branch));
             }
-        }
-
-        for branch in others {
-            rows.push(Row::Branch(project.id, branch));
-            for pane in top
-                .iter()
-                .filter(|pane| pane.branch.as_deref() == Some(branch))
-            {
+            for pane in panes {
                 push_pane(state, &mut rows, pane, PANE);
             }
         }
     }
 
     rows
+}
+
+/// A project's top-level panes grouped as the sidebar draws them, each
+/// group with the branch heading above it, when it has one.
+///
+/// A project with no branch is one group with no heading. Otherwise its own
+/// branch comes first, and a pane whose branch is not known yet is shown
+/// with the project rather than held back until it is; every other branch
+/// follows, in the order its first pane was opened.
+fn branch_groups<'a>(
+    state: &'a AppState,
+    project: &'a Project,
+) -> Vec<(Option<&'a str>, Vec<&'a Pane>)> {
+    let top: Vec<&Pane> = state
+        .panes_for(project.id)
+        .into_iter()
+        .filter(|pane| pane.parent.is_none())
+        .collect();
+
+    let Some(own) = project.branch.as_deref() else {
+        return vec![(None, top)];
+    };
+
+    let mut groups = vec![(
+        Some(own),
+        top.iter()
+            .copied()
+            .filter(|pane| pane.branch.as_deref().is_none_or(|branch| branch == own))
+            .collect::<Vec<_>>(),
+    )];
+
+    let mut others: Vec<&str> = Vec::new();
+    for pane in &top {
+        if let Some(branch) = pane.branch.as_deref()
+            && branch != own
+            && !others.contains(&branch)
+        {
+            others.push(branch);
+        }
+    }
+    for branch in others {
+        let panes = top
+            .iter()
+            .copied()
+            .filter(|pane| pane.branch.as_deref() == Some(branch))
+            .collect();
+        groups.push((Some(branch), panes));
+    }
+    groups
+}
+
+/// Every pane in the order the sidebar lists them, whatever is folded:
+/// machine by machine, project by project, branch by branch, each top-level
+/// pane followed by all of its descendants.
+///
+/// Unlike the drawn rows this follows subagents to any depth, so a pane the
+/// sidebar has no row for is still reachable in a sequence built from this.
+pub fn pane_order(state: &AppState) -> Vec<PaneId> {
+    fn descend(state: &AppState, pane: PaneId, order: &mut Vec<PaneId>) {
+        order.push(pane);
+        for child in state.children_of(pane) {
+            descend(state, child.id, order);
+        }
+    }
+
+    let devices = state.devices();
+    let projects: Vec<&Project> = if devices.len() <= 1 {
+        state.projects().iter().collect()
+    } else {
+        devices
+            .iter()
+            .flat_map(|device| {
+                state
+                    .projects()
+                    .iter()
+                    .filter(move |project| project.device == device.id)
+            })
+            .collect()
+    };
+
+    let mut order = Vec::new();
+    for project in projects {
+        for (_, panes) in branch_groups(state, project) {
+            for pane in panes {
+                descend(state, pane.id, &mut order);
+            }
+        }
+    }
+    order
 }
 
 /// A top-level pane's row, and its subagents' beneath it unless it is

@@ -71,8 +71,9 @@ quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
 that letter.
 
 A project with nothing open shows how to start: the keys for a new agent, for a
-shell and for command help, as you have them bound. The status row always ends
-with the help key, whatever else it is saying.
+shell and for command help, as you have them bound. The status row ends with
+the help key in normal mode (not in a mode, while locked, or while a dialog is
+open), whatever else it is saying.
 
 Four of these keys are newly taken from panes: `Ctrl p` is a shell's
 previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is
@@ -103,8 +104,9 @@ The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
 drops that mode's defaults. A command is named in snake_case — `new_pane`,
 `close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
 `next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
-`next_attention`, `attention_picker`, `quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
-name and skipped, and the rest still applies. `Esc` always leaves a mode,
+`next_attention`, `attention_picker`, `toggle_sidebar`, `sidebar_narrower`,
+`sidebar_wider`, `help`, `quit`, `pane_mode`, `lock`, `prefix`, and so on. A
+mistake is logged by name and skipped, and the rest still applies. `Esc` always leaves a mode,
 lock always has a key that unlocks, and a config that leaves no key to quit
 is logged. Keys are read when Dispatch starts.
 

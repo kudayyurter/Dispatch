@@ -1875,3 +1875,50 @@ fn every_state_has_words() {
     assert_eq!(status_text(PaneStatus::Exited(0), None), "Exited");
     assert_eq!(status_text(PaneStatus::Exited(2), None), "Exited (2)");
 }
+
+/// A subagent of `parent`, adopted into `project`.
+fn child_of(state: &mut AppState, project: ProjectId, parent: PaneId) -> PaneId {
+    let mut child = Pane::new(project, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    let id = child.id;
+    state.adopt_pane(child).expect("the project exists");
+    id
+}
+
+#[test]
+fn pane_order_follows_the_drawn_rows_across_branches() {
+    let (mut state, project) = repository();
+    // Spawn order interleaves the branches; the sidebar groups them.
+    let other_one = pane_on(&mut state, project, "o1", Some("feature"));
+    let own_one = pane_on(&mut state, project, "m1", Some("main"));
+    let third_one = pane_on(&mut state, project, "t1", Some("fix"));
+    let other_two = pane_on(&mut state, project, "o2", Some("feature"));
+    let own_two = pane_on(&mut state, project, "m2", None);
+
+    let drawn: Vec<PaneId> = rows(&state, None)
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Pane(id, _) => Some(id),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        drawn,
+        [own_one, own_two, other_one, other_two, third_one],
+        "the drawn order is branch by branch"
+    );
+    assert_eq!(pane_order(&state), drawn);
+}
+
+#[test]
+fn pane_order_reaches_every_depth_and_ignores_folds() {
+    let (mut state, project) = repository();
+    let top = pane_on(&mut state, project, "top", Some("main"));
+    let child = child_of(&mut state, project, top);
+    let grandchild = child_of(&mut state, project, child);
+    let next = pane_on(&mut state, project, "next", Some("main"));
+    state.toggle_pane_collapsed(top);
+
+    assert_eq!(pane_order(&state), [top, child, grandchild, next]);
+}

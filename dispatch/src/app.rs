@@ -1150,47 +1150,9 @@ impl App {
         self.state.toggle_project_collapsed(project);
     }
 
-    /// Every pane in the order the sidebar lists them: machine by machine,
-    /// project by project, each top-level pane followed by its subagents.
+    /// Every pane in the order the sidebar lists them, folded or not.
     fn pane_order(&self) -> Vec<PaneId> {
-        let devices = self.state.devices();
-        let projects: Vec<ProjectId> = if devices.len() <= 1 {
-            self.state
-                .projects()
-                .iter()
-                .map(|project| project.id)
-                .collect()
-        } else {
-            devices
-                .iter()
-                .flat_map(|device| {
-                    self.state
-                        .projects()
-                        .iter()
-                        .filter(move |project| project.device == device.id)
-                        .map(|project| project.id)
-                })
-                .collect()
-        };
-
-        let mut order = Vec::new();
-        for project in projects {
-            for top in self
-                .state
-                .panes_for(project)
-                .into_iter()
-                .filter(|pane| pane.parent.is_none())
-            {
-                order.push(top.id);
-                order.extend(
-                    self.state
-                        .children_of(top.id)
-                        .into_iter()
-                        .map(|child| child.id),
-                );
-            }
-        }
-        order
+        sidebar::pane_order(&self.state)
     }
 
     /// Whether `id` is a live pane waiting on the user.
@@ -1276,7 +1238,13 @@ impl App {
                 let keys = keymap
                     .path_to(command)
                     .unwrap_or_else(|| "no key".to_string());
-                Item::new(name, command.describe()).with_detail(keys)
+                // One row stands for the digit keys, and Enter on it goes to
+                // tab 1, so that is what it says.
+                let label = match command {
+                    Command::GoToTab(_) => "Go to tab 1",
+                    other => other.describe(),
+                };
+                Item::new(name, label).with_detail(keys)
             })
             .collect();
         self.overlay = Some(Overlay::Help(
@@ -2869,7 +2837,13 @@ impl App {
         // away; a click on it is the sidebar's, below, and then puts it away.
         if self.drawer_open {
             match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc => {
+                // Only in normal mode: in a key mode Esc leaves the mode, and
+                // locked every key belongs to the pane.
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && key.code == KeyCode::Esc
+                        && self.router.key_mode() == KeyMode::Normal =>
+                {
                     self.drawer_open = false;
                     return Ok(());
                 }
@@ -5297,11 +5271,27 @@ impl App {
             // of its top border; the others leave it to their glyphs, or the
             // grid would fill with words.
             if is_focused && let Some(state) = self.state.pane(*id) {
-                let words = sidebar::status_text(state.status, self.reason_of(*id));
-                block = block.title_top(
-                    Line::styled(format!(" {words} "), Style::default().fg(self.theme.faded))
-                        .right_aligned(),
+                let words = format!(
+                    " {} ",
+                    sidebar::status_text(state.status, self.reason_of(*id))
                 );
+                // Only when both fit: a right-aligned title is drawn over a
+                // left one, and the title is what names the pane. Plain, not
+                // the bold the block gives its titles.
+                let needed = Span::raw(pane_title(&self.state, *id)).width()
+                    + Span::raw(words.as_str()).width()
+                    + 4;
+                if needed <= usize::from(outer.width) {
+                    block = block.title_top(
+                        Line::styled(
+                            words,
+                            Style::default()
+                                .fg(self.theme.faded)
+                                .remove_modifier(Modifier::BOLD),
+                        )
+                        .right_aligned(),
+                    );
+                }
             }
             frame.render_widget(block, *outer);
             if let Some(t) = self.animations.value(Target::Open(*id), now) {
@@ -5654,12 +5644,12 @@ impl App {
         // A blocked pane on another tab, or in a folded project, still needs
         // to be found; the status row is the one place always on screen, and
         // it stays said over an overlay, which may be what hides the pane.
+        // Counted from the walk `Alt a` takes, so the number said here is
+        // always the number that key can reach.
         let blocked = self
-            .state
-            .projects()
-            .iter()
-            .flat_map(|project| self.state.panes_for(project.id))
-            .filter(|pane| !pane.closed && pane.status == PaneStatus::Blocked)
+            .pane_order()
+            .into_iter()
+            .filter(|id| self.is_waiting(*id))
             .count();
         let blocked_reminder = (blocked > 0).then(|| {
             let waiting = format!("{blocked} waiting on you");
@@ -5770,7 +5760,7 @@ impl App {
         // The way into the command help, pinned to the end of the row and
         // reserved first, so no message can push it off. A mode's row lists
         // its own keys instead, and locked, help is not reachable anyway.
-        let chip = (mode == KeyMode::Normal)
+        let chip = (mode == KeyMode::Normal && self.overlay.is_none())
             .then(|| keymap.path_to(Command::Help))
             .flatten()
             .map(|keys| format!("{keys} help"));
@@ -13951,5 +13941,201 @@ args = ["--effort", "{value}"]
             "{}",
             bottom_row(&terminal)
         );
+    }
+
+    /// The top border of `pane`'s tile, as last drawn.
+    fn top_border(
+        app: &App,
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        pane: PaneId,
+    ) -> String {
+        let (_, rect) = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("tiled");
+        rendered_text(terminal)
+            .lines()
+            .nth(rect.y as usize)
+            .unwrap_or("")
+            .chars()
+            .skip(rect.x as usize)
+            .take(rect.width as usize)
+            .collect()
+    }
+
+    #[test]
+    fn a_focused_panes_words_give_way_to_its_title_when_they_do_not_both_fit() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.rename(
+            panes[2],
+            "a task with a title long enough to take the whole top border",
+        );
+        app.state
+            .set_pane_status(panes[2], PaneStatus::Blocked)
+            .expect("exists");
+        app.focus_pane(panes[2]);
+        advance(&clock, Duration::from_secs(1));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+
+        let top = top_border(&app, &terminal, panes[2]);
+        assert!(
+            top.contains(" a task with a title long enough to take the whole top border "),
+            "{top}"
+        );
+        assert!(!top.contains("Needs approval"), "{top}");
+    }
+
+    #[test]
+    fn a_wide_panes_words_are_shown_and_not_bold() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        advance(&clock, Duration::from_secs(1));
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let (_, rect) = app.frames[0];
+        let top = top_border(&app, &terminal, panes[0]);
+        let offset = column_of(&top, "Working");
+        assert!(offset > 0, "{top}");
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((rect.x + u16::try_from(offset).expect("narrow"), rect.y))
+            .expect("drawn");
+        assert_eq!(cell.fg, app.theme.faded);
+        assert!(!cell.modifier.contains(Modifier::BOLD), "{cell:?}");
+    }
+
+    #[test]
+    fn alt_a_follows_the_sidebar_across_branches_and_reaches_deep_subagents() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.state
+            .set_project_branch(project, Some("main".into()))
+            .expect("exists");
+        // Spawn order: feature, main, feature; the sidebar draws main's
+        // pane first, then both of feature's.
+        for (pane, branch) in panes.iter().zip(["feature", "main", "feature"]) {
+            app.state
+                .set_pane_branch(*pane, Some(branch.to_string()))
+                .expect("exists");
+        }
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, "shell", Some(panes[0]), false))
+            .expect("listening");
+        let grandchild = PaneId::new();
+        daemon
+            .send(spawned(grandchild, project, "shell", Some(child), false))
+            .expect("listening");
+        app.poll_daemon();
+        for pane in [panes[0], panes[1], grandchild] {
+            block(&mut app, pane);
+        }
+        app.focus_pane(panes[2]);
+
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        assert!(
+            bottom_row(&terminal).contains("3 waiting on you"),
+            "{}",
+            bottom_row(&terminal)
+        );
+
+        // From panes[2] (last on feature): wrap to main's, then feature's
+        // first, then down to the grandchild.
+        let mut walked = Vec::new();
+        for _ in 0..3 {
+            press_alt(&mut app, 'a');
+            walked.push(app.state.focused_pane());
+        }
+        assert_eq!(
+            walked,
+            [Some(panes[1]), Some(panes[0]), Some(grandchild)],
+            "sidebar order, every depth"
+        );
+    }
+
+    #[test]
+    fn lock_hands_the_drawer_no_escape_but_normal_mode_closes_it() {
+        let (mut app, project, daemon, sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let _ = sent.try_iter().count();
+
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        app.drawer_open = true;
+        press(&mut app, KeyCode::Esc);
+        assert!(app.drawer_open, "locked, Esc is the pane's");
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "it reached the pane"
+        );
+
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.drawer_open, "in normal mode Esc puts it away");
+    }
+
+    #[test]
+    fn the_help_chip_is_hidden_while_an_overlay_has_the_keyboard() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).contains("Alt / help"));
+
+        app.open_help();
+        drawn(&mut app, &mut terminal);
+        assert!(!bottom_row(&terminal).contains("Alt / help"));
+
+        app.overlay = None;
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).contains("Alt / help"));
+    }
+
+    #[test]
+    fn the_help_row_for_the_digit_keys_says_it_goes_to_tab_one() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        app.open_help();
+        let Some(Overlay::Help(picker)) = &app.overlay else {
+            panic!("help is open");
+        };
+        assert!(
+            picker
+                .items()
+                .iter()
+                .any(|item| item.label == "Go to tab 1")
+        );
+        assert!(!picker.items().iter().any(|item| item.label.contains("1–9")));
+    }
+
+    #[test]
+    fn the_sidebar_docks_at_eighty_columns_and_takes_none_at_seventy_nine() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        let mut at_80 = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut at_80);
+        assert_eq!(
+            app.frames.iter().map(|(_, r)| r.x).min(),
+            Some(sidebar::WIDTH)
+        );
+
+        let mut at_79 = ratatui::Terminal::new(ratatui::backend::TestBackend::new(79, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut at_79);
+        assert_eq!(app.frames.iter().map(|(_, r)| r.x).min(), Some(0));
+        assert!(app.sidebar_area.is_empty());
     }
 }
