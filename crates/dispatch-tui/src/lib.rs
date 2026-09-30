@@ -4,6 +4,7 @@ pub mod activity;
 pub mod browser;
 pub mod input;
 pub mod keymap;
+pub mod menu;
 pub mod motion;
 pub mod pane;
 pub mod picker;
