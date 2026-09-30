@@ -157,7 +157,7 @@ and quiet means idle -- though not the echo of your own typing, or its repaint
 after a resize. Each harness's rules recognise what activity alone cannot -- a
 spinner in the title, a permission prompt. `claude`, `codex`, `opencode` and
 `agy` have rules built in, adapted from
-[herdr](https://github.com/ogulcancelik/herdr)'s detection manifests. A
+[herdr](https://github.com/herdrdev/herdr)'s detection manifests. A
 harness's own TOML can carry its own:
 
 ```toml

@@ -1,6 +1,6 @@
 //! Builds the vendored `libghostty-vt` with Zig and links it statically.
 //!
-//! Derived from herdr's `build.rs` (https://github.com/rksm/herdr),
+//! Derived from herdr's `build.rs` (https://github.com/herdrdev/herdr),
 //! Copyright the herdr authors, licensed under the Apache License, Version 2.0.
 
 use std::env;

@@ -1,7 +1,7 @@
 //! The rules Dispatch ships for the agents it knows.
 //!
 //! Adapted from herdr's detection manifests
-//! (<https://github.com/ogulcancelik/herdr>, Apache-2.0), simplified to the
+//! (<https://github.com/herdrdev/herdr>, Apache-2.0), simplified to the
 //! regions and conditions Dispatch's rules have. Written as TOML — the same
 //! format a harness file's `[status]` section uses — so any of these can be
 //! copied into that file and edited when an agent's interface moves on.
