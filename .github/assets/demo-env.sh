@@ -1,65 +1,85 @@
-# .github/assets/demo-env.sh: a throwaway environment for demo.tape.
-# Sourced (hidden) by the tape. Nothing here touches your real config or agents:
-# HOME and DISPATCH_CONFIG_DIR are temporary, and the only agent the tape opens
-# is a scripted stand-in ("Demo agent") that prints canned output, so no agent
-# runs and no API is called. The real harnesses still appear in the picker.
+#!/usr/bin/env bash
+# .github/assets/demo-env.sh: the clean environment demo.tape records in.
 #
-# DISPATCH_BIN overrides the binary (default: target/release/dispatch).
+# Run (hidden) by the tape. It makes a throwaway directory with a fresh HOME,
+# a fresh clone of Dispatch on its default branch, and empty config for
+# Dispatch, Claude Code and Codex, then starts Dispatch there under `env -i`.
+# Nothing of yours shows: no shell history, dotfiles, prompt, agent settings,
+# memories or instructions, and no real path.
+#
+# The agents are real and logged in as you: Claude Code's credentials are
+# linked in and Codex's auth.json is copied, so a recording spends a little of
+# both accounts' quota. No credentials are kept in the repo, and the throwaway
+# directory is deleted when Dispatch quits.
+#
+# DISPATCH_BIN overrides the binary (default: target/release/dispatch);
+# DEMO_REPO the repository cloned (default: the public one on GitHub).
+set -euo pipefail
 
 bin=${DISPATCH_BIN:-$PWD/target/release/dispatch}
+repo=${DEMO_REPO:-https://github.com/kudayyurter/Dispatch.git}
+claude_bin=$(readlink -f "$(command -v claude)")
+codex_bin=$(readlink -f "$(command -v codex)")
+
 demo=$(mktemp -d)
-export HOME=$demo/home DISPATCH_CONFIG_DIR=$demo/config
-mkdir -p "$HOME" "$DISPATCH_CONFIG_DIR/harnesses" "$demo/bin"
+trap 'rm -rf "$demo"' EXIT
+home=$demo/home clone=$demo/home/code/Dispatch
+mkdir -p "$home/code" "$demo/bin" "$demo/dispatch" "$demo/claude" "$demo/codex"
 ln -s "$bin" "$demo/bin/dispatch"
-export PATH=$demo/bin:/usr/bin:/bin SHELL=/bin/bash PS1='$ '
+ln -s "$claude_bin" "$demo/bin/claude"
+ln -s "$codex_bin" "$demo/bin/codex"
 
-# Two sample projects.
-for p in api web; do
-  mkdir -p "$HOME/code/$p/src"
-  touch "$HOME/code/$p/src/main.rs" "$HOME/code/$p/Cargo.toml"
-  printf '# %s\n' "$p" > "$HOME/code/$p/README.md"
-  git -C "$HOME/code/$p" init -q -b main
-done
+git clone -q --depth 1 "$repo" "$clone"
 
-# The stand-in agent: each pane it opens plays the next of three scripts.
-cat > "$demo/bin/demo-agent" <<'EOF'
-#!/bin/bash
-n=$(( $(cat "$HOME/.demo-count" 2>/dev/null || echo 0) + 1 )); echo $n > "$HOME/.demo-count"
-say() { printf '%s\n' "$1"; sleep "${2:-0.5}"; }
-case $n in
-  1) say "> add retries to the http client"; say "reading src/http/client.rs"; say "editing src/http/client.rs"
-     say "running cargo test"; say "  42 passed" 1; say "Done: 2 files changed."; printf '\n> ' ;;
-  2) say "> bump the lockfile"; say "reading Cargo.lock"
-     printf '\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n'; read -r _
-     say "updating Cargo.lock"; say "  18 packages updated"; say "running cargo test"; say "  42 passed"
-     say "Done: lockfile bumped."; printf '\n> ' ;;
-  *) say "> write docs for the api"; while :; do say "writing docs/api.md ($((i+=1)))" 0.4; done ;;
-esac
-exec cat > /dev/null
+# Dispatch: Claude asks before it runs a command (so it can be blocked on
+# you), both agents think briefly, and shell panes skip rc files.
+cat > "$demo/dispatch/harness-settings.toml" <<'EOF'
+[claude]
+effort = "low"
+permissions = "manual"
+
+[codex]
+effort = "low"
 EOF
-chmod +x "$demo/bin/demo-agent"
-
-cat > "$DISPATCH_CONFIG_DIR/harnesses/demo.toml" <<'EOF'
-id = "demo"
-icon = "󰚩"
-display_name = "Demo agent"
-command = "demo-agent"
-args = []
-
-[[status.rules]]
-state = "blocked"
-region = "bottom:5"
-contains = ["do you want to proceed?"]
-priority = 990
-EOF
-
-# Shell panes skip rc files, so no system prompt or title names you or this machine.
-cat > "$DISPATCH_CONFIG_DIR/config.toml" <<'EOF'
+cat > "$demo/dispatch/config.toml" <<'EOF'
 [shell]
 command = "/bin/bash"
 args = ["--norc", "--noprofile"]
 login = "never"
 EOF
 
-cd "$HOME/code"
+# Claude Code: logged in, onboarding done, the clone trusted.
+ln -s "$HOME/.claude/.credentials.json" "$demo/claude/.credentials.json"
+cat > "$demo/claude/.claude.json" <<EOF
+{"hasCompletedOnboarding": true, "theme": "dark",
+ "projects": {"$clone": {"hasTrustDialogAccepted": true}}}
+EOF
+
+# Codex: logged in, the clone trusted, no update box, and no status line or
+# rate-limit nudge (both can name the model).
+cp "$HOME/.codex/auth.json" "$demo/codex/auth.json"
+chmod 600 "$demo/codex/auth.json"
+cat > "$demo/codex/config.toml" <<EOF
+check_for_update_on_startup = false
+
+[projects."$clone"]
+trust_level = "trusted"
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[tui]
+status_line = []
+EOF
+
+cd "$clone"
 clear
+env -i \
+  HOME="$home" PATH="$demo/bin:/usr/bin:/bin" \
+  TERM="${TERM:-xterm-256color}" COLORTERM=truecolor LANG="${LANG:-C.UTF-8}" \
+  SHELL=/bin/bash PS1='$ ' \
+  DISPATCH_CONFIG_DIR="$demo/dispatch" \
+  CLAUDE_CONFIG_DIR="$demo/claude" CLAUDE_CODE_HIDE_CWD=1 DISABLE_AUTOUPDATER=1 \
+  CODEX_HOME="$demo/codex" \
+  RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+  dispatch .
