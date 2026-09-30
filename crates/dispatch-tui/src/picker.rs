@@ -9,6 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
+use crate::button::{self, Button, ButtonId, DialogLayout};
 use crate::theme::Chrome;
 
 /// One row of a picker.
@@ -54,6 +55,12 @@ pub struct Picker {
     hint: Option<String>,
     /// What has been typed to narrow the rows, for a picker that takes typing.
     filter: Option<String>,
+    /// What can be clicked along the foot, when the caller wants any.
+    buttons: Vec<Button>,
+    /// The button held down, drawn in the selection.
+    pressed: Option<ButtonId>,
+    /// The row the pointer is over, among the rows shown.
+    hovered: Option<usize>,
 }
 
 impl Picker {
@@ -67,6 +74,34 @@ impl Picker {
             chrome: Chrome::default(),
             hint: None,
             filter: None,
+            buttons: Vec::new(),
+            pressed: None,
+            hovered: None,
+        }
+    }
+
+    /// The same picker, with `buttons` along its foot when they fit.
+    #[must_use]
+    pub fn with_buttons(mut self, buttons: Vec<Button>) -> Self {
+        self.buttons = buttons;
+        self
+    }
+
+    /// Marks the button held down, or none.
+    pub fn set_pressed(&mut self, pressed: Option<ButtonId>) {
+        self.pressed = pressed;
+    }
+
+    /// Marks the row the pointer is over, by its index among the rows shown.
+    pub fn set_hovered(&mut self, hovered: Option<usize>) {
+        self.hovered = hovered;
+    }
+
+    /// Moves the highlight to the row at `index` among the rows shown, if
+    /// there is one: what a click on a row does.
+    pub fn select_shown(&mut self, index: usize) {
+        if index < self.shown().len() {
+            self.selected = index;
         }
     }
 
@@ -209,6 +244,12 @@ impl Picker {
     /// and room for the border and a margin.
     #[must_use]
     pub fn desired_width(&self) -> u16 {
+        self.width_for(true)
+    }
+
+    /// The width it needs, counting its buttons or not: a box that drops
+    /// them goes back to the width it had without.
+    fn width_for(&self, buttons: bool) -> u16 {
         let widest = self
             .items
             .iter()
@@ -219,31 +260,97 @@ impl Picker {
             .unwrap_or(0);
 
         let hint_width = self.hint.as_ref().map_or(0, |hint| hint.chars().count());
+        let buttons_width = if buttons {
+            usize::from(button::total_width(&self.buttons))
+        } else {
+            0
+        };
         let filter_width = self
             .filter
             .as_ref()
             .map_or(0, |filter| filter.chars().count() + 3);
-        let widest = widest.max(filter_width);
+        let widest = widest.max(filter_width).max(buttons_width);
         u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
             .unwrap_or(u16::MAX)
             .max(20)
     }
 }
 
-impl Widget for &Picker {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl Picker {
+    /// Where the box and what can be clicked in it fall inside `area`.
+    ///
+    /// The one place this is worked out: drawing follows it, so what is
+    /// clicked is what is seen. Empty when `area` is too small to draw in.
+    #[must_use]
+    pub fn layout(&self, area: Rect) -> DialogLayout {
         if area.width < 4 || area.height < 3 {
-            return;
+            return DialogLayout::default();
         }
 
-        let width = self.desired_width().clamp(20.min(area.width), area.width);
-        let shown = self.shown();
+        let clamped = |buttons| {
+            self.width_for(buttons)
+                .clamp(20.min(area.width), area.width)
+        };
+        let width = clamped(true);
+        let shown = self.shown().len();
         let filter_rows = usize::from(self.filter.is_some());
-        let height = u16::try_from(shown.len().max(1) + filter_rows + 2)
-            .unwrap_or(u16::MAX)
-            .clamp(3, area.height);
+        let height = |extra: usize| {
+            u16::try_from(shown.max(1) + filter_rows + 2 + extra)
+                .unwrap_or(u16::MAX)
+                .clamp(3, area.height)
+        };
 
-        let rect = centred(area, width, height);
+        // Buttons take the last row inside the box, and are kept only when
+        // they all fit and leave the list a row to draw in.
+        let frame = Block::default().borders(Borders::ALL);
+        let with_buttons = centred(area, width, height(1));
+        let foot = frame.inner(with_buttons);
+        let (rect, inner, buttons) = if usize::from(foot.height) > filter_rows + 1 {
+            let row = Rect::new(foot.x, foot.y + foot.height - 1, foot.width, 1);
+            let placed = button::lay_out(&self.buttons, row);
+            if placed.is_empty() {
+                let rect = centred(area, clamped(false), height(0));
+                (rect, frame.inner(rect), placed)
+            } else {
+                let inner = Rect::new(foot.x, foot.y, foot.width, foot.height - 1);
+                (with_buttons, inner, placed)
+            }
+        } else {
+            let rect = centred(area, clamped(false), height(0));
+            (rect, frame.inner(rect), Vec::new())
+        };
+
+        let top = inner.y + u16::try_from(filter_rows).unwrap_or(0);
+        let rows = usize::from(inner.bottom().saturating_sub(top));
+
+        // Scroll so the selection stays visible in a list taller than the box.
+        let first = self.selected.saturating_sub(rows.saturating_sub(1));
+        let rows = (first..shown)
+            .take(rows)
+            .enumerate()
+            .map(|(offset, index)| {
+                let y = top + u16::try_from(offset).unwrap_or(0);
+                (Rect::new(inner.x, y, inner.width, 1), index)
+            })
+            .collect();
+
+        DialogLayout {
+            rect,
+            rows,
+            steps: Vec::new(),
+            buttons,
+        }
+    }
+}
+
+impl Widget for &Picker {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let layout = self.layout(area);
+        let rect = layout.rect;
+        if rect.is_empty() {
+            return;
+        }
+        let shown = self.shown();
 
         // The picker floats over the grid, so whatever it covers is erased
         // rather than left showing through.
@@ -258,9 +365,10 @@ impl Widget for &Picker {
                 Line::styled(format!(" {hint} "), self.chrome.border).right_aligned(),
             );
         }
-        let mut inner = block.inner(rect);
+        let inner = block.inner(rect);
         block.render(rect, buf);
 
+        let mut list = inner;
         if let Some(filter) = &self.filter {
             write(
                 buf,
@@ -270,53 +378,64 @@ impl Widget for &Picker {
                 &format!("> {filter}▏"),
                 self.chrome.accent,
             );
-            inner.y += 1;
-            inner.height = inner.height.saturating_sub(1);
+            list.y += 1;
+            list.height = list.height.saturating_sub(1);
         }
 
         if shown.is_empty() {
             write(
                 buf,
-                inner,
-                inner.x,
-                inner.y,
+                list,
+                list.x,
+                list.y,
                 "nothing to choose",
                 self.chrome.secondary,
             );
-            return;
         }
 
-        // Scroll so the selection stays visible in a list taller than the box.
-        let rows = inner.height as usize;
-        let first = self.selected.saturating_sub(rows.saturating_sub(1));
-
-        for (offset, item) in shown.iter().skip(first).take(rows).enumerate() {
-            let index = first + offset;
-            let y = inner.y + u16::try_from(offset).unwrap_or(0);
-            let chosen = index == self.selected;
+        for (row, index) in &layout.rows {
+            let Some(item) = shown.get(*index) else {
+                continue;
+            };
+            let chosen = *index == self.selected;
 
             let style = if chosen {
                 self.chrome.selection
             } else {
                 Style::default()
             };
+            // Underlined rather than barred, so what the pointer is over
+            // never reads as what is chosen.
+            let label_style = if !chosen && self.hovered == Some(*index) {
+                button::hover(&self.chrome)
+            } else {
+                style
+            };
 
             // Paint the whole row so the highlight is a bar rather than just
             // behind the text.
-            for x in inner.x..inner.x + inner.width {
-                if let Some(cell) = buf.cell_mut((x, y)) {
+            for x in row.x..row.right() {
+                if let Some(cell) = buf.cell_mut((x, row.y)) {
                     cell.set_symbol(" ");
                     cell.set_style(style);
                 }
             }
 
-            let x = write(buf, inner, inner.x + 1, y, &item.label, style);
+            let x = write(buf, *row, row.x + 1, row.y, &item.label, label_style);
 
             if let Some(detail) = &item.detail {
                 let detail_style = if chosen { style } else { self.chrome.secondary };
-                write(buf, inner, x + 2, y, detail, detail_style);
+                write(buf, *row, x + 2, row.y, detail, detail_style);
             }
         }
+
+        button::render(
+            buf,
+            &self.buttons,
+            &layout.buttons,
+            &self.chrome,
+            self.pressed,
+        );
     }
 }
 

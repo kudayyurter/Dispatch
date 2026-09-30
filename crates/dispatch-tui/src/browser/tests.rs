@@ -456,3 +456,142 @@ fn the_browser_draws_only_in_its_chrome() {
 
     crate::theme::assert_no_fixed_colours(&buf);
 }
+
+fn open_cancel() -> Vec<crate::button::Button> {
+    use crate::button::{Button, ButtonId};
+    vec![
+        Button {
+            id: ButtonId::Cancel,
+            label: "Cancel",
+            default: false,
+        },
+        Button {
+            id: ButtonId::Open,
+            label: "Open",
+            default: true,
+        },
+    ]
+}
+
+/// Renders into a buffer, for reading back cells.
+fn buffer(browser: &Browser, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    use ratatui::widgets::Widget;
+    let area = ratatui::layout::Rect::new(0, 0, width, height);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    browser.render(area, &mut buf);
+    buf
+}
+
+fn drawn_in(buf: &ratatui::buffer::Buffer, rect: ratatui::layout::Rect) -> String {
+    (rect.x..rect.right())
+        .filter_map(|x| buf.cell((x, rect.y)))
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
+}
+
+#[test]
+fn buttons_are_laid_out_and_drawn_below_the_list_and_the_keys() {
+    let tree = Tree::new("buttons", &["alpha", "beta"]);
+    let browser = Browser::new(tree.path()).with_buttons(open_cancel());
+    let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+    let layout = browser.layout(area);
+    let buf = buffer(&browser, 100, 24);
+
+    assert_eq!(layout.buttons.len(), 2);
+    let foot = layout.buttons[0].0.y;
+    for (rect, id) in &layout.buttons {
+        let label = if *id == crate::button::ButtonId::Open {
+            "[ Open ]"
+        } else {
+            "[ Cancel ]"
+        };
+        assert_eq!(drawn_in(&buf, *rect), label);
+    }
+    assert!(layout.rows.iter().all(|(row, _)| row.y < foot - 1));
+    let keys = drawn_in(
+        &buf,
+        ratatui::layout::Rect::new(layout.rect.x + 1, foot - 1, layout.rect.width - 2, 1),
+    );
+    assert!(keys.contains("⏎ open"), "the keys stay above: {keys}");
+}
+
+#[test]
+fn a_browser_without_buttons_keeps_its_listing_rows() {
+    let tree = Tree::new("no-buttons", &["alpha", "beta", "gamma", "delta", "eps"]);
+    let area = ratatui::layout::Rect::new(0, 0, 100, 12);
+    let bare = Browser::new(tree.path()).layout(area);
+    let with = Browser::new(tree.path())
+        .with_buttons(open_cancel())
+        .layout(area);
+
+    assert!(bare.buttons.is_empty());
+    assert_eq!(bare.rect, with.rect);
+    assert_eq!(bare.rows.len(), with.rows.len() + 1);
+}
+
+#[test]
+fn buttons_that_do_not_fit_are_dropped_and_the_listing_keeps_its_rows() {
+    let tree = Tree::new("no-room", &["alpha", "beta"]);
+    let area = ratatui::layout::Rect::new(0, 0, 30, 9);
+    let bare = Browser::new(tree.path()).layout(area);
+    let with = Browser::new(tree.path())
+        .with_buttons(open_cancel())
+        .layout(area);
+
+    assert!(with.buttons.is_empty());
+    assert_eq!(with.rows, bare.rows);
+}
+
+#[test]
+fn rows_are_where_each_visible_entry_is_drawn() {
+    let tree = Tree::new("rows", &["alpha", "beta"]);
+    let browser = Browser::new(tree.path()).with_buttons(open_cancel());
+    let layout = browser.layout(ratatui::layout::Rect::new(0, 0, 100, 24));
+    let buf = buffer(&browser, 100, 24);
+
+    assert_eq!(layout.rows.len(), 2);
+    for ((rect, index), label) in layout.rows.iter().zip(["alpha", "beta"]) {
+        assert_eq!(rect.height, 1);
+        assert!(drawn_in(&buf, *rect).contains(label));
+        assert_eq!(labels(&browser)[*index], label);
+    }
+}
+
+#[test]
+fn selecting_a_visible_entry_moves_to_it_and_ignores_the_out_of_range() {
+    let tree = Tree::new("select", &["alpha", "beta"]);
+    let mut browser = Browser::new(tree.path());
+    browser.select_visible(1);
+    assert_eq!(browser.selected().map(|e| e.label.as_str()), Some("beta"));
+    browser.select_visible(7);
+    assert_eq!(browser.selected().map(|e| e.label.as_str()), Some("beta"));
+}
+
+#[test]
+fn hover_underlines_an_entry_and_leaves_the_chosen_one_alone() {
+    let tree = Tree::new("hover", &["alpha", "beta"]);
+    let mut browser = Browser::new(tree.path());
+    browser.set_hovered(Some(1));
+    let layout = browser.layout(ratatui::layout::Rect::new(0, 0, 100, 24));
+    let buf = buffer(&browser, 100, 24);
+    let underlined = |rect: ratatui::layout::Rect| {
+        buf.cell((rect.x + 2, rect.y))
+            .unwrap()
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED)
+    };
+
+    assert!(underlined(layout.rows[1].0));
+    assert!(!underlined(layout.rows[0].0));
+}
+
+#[test]
+fn a_browser_with_buttons_draws_at_any_size_without_panicking() {
+    let tree = Tree::new("sizes", &["alpha", "beta"]);
+    let browser = Browser::new(tree.path()).with_buttons(open_cancel());
+    for width in 1..=30 {
+        for height in 1..=10 {
+            render(&browser, width, height);
+        }
+    }
+}

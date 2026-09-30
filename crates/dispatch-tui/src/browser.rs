@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
+use crate::button::{self, Button, ButtonId, DialogLayout};
 use crate::sidebar::{REPOSITORY, SHUT_FOLDER};
 use crate::theme::Chrome;
 
@@ -62,6 +63,12 @@ pub struct Browser {
     scanning: bool,
     /// The dialog colours, set by whoever draws the overlay.
     chrome: Chrome,
+    /// What can be clicked along the foot, when the caller wants any.
+    buttons: Vec<Button>,
+    /// The button held down, drawn in the selection.
+    pressed: Option<ButtonId>,
+    /// The entry the pointer is over, among the visible ones.
+    hovered: Option<usize>,
 }
 
 impl Browser {
@@ -79,6 +86,35 @@ impl Browser {
             selected: 0,
             scanning: false,
             chrome: Chrome::default(),
+            buttons: Vec::new(),
+            pressed: None,
+            hovered: None,
+        }
+    }
+
+    /// The same browser, with `buttons` along its foot when they fit.
+    #[must_use]
+    pub fn with_buttons(mut self, buttons: Vec<Button>) -> Self {
+        self.buttons = buttons;
+        self
+    }
+
+    /// Marks the button held down, or none.
+    pub fn set_pressed(&mut self, pressed: Option<ButtonId>) {
+        self.pressed = pressed;
+    }
+
+    /// Marks the entry the pointer is over, by its index among the visible
+    /// ones.
+    pub fn set_hovered(&mut self, hovered: Option<usize>) {
+        self.hovered = hovered;
+    }
+
+    /// Moves to the visible entry at `index`, if there is one: what a click
+    /// on a row does.
+    pub fn select_visible(&mut self, index: usize) {
+        if index < self.visible().len() {
+            self.selected = index;
         }
     }
 
@@ -421,15 +457,69 @@ fn short(path: &Path) -> String {
     }
 }
 
-impl Widget for &Browser {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl Browser {
+    /// Where the box and what can be clicked in it fall inside `area`.
+    ///
+    /// The one place this is worked out: drawing follows it, so what is
+    /// clicked is what is seen. Empty when `area` is too small to draw in.
+    #[must_use]
+    pub fn layout(&self, area: Rect) -> DialogLayout {
         if area.width < 8 || area.height < 6 {
-            return;
+            return DialogLayout::default();
         }
 
         let width = (area.width * 2 / 3).clamp(30.min(area.width), area.width);
         let height = (area.height * 2 / 3).clamp(6, area.height);
         let rect = centred(area, width, height);
+        let inner = Block::default().borders(Borders::ALL).inner(rect);
+        if inner.height < 3 {
+            return DialogLayout {
+                rect,
+                ..DialogLayout::default()
+            };
+        }
+
+        // Where we are, what has been typed, the listing, then the keys. The
+        // buttons go under the keys and cost the listing a row, kept only
+        // when they fit and leave it one.
+        let foot = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        let placed = if inner.height >= 5 {
+            button::lay_out(&self.buttons, foot)
+        } else {
+            Vec::new()
+        };
+        let rows = inner
+            .height
+            .saturating_sub(3 + u16::from(!placed.is_empty()));
+
+        // The selected row stays on screen in a listing longer than the box.
+        let first = (self.selected + 1).saturating_sub(usize::from(rows));
+        let visible = self.visible().len();
+        let rows = (first..visible)
+            .take(usize::from(rows))
+            .enumerate()
+            .map(|(offset, index)| {
+                let y = inner.y + 2 + u16::try_from(offset).unwrap_or(0);
+                (Rect::new(inner.x, y, inner.width, 1), index)
+            })
+            .collect();
+
+        DialogLayout {
+            rect,
+            rows,
+            steps: Vec::new(),
+            buttons: placed,
+        }
+    }
+}
+
+impl Widget for &Browser {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let layout = self.layout(area);
+        let rect = layout.rect;
+        if rect.is_empty() {
+            return;
+        }
 
         // It floats over the grid, so whatever it covers is erased rather than
         // left showing through.
@@ -446,8 +536,6 @@ impl Widget for &Browser {
             return;
         }
 
-        // Where we are, then what has been typed, then the listing, then the
-        // keys: the listing is the part that grows.
         // The word first and the path after it: cutting a path keeps its end,
         // and a cut that ate the word would leave the listing unexplained.
         let prefix = if self.scanning {
@@ -479,54 +567,62 @@ impl Widget for &Browser {
             Style::default().add_modifier(Modifier::BOLD),
         );
 
-        let rows = inner.height.saturating_sub(3);
         let visible = self.visible();
-
-        // The selected row stays on screen in a listing longer than the box.
-        let first = (self.selected + 1).saturating_sub(rows as usize);
-
-        for (offset, entry) in visible.iter().skip(first).take(rows as usize).enumerate() {
-            let y = inner.y + 2 + offset as u16;
-            let style = if first + offset == self.selected {
+        for (row, index) in &layout.rows {
+            let Some(entry) = visible.get(*index) else {
+                continue;
+            };
+            let chosen = *index == self.selected;
+            let style = if chosen {
                 self.chrome.selection
             } else {
                 Style::default()
             };
+            // Underlined rather than barred, so what the pointer is over
+            // never reads as what is chosen.
+            let label_style = if !chosen && self.hovered == Some(*index) {
+                button::hover(&self.chrome)
+            } else {
+                style
+            };
 
             write(
                 buf,
-                inner,
-                inner.x,
-                y,
-                &" ".repeat(inner.width as usize),
+                *row,
+                row.x,
+                row.y,
+                &" ".repeat(row.width as usize),
                 style,
             );
-            write(buf, inner, inner.x, y, SHUT_FOLDER, style);
+            write(buf, *row, row.x, row.y, SHUT_FOLDER, style);
 
             // A scan reports paths from all over the tree, so the label alone
             // would not say which "src" this is — and a path cut to fit keeps
             // its end, which is the part naming the project.
-            let room = inner.width.saturating_sub(4) as usize;
+            let room = row.width.saturating_sub(4) as usize;
             let label = if self.scanning {
                 tail(&short(&entry.path), room)
             } else {
                 entry.label.clone()
             };
-            write(buf, inner, inner.x + 2, y, &label, style);
+            write(buf, *row, row.x + 2, row.y, &label, label_style);
 
             if entry.repo {
-                let x = inner.x + 3 + u16::try_from(label.chars().count()).unwrap_or(0);
-                write(buf, inner, x, y, REPOSITORY, style);
+                let x = row.x + 3 + u16::try_from(label.chars().count()).unwrap_or(0);
+                write(buf, *row, x, row.y, REPOSITORY, style);
             }
         }
 
-        write(
+        // The keys sit on the last row, or the one above the buttons.
+        let keys_y = inner.y + inner.height - 1 - u16::from(!layout.buttons.is_empty());
+        write(buf, inner, inner.x, keys_y, KEYS, self.chrome.secondary);
+
+        button::render(
             buf,
-            inner,
-            inner.x,
-            inner.y + inner.height - 1,
-            KEYS,
-            self.chrome.secondary,
+            &self.buttons,
+            &layout.buttons,
+            &self.chrome,
+            self.pressed,
         );
     }
 }

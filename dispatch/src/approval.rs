@@ -9,6 +9,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
+use dispatch_tui::button::{self, Button, ButtonId, DialogLayout};
+
 /// One request, as the user needs to see it.
 pub struct Approval<'a> {
     /// Title of the pane that asked.
@@ -27,6 +29,10 @@ pub struct Approval<'a> {
     pub scroll: u16,
     /// The dialog colours.
     pub chrome: dispatch_tui::theme::Chrome,
+    /// What can be clicked along the foot, when the caller wants any.
+    pub buttons: Vec<Button>,
+    /// The button held down, drawn in the selection.
+    pub pressed: Option<ButtonId>,
 }
 
 impl<'a> Approval<'a> {
@@ -38,6 +44,39 @@ impl<'a> Approval<'a> {
     #[must_use]
     pub fn inner(area: Rect) -> Rect {
         Block::default().borders(Borders::ALL).inner(area)
+    }
+
+    /// Where the buttons fall in a box drawn at `area`: the last row inside
+    /// the border, and none at all when they do not all fit or would leave
+    /// the text no row.
+    #[must_use]
+    pub fn layout(&self, area: Rect) -> DialogLayout {
+        let inner = Self::inner(area);
+        let buttons = if inner.height >= 2 {
+            let row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+            button::lay_out(&self.buttons, row)
+        } else {
+            Vec::new()
+        };
+        DialogLayout {
+            rect: area,
+            buttons,
+            ..DialogLayout::default()
+        }
+    }
+
+    /// The rect the text is drawn into for a box at `area`: the inside of
+    /// the border, less the row the buttons take when there are any.
+    ///
+    /// What scrolling is clamped against, so a button row never hides a line
+    /// the clamp counted as visible.
+    #[must_use]
+    pub fn content_area(&self, area: Rect) -> Rect {
+        let mut inner = Self::inner(area);
+        if !self.layout(area).buttons.is_empty() {
+            inner.height -= 1;
+        }
+        inner
     }
 
     /// The lines this prompt renders, before wrapping: the harness/project/
@@ -123,10 +162,17 @@ impl Widget for Approval<'_> {
             .borders(Borders::ALL)
             .title(title(self.asking, area.width))
             .border_style(self.chrome.border);
-        let inner = block.inner(area);
         block.render(area, buf);
 
-        self.render_content(inner, buf);
+        let layout = self.layout(area);
+        self.render_content(self.content_area(area), buf);
+        button::render(
+            buf,
+            &self.buttons,
+            &layout.buttons,
+            &self.chrome,
+            self.pressed,
+        );
     }
 }
 
@@ -174,6 +220,8 @@ mod tests {
             waiting: 0,
             scroll: 0,
             chrome: dispatch_tui::theme::Chrome::default(),
+            buttons: Vec::new(),
+            pressed: None,
         }
     }
 
@@ -318,5 +366,92 @@ mod tests {
             format!("┌ {}… wants to delegate ┐", "m".repeat(41)),
             "one column more is cut, and the title still fills the box exactly"
         );
+    }
+
+    fn four_buttons() -> Vec<Button> {
+        [
+            (ButtonId::Approve, "Approve", true),
+            (ButtonId::Deny, "Deny", false),
+            (ButtonId::Always, "Always", false),
+            (ButtonId::Later, "Later", false),
+        ]
+        .into_iter()
+        .map(|(id, label, default)| Button { id, label, default })
+        .collect()
+    }
+
+    fn drawn_in(buf: &Buffer, rect: Rect) -> String {
+        (rect.x..rect.right())
+            .filter_map(|x| buf.cell((x, rect.y)))
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn buttons_take_the_last_row_inside_the_border_and_the_text_gives_way() {
+        let widget = Approval {
+            buttons: four_buttons(),
+            ..approval("echo delegated")
+        };
+        let area = Rect::new(2, 3, 60, 12);
+        let layout = widget.layout(area);
+        let content = widget.content_area(area);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 70, 20));
+        widget.render(area, &mut buf);
+
+        assert_eq!(layout.rect, area);
+        let labels: Vec<String> = layout.buttons.iter().map(|b| drawn_in(&buf, b.0)).collect();
+        assert_eq!(
+            labels,
+            ["[ Approve ]", "[ Deny ]", "[ Always ]", "[ Later ]"]
+        );
+        let foot = Approval::inner(area).bottom() - 1;
+        assert!(layout.buttons.iter().all(|(rect, _)| rect.y == foot));
+        assert_eq!(content.bottom(), foot);
+    }
+
+    #[test]
+    fn buttons_that_do_not_fit_are_dropped_and_the_text_keeps_its_rows() {
+        let widget = Approval {
+            buttons: four_buttons(),
+            ..approval("echo delegated")
+        };
+        let area = Rect::new(0, 0, 30, 12);
+        assert!(widget.layout(area).buttons.is_empty());
+        assert_eq!(widget.content_area(area), Approval::inner(area));
+
+        let tiny = Rect::new(0, 0, 60, 3);
+        assert!(widget.layout(tiny).buttons.is_empty());
+        assert_eq!(widget.content_area(tiny), Approval::inner(tiny));
+    }
+
+    #[test]
+    fn without_buttons_the_box_is_as_it_was() {
+        let widget = approval("echo delegated");
+        let area = Rect::new(0, 0, 60, 12);
+        assert!(widget.layout(area).buttons.is_empty());
+        assert_eq!(widget.content_area(area), Approval::inner(area));
+    }
+
+    #[test]
+    fn it_draws_at_any_size_without_panicking_with_and_without_buttons() {
+        for buttons in [Vec::new(), four_buttons()] {
+            let widget = Approval {
+                buttons,
+                ..approval("echo delegated")
+            };
+            for width in 1..=30 {
+                for height in 1..=10 {
+                    let area = Rect::new(0, 0, width, height);
+                    let mut buf = Buffer::empty(area);
+                    Approval {
+                        buttons: widget.buttons.clone(),
+                        ..approval("echo delegated")
+                    }
+                    .render(area, &mut buf);
+                    let _ = widget.layout(area);
+                }
+            }
+        }
     }
 }

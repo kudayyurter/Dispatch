@@ -19,9 +19,7 @@ use crate::tabs::TabHit;
 /// Two presses on one target this close together are a double-click.
 pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-/// Stand-in until Task 8 moves the dialog buttons into `dispatch-tui`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ButtonId {}
+pub use dispatch_tui::button::ButtonId;
 
 /// A row or button of the open dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

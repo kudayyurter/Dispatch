@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
+use crate::button::{self, Button, ButtonId, DialogLayout};
 use crate::picker::{centred, write};
 use crate::theme::Chrome;
 
@@ -30,6 +31,10 @@ pub struct Prompt {
     note: Option<Note>,
     /// The dialog colours, set by whoever draws the overlay.
     chrome: Chrome,
+    /// What can be clicked under the hint, when the caller wants any.
+    buttons: Vec<Button>,
+    /// The button held down, drawn in the selection.
+    pressed: Option<ButtonId>,
 }
 
 /// The narrowest a prompt is drawn, so a short title still leaves room to
@@ -46,7 +51,21 @@ impl Prompt {
             input: String::new(),
             note: None,
             chrome: Chrome::default(),
+            buttons: Vec::new(),
+            pressed: None,
         }
+    }
+
+    /// The same prompt, with `buttons` under its hint when they fit.
+    #[must_use]
+    pub fn with_buttons(mut self, buttons: Vec<Button>) -> Self {
+        self.buttons = buttons;
+        self
+    }
+
+    /// Marks the button held down, or none.
+    pub fn set_pressed(&mut self, pressed: Option<ButtonId>) {
+        self.pressed = pressed;
     }
 
     /// Draws in `chrome`.
@@ -120,6 +139,12 @@ impl Prompt {
     /// reason cut at the box's edge loses the part that says why.
     #[must_use]
     pub fn desired_width(&self) -> u16 {
+        self.width_for(true)
+    }
+
+    /// The width it needs, counting its buttons or not: a box that drops
+    /// them goes back to the width it had without.
+    fn width_for(&self, buttons: bool) -> u16 {
         let note = self.note.as_ref().map_or(0, |note| match note {
             Note::Busy(text) | Note::Error(text) => text.chars().count(),
         });
@@ -128,6 +153,11 @@ impl Prompt {
             self.hint.chars().count(),
             self.input.chars().count(),
             note,
+            if buttons {
+                usize::from(button::total_width(&self.buttons))
+            } else {
+                0
+            },
         ]
         .into_iter()
         .max()
@@ -136,36 +166,73 @@ impl Prompt {
     }
 }
 
-impl Widget for &Prompt {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 8 || area.height < 5 {
-            return;
-        }
-
-        let note = self.note.as_ref().map(|note| match note {
+impl Prompt {
+    /// The note as it is drawn in a box `width` wide, with its colour: one
+    /// line, or two when it is wider than the box.
+    fn note_lines(&self, width: u16) -> Option<((&str, Option<&str>), Color)> {
+        let (text, colour) = match self.note.as_ref()? {
             Note::Busy(text) => (text.as_str(), Color::Yellow),
             Note::Error(text) => (text.as_str(), Color::Red),
-        });
-
-        let width = self
-            .desired_width()
-            .clamp(MIN_WIDTH.min(area.width), area.width);
-
-        // A note still wider than the box, because the area is, takes a
-        // second line rather than being cut.
-        let lines = note.map(|(text, colour)| (wrap(text, usize::from(width - 2)), colour));
-        let height = if lines
-            .as_ref()
-            .is_some_and(|(wrapped, _)| wrapped.1.is_some())
-        {
-            6
-        } else {
-            5
         };
+        Some((wrap(text, usize::from(width.saturating_sub(2))), colour))
+    }
+
+    /// Where the box and what can be clicked in it fall inside `area`.
+    ///
+    /// The one place this is worked out: drawing follows it, so what is
+    /// clicked is what is seen. Empty when `area` is too small to draw in.
+    #[must_use]
+    pub fn layout(&self, area: Rect) -> DialogLayout {
+        if area.width < 8 || area.height < 5 {
+            return DialogLayout::default();
+        }
 
         // Border, input, hint, note — and the note's second line when it
-        // needs one, for as many rows as the area has.
-        let rect = centred(area, width, height);
+        // needs one, for as many rows as the area has. A note still wider
+        // than the box, because the area is, takes a second line rather than
+        // being cut.
+        let shape = |buttons: bool| {
+            let width = self
+                .width_for(buttons)
+                .clamp(MIN_WIDTH.min(area.width), area.width);
+            let wraps = self
+                .note_lines(width)
+                .is_some_and(|((_, second), _)| second.is_some());
+            (width, if wraps { 6 } else { 5 })
+        };
+
+        // The buttons are one row more, kept only when the area has it and
+        // they all fit; otherwise the box keeps its old shape.
+        let (width, height) = shape(true);
+        let rect = centred(area, width, height + 1);
+        if rect.height == height + 1 {
+            let inner = Block::default().borders(Borders::ALL).inner(rect);
+            let row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+            let buttons = button::lay_out(&self.buttons, row);
+            if !buttons.is_empty() {
+                return DialogLayout {
+                    rect,
+                    buttons,
+                    ..DialogLayout::default()
+                };
+            }
+        }
+
+        let (width, height) = shape(false);
+        DialogLayout {
+            rect: centred(area, width, height),
+            ..DialogLayout::default()
+        }
+    }
+}
+
+impl Widget for &Prompt {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let layout = self.layout(area);
+        let rect = layout.rect;
+        if rect.is_empty() {
+            return;
+        }
 
         // Floats over the grid, so whatever it covers is erased rather than
         // left showing through.
@@ -200,13 +267,21 @@ impl Widget for &Prompt {
             self.chrome.secondary,
         );
 
-        if let Some(((first, second), colour)) = lines {
+        if let Some(((first, second), colour)) = self.note_lines(rect.width) {
             let style = Style::default().fg(colour);
             write(buf, inner, inner.x, inner.y + 2, first, style);
             if let Some(second) = second {
                 write(buf, inner, inner.x, inner.y + 3, second, style);
             }
         }
+
+        button::render(
+            buf,
+            &self.buttons,
+            &layout.buttons,
+            &self.chrome,
+            self.pressed,
+        );
     }
 }
 

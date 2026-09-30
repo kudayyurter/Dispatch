@@ -553,3 +553,163 @@ fn the_settings_form_draws_only_in_its_chrome() {
 
     crate::theme::assert_no_fixed_colours(&buf);
 }
+
+fn buttons() -> Vec<crate::button::Button> {
+    use crate::button::{Button, ButtonId};
+    vec![
+        Button {
+            id: ButtonId::Cancel,
+            label: "Cancel",
+            default: false,
+        },
+        Button {
+            id: ButtonId::SaveDefault,
+            label: "Save as default",
+            default: false,
+        },
+        Button {
+            id: ButtonId::OpenPane,
+            label: "Open pane",
+            default: true,
+        },
+    ]
+}
+
+fn buffer(form: &SettingsForm, width: u16, height: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    form.render(area, &mut buf);
+    buf
+}
+
+fn drawn_in(buf: &Buffer, rect: Rect) -> String {
+    (rect.x..rect.right())
+        .filter_map(|x| buf.cell((x, rect.y)))
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+#[test]
+fn buttons_are_laid_out_and_drawn_below_the_rows() {
+    let form = form().with_buttons(buttons());
+    let layout = form.layout(Rect::new(0, 0, 100, 20));
+    let buf = buffer(&form, 100, 20);
+
+    assert_eq!(layout.buttons.len(), 3);
+    let foot = layout.buttons[0].0.y;
+    assert!(layout.rows.iter().all(|(row, _)| row.y < foot));
+    assert_eq!(layout.rows.len(), 3);
+    let labels: Vec<String> = layout.buttons.iter().map(|b| drawn_in(&buf, b.0)).collect();
+    assert_eq!(
+        labels,
+        ["[ Cancel ]", "[ Save as default ]", "[ Open pane ]"]
+    );
+}
+
+#[test]
+fn buttons_that_do_not_fit_are_dropped_and_the_box_keeps_its_old_shape() {
+    let bare = form();
+    let with = form().with_buttons(buttons());
+    // Room for the rows and the border and no more.
+    let area = Rect::new(0, 0, 100, 5);
+    assert!(with.layout(area).buttons.is_empty());
+    assert_eq!(with.layout(area).rect, bare.layout(area).rect);
+    assert_eq!(with.layout(area).rows, bare.layout(area).rows);
+}
+
+#[test]
+fn rows_are_where_each_row_is_drawn() {
+    let form = form().with_buttons(buttons());
+    let layout = form.layout(Rect::new(0, 0, 100, 20));
+    let buf = buffer(&form, 100, 20);
+
+    for ((rect, index), label) in layout.rows.iter().zip(["Model", "Effort", "Skip prompts"]) {
+        assert!(drawn_in(&buf, *rect).contains(label), "{label} at {index}");
+    }
+}
+
+#[test]
+fn steps_sit_on_the_arrows_either_side_of_each_value() {
+    let form = form();
+    let layout = form.layout(Rect::new(0, 0, 100, 20));
+    let buf = buffer(&form, 100, 20);
+
+    assert_eq!(layout.steps.len(), 6);
+    for (rect, index, forward) in &layout.steps {
+        assert_eq!(rect.width, 2);
+        let cells = drawn_in(&buf, *rect);
+        let arrow = if *forward { "▸" } else { "◂" };
+        assert!(cells.contains(arrow), "row {index} {forward}: {cells:?}");
+    }
+}
+
+#[test]
+fn clicking_a_row_selects_it_and_its_arrows_step_it() {
+    let mut form = form();
+    form.select_row(1);
+    assert_eq!(form.selected_index(), 1);
+
+    assert_eq!(form.step_row(1, true), FormAction::None);
+    assert_eq!(value(&form, "effort"), "low");
+    form.step_row(1, false);
+    assert_eq!(value(&form, "effort"), "");
+
+    // Stepping another row moves to it, as a click on its arrow does.
+    form.step_row(2, true);
+    assert_eq!(form.selected_index(), 2);
+    assert_eq!(value(&form, "bypass"), "false");
+
+    form.select_row(99);
+    assert_eq!(form.selected_index(), 2);
+}
+
+#[test]
+fn a_row_with_nothing_to_choose_is_not_selected_or_stepped() {
+    let mut form = limited_with(&[("model", "plain")]);
+    let before = form.values();
+    let layout = form.layout(Rect::new(0, 0, 100, 20));
+    let unavailable: Vec<usize> = layout
+        .rows
+        .iter()
+        .map(|r| r.1)
+        .filter(|i| layout.steps.iter().all(|s| s.1 != *i))
+        .collect();
+
+    assert!(
+        !unavailable.is_empty(),
+        "the effort row has nothing to choose"
+    );
+    for index in unavailable {
+        form.step_row(index, true);
+        assert_ne!(form.selected_index(), index);
+    }
+    assert_eq!(form.values(), before);
+}
+
+#[test]
+fn hover_underlines_a_row_and_leaves_the_chosen_one_alone() {
+    let mut form = form();
+    form.set_hovered(Some(1));
+    let layout = form.layout(Rect::new(0, 0, 100, 20));
+    let buf = buffer(&form, 100, 20);
+    let underlined = |rect: Rect| {
+        buf.cell((rect.x + 1, rect.y))
+            .unwrap()
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED)
+    };
+
+    assert!(underlined(layout.rows[1].0));
+    assert!(!underlined(layout.rows[0].0));
+}
+
+#[test]
+fn a_form_with_buttons_draws_at_any_size_without_panicking() {
+    let form = form().with_buttons(buttons());
+    for width in 1..=30 {
+        for height in 1..=10 {
+            render(&form, width, height);
+            let _ = form.layout(Rect::new(0, 0, width, height));
+        }
+    }
+}

@@ -4248,6 +4248,8 @@ impl App {
             waiting: self.pending.len().saturating_sub(1),
             scroll,
             chrome: self.theme.chrome(),
+            buttons: Vec::new(),
+            pressed: None,
         })
     }
 
@@ -5439,7 +5441,7 @@ impl App {
         // not from an offset that keystroke-time clamping never saw. Measured
         // with its own widget, rebuilt below for the render itself, because
         // both borrow `self` and the persist in between needs it back.
-        let inner = Approval::inner(rect);
+        let inner = measured.content_area(rect);
         let max = measured
             .total_rows(inner.width)
             .saturating_sub(inner.height);

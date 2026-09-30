@@ -144,3 +144,62 @@ fn the_prompt_draws_only_in_its_chrome() {
         "an error keeps its red: it means something"
     );
 }
+
+fn ok_cancel() -> Vec<crate::button::Button> {
+    use crate::button::{Button, ButtonId};
+    vec![
+        Button {
+            id: ButtonId::Cancel,
+            label: "Cancel",
+            default: false,
+        },
+        Button {
+            id: ButtonId::Ok,
+            label: "OK",
+            default: true,
+        },
+    ]
+}
+
+#[test]
+fn buttons_are_drawn_under_the_hint_in_a_box_one_row_taller() {
+    let bare = Prompt::new("Rename tab", "Enter ok");
+    let prompt = Prompt::new("Rename tab", "Enter ok").with_buttons(ok_cancel());
+    let area = Rect::new(0, 0, 60, 12);
+    let layout = prompt.layout(area);
+    let mut buf = Buffer::empty(area);
+    (&prompt).render(area, &mut buf);
+
+    assert_eq!(layout.rect.height, bare.layout(area).rect.height + 1);
+    assert_eq!(layout.buttons.len(), 2);
+    for (rect, _) in &layout.buttons {
+        let drawn: String = (rect.x..rect.right())
+            .filter_map(|x| buf.cell((x, rect.y)))
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(drawn == "[ OK ]" || drawn == "[ Cancel ]", "{drawn}");
+        assert!(rect.y > layout.rect.y + 2, "under the hint");
+        assert!(rect.bottom() < layout.rect.bottom(), "inside the border");
+    }
+}
+
+#[test]
+fn buttons_that_do_not_fit_leave_the_box_as_it_was() {
+    let bare = Prompt::new("Rename tab", "Enter ok");
+    let prompt = Prompt::new("Rename tab", "Enter ok").with_buttons(ok_cancel());
+    // Five rows is the box as it was: no room for a sixth.
+    let area = Rect::new(0, 0, 60, 5);
+    assert!(prompt.layout(area).buttons.is_empty());
+    assert_eq!(prompt.layout(area).rect, bare.layout(area).rect);
+}
+
+#[test]
+fn a_prompt_with_buttons_draws_at_any_size_without_panicking() {
+    let mut prompt = Prompt::new("Rename tab", "Enter ok").with_buttons(ok_cancel());
+    prompt.set_note(Some(Note::Error("that name is taken already".to_string())));
+    for width in 1..=30 {
+        for height in 1..=10 {
+            render(&prompt, width, height);
+        }
+    }
+}

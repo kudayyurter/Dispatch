@@ -326,3 +326,167 @@ fn a_filter_is_drawn_above_the_rows() {
     let row = lines.iter().position(|l| l.contains("agy")).expect("a row");
     assert!(filter < row);
 }
+
+fn open_cancel() -> Vec<crate::button::Button> {
+    use crate::button::{Button, ButtonId};
+    vec![
+        Button {
+            id: ButtonId::Cancel,
+            label: "Cancel",
+            default: false,
+        },
+        Button {
+            id: ButtonId::Open,
+            label: "Open",
+            default: true,
+        },
+    ]
+}
+
+/// What is drawn inside `rect`.
+fn drawn_in(buf: &Buffer, rect: Rect) -> String {
+    (rect.x..rect.right())
+        .filter_map(|x| buf.cell((x, rect.y)))
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+#[test]
+fn buttons_are_laid_out_and_drawn_at_a_comfortable_size() {
+    let picker = picker().with_buttons(open_cancel());
+    let area = Rect::new(0, 0, 60, 12);
+    let layout = picker.layout(area);
+    let mut buf = Buffer::empty(area);
+    (&picker).render(area, &mut buf);
+
+    assert_eq!(layout.buttons.len(), 2);
+    for (rect, id) in &layout.buttons {
+        let label = if *id == crate::button::ButtonId::Open {
+            "[ Open ]"
+        } else {
+            "[ Cancel ]"
+        };
+        assert_eq!(drawn_in(&buf, *rect), label);
+        assert!(rect.bottom() < layout.rect.bottom(), "inside the border");
+    }
+}
+
+#[test]
+fn buttons_never_overlap_the_list() {
+    let picker = picker().with_buttons(open_cancel());
+    let layout = picker.layout(Rect::new(0, 0, 60, 12));
+    let foot = layout.buttons[0].0.y;
+
+    assert_eq!(layout.rows.len(), 3);
+    assert!(layout.rows.iter().all(|(row, _)| row.y < foot));
+}
+
+#[test]
+fn buttons_that_do_not_fit_are_dropped_and_the_box_keeps_its_old_shape() {
+    let bare = picker();
+    let with = picker().with_buttons(open_cancel());
+    // Too short for the list and a row of buttons.
+    let area = Rect::new(0, 0, 60, 3);
+    assert!(with.layout(area).buttons.is_empty());
+    assert_eq!(with.layout(area).rect, bare.layout(area).rect);
+}
+
+#[test]
+fn a_picker_without_buttons_keeps_the_shape_it_had() {
+    let area = Rect::new(0, 0, 60, 12);
+    let bare = picker().layout(area);
+    let with = picker().with_buttons(open_cancel()).layout(area);
+
+    assert!(bare.buttons.is_empty());
+    assert_eq!(with.rect.height, bare.rect.height + 1);
+}
+
+#[test]
+fn rows_are_where_each_shown_row_is_drawn() {
+    let picker = picker().with_buttons(open_cancel());
+    let area = Rect::new(0, 0, 60, 12);
+    let layout = picker.layout(area);
+    let mut buf = Buffer::empty(area);
+    (&picker).render(area, &mut buf);
+
+    for ((rect, index), label) in layout.rows.iter().zip(["Claude Code", "Codex", "agy"]) {
+        assert_eq!(rect.height, 1);
+        assert_eq!(
+            *index,
+            layout.rows.iter().position(|r| r.0 == *rect).unwrap()
+        );
+        assert!(drawn_in(&buf, *rect).contains(label), "{label}");
+    }
+}
+
+#[test]
+fn rows_index_the_filtered_list() {
+    let mut picker = picker().with_filter().with_buttons(open_cancel());
+    picker.push_filter('x');
+    let layout = picker.layout(Rect::new(0, 0, 60, 12));
+    assert_eq!(layout.rows.len(), 1, "only Codex has an x");
+    assert_eq!(layout.rows[0].1, 0);
+}
+
+#[test]
+fn selecting_by_shown_index_moves_the_highlight_and_ignores_the_out_of_range() {
+    let mut picker = picker();
+    picker.select_shown(2);
+    assert_eq!(picker.selected_index(), 2);
+    picker.select_shown(9);
+    assert_eq!(picker.selected_index(), 2);
+}
+
+#[test]
+fn hover_is_underlined_and_not_a_bar_and_never_on_the_chosen_row() {
+    let mut picker = picker();
+    picker.set_hovered(Some(1));
+    let area = Rect::new(0, 0, 40, 8);
+    let layout = picker.layout(area);
+    let mut buf = Buffer::empty(area);
+    (&picker).render(area, &mut buf);
+
+    let (hovered, _) = layout.rows[1];
+    let cell = buf.cell((hovered.x + 1, hovered.y)).unwrap();
+    assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
+    assert_ne!(cell.bg, selection_bg(), "not the selection's bar");
+
+    picker.set_hovered(Some(0));
+    let mut buf = Buffer::empty(area);
+    (&picker).render(area, &mut buf);
+    let (chosen, _) = layout.rows[0];
+    let cell = buf.cell((chosen.x + 1, chosen.y)).unwrap();
+    assert!(!cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
+}
+
+#[test]
+fn a_pressed_button_is_drawn_in_the_selection() {
+    let mut picker = picker().with_buttons(open_cancel());
+    picker.set_pressed(Some(crate::button::ButtonId::Open));
+    let area = Rect::new(0, 0, 60, 12);
+    let layout = picker.layout(area);
+    let mut buf = Buffer::empty(area);
+    (&picker).render(area, &mut buf);
+
+    let open = layout
+        .buttons
+        .iter()
+        .find(|b| b.1 == crate::button::ButtonId::Open)
+        .unwrap()
+        .0;
+    assert_eq!(buf.cell((open.x + 2, open.y)).unwrap().bg, selection_bg());
+}
+
+#[test]
+fn a_picker_with_buttons_draws_at_any_size_without_panicking() {
+    let picker = picker()
+        .with_hint("↑↓ choose  Enter open")
+        .with_filter()
+        .with_buttons(open_cancel());
+    for width in 1..=30 {
+        for height in 1..=10 {
+            render(&picker, width, height);
+            let _ = picker.layout(Rect::new(0, 0, width, height));
+        }
+    }
+}

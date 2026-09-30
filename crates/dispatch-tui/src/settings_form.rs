@@ -15,6 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
+use crate::button::{self, Button, ButtonId, DialogLayout};
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::picker::{centred, write};
 use crate::theme::Chrome;
@@ -219,6 +220,12 @@ pub struct SettingsForm {
     editing: Option<Edit>,
     /// The dialog colours, set by whoever draws the overlay.
     chrome: Chrome,
+    /// What can be clicked along the foot, when the caller wants any.
+    buttons: Vec<Button>,
+    /// The button held down, drawn in the selection.
+    pressed: Option<ButtonId>,
+    /// The row the pointer is over.
+    hovered: Option<usize>,
 }
 
 impl SettingsForm {
@@ -244,6 +251,9 @@ impl SettingsForm {
             selected: 0,
             editing: None,
             chrome: Chrome::default(),
+            buttons: Vec::new(),
+            pressed: None,
+            hovered: None,
         };
         form.refit();
         if form
@@ -259,6 +269,48 @@ impl SettingsForm {
     /// Draws in `chrome`.
     pub fn set_chrome(&mut self, chrome: Chrome) {
         self.chrome = chrome;
+    }
+
+    /// The same popup, with `buttons` along its foot when they fit.
+    #[must_use]
+    pub fn with_buttons(mut self, buttons: Vec<Button>) -> Self {
+        self.buttons = buttons;
+        self
+    }
+
+    /// Marks the button held down, or none.
+    pub fn set_pressed(&mut self, pressed: Option<ButtonId>) {
+        self.pressed = pressed;
+    }
+
+    /// Marks the row the pointer is over.
+    pub fn set_hovered(&mut self, hovered: Option<usize>) {
+        self.hovered = hovered;
+    }
+
+    /// Moves to row `index`, if it has something to choose: what a click on
+    /// a row does. A value being typed on another row is kept, as moving
+    /// with the arrows keeps it.
+    pub fn select_row(&mut self, index: usize) {
+        let available = self
+            .rows
+            .get(index)
+            .is_some_and(|row| row.allowed != Allowed::Unavailable);
+        if available && index != self.selected {
+            self.confirm();
+            self.selected = index;
+        }
+    }
+
+    /// Steps row `index` to its next or previous value: what a click on its
+    /// `◂` or `▸` does, through the code `←` and `→` run. A row with nothing
+    /// to choose is left alone.
+    pub fn step_row(&mut self, index: usize, forward: bool) -> FormAction {
+        self.select_row(index);
+        if self.selected == index {
+            self.step_value(forward);
+        }
+        FormAction::None
     }
 
     /// Every row's value, by key: what opening or saving uses.
@@ -298,8 +350,8 @@ impl SettingsForm {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.previous_row(),
             KeyCode::Down | KeyCode::Char('j') => self.next_row(),
-            KeyCode::Left | KeyCode::Char('h') => self.step(false),
-            KeyCode::Right | KeyCode::Char('l') => self.step(true),
+            KeyCode::Left | KeyCode::Char('h') => self.step_value(false),
+            KeyCode::Right | KeyCode::Char('l') => self.step_value(true),
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Enter => return FormAction::Open,
             KeyCode::Char('s') => return FormAction::Save,
@@ -341,8 +393,8 @@ impl SettingsForm {
             }
             // The text is dropped: the arrows never trap the user on the
             // typed slot.
-            KeyCode::Left => self.step(false),
-            KeyCode::Right => self.step(true),
+            KeyCode::Left => self.step_value(false),
+            KeyCode::Right => self.step_value(true),
             KeyCode::Backspace => {
                 if let Some(edit) = &mut self.editing {
                     edit.text.pop();
@@ -428,7 +480,7 @@ impl SettingsForm {
     ///
     /// Stepping onto the typed slot starts typing there; stepping while
     /// typing drops the text and moves to the typed slot's neighbour.
-    fn step(&mut self, forward: bool) {
+    fn step_value(&mut self, forward: bool) {
         let typing = self.editing.take().is_some();
         let Some(row) = self.rows.get_mut(self.selected) else {
             return;
@@ -520,6 +572,12 @@ impl SettingsForm {
     /// The width it needs to be drawn whole.
     #[must_use]
     pub fn desired_width(&self) -> u16 {
+        self.width_for(true)
+    }
+
+    /// The width it needs, counting its buttons or not: a box that drops
+    /// them goes back to the width it had without.
+    fn width_for(&self, buttons: bool) -> u16 {
         let label_width = self
             .rows
             .iter()
@@ -544,14 +602,110 @@ impl SettingsForm {
         let row_width = 1 + label_width + 2 + 2 + value_width + 2 + 1;
         let widest = row_width
             .max(self.title.chars().count() + 4)
-            .max(hint.chars().count() + 4);
+            .max(hint.chars().count() + 4)
+            .max(if buttons {
+                usize::from(button::total_width(&self.buttons))
+            } else {
+                0
+            });
         u16::try_from(widest + 2).unwrap_or(u16::MAX)
+    }
+}
+
+impl SettingsForm {
+    /// What a row shows as its value, with a value being typed and its
+    /// cursor where it is typed.
+    fn value_text(&self, index: usize, row: &Row) -> String {
+        match (&self.editing, index == self.selected, &row.shape) {
+            (Some(edit), true, Shape::Text) => format!("{}▏", edit.text),
+            (Some(edit), true, _) => format!("Custom: {}▏", edit.text),
+            _ => row.shown(),
+        }
+    }
+
+    /// Where the box and what can be clicked in it fall inside `area`.
+    ///
+    /// The one place this is worked out: drawing follows it, so what is
+    /// clicked is what is seen. Empty when `area` is too small to draw in.
+    #[must_use]
+    pub fn layout(&self, area: Rect) -> DialogLayout {
+        if area.width < 8 || area.height < 3 {
+            return DialogLayout::default();
+        }
+
+        let label_width = self
+            .rows
+            .iter()
+            .map(|row| row.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = |buttons| self.width_for(buttons).min(area.width);
+        let height = |extra: usize| {
+            u16::try_from(self.rows.len() + 2 + extra)
+                .unwrap_or(u16::MAX)
+                .min(area.height)
+        };
+
+        // The buttons are one row more than the rows need, kept only when
+        // the area has it and they all fit; otherwise the box keeps its old
+        // shape and its hint.
+        let frame = Block::default().borders(Borders::ALL);
+        let grown = centred(area, width(true), height(1));
+        let foot = frame.inner(grown);
+        let (rect, buttons) = if usize::from(foot.height) > self.rows.len() {
+            let row = Rect::new(foot.x, foot.y + foot.height - 1, foot.width, 1);
+            let placed = button::lay_out(&self.buttons, row);
+            if placed.is_empty() {
+                (centred(area, width(false), height(0)), placed)
+            } else {
+                (grown, placed)
+            }
+        } else {
+            (centred(area, width(false), height(0)), Vec::new())
+        };
+        let inner = frame.inner(rect);
+
+        let value_x = inner
+            .x
+            .saturating_add(1)
+            .saturating_add(u16::try_from(label_width + 2).unwrap_or(u16::MAX));
+
+        let mut rows = Vec::new();
+        let mut steps = Vec::new();
+        for (index, row) in self.rows.iter().enumerate().take(usize::from(inner.height)) {
+            let y = inner.y + u16::try_from(index).unwrap_or(0);
+            rows.push((Rect::new(inner.x, y, inner.width, 1), index));
+            if row.allowed == Allowed::Unavailable {
+                continue;
+            }
+
+            // `◂ ` before the value and ` ▸` after it, each two cells, cut
+            // to the box as drawing cuts them.
+            let after = value_x.saturating_add(2).saturating_add(
+                u16::try_from(self.value_text(index, row).chars().count()).unwrap_or(u16::MAX),
+            );
+            for (x, forward) in [(value_x, false), (after, true)] {
+                let cell = Rect::new(x, y, 2, 1).intersection(inner);
+                if !cell.is_empty() {
+                    steps.push((cell, index, forward));
+                }
+            }
+        }
+
+        DialogLayout {
+            rect,
+            rows,
+            steps,
+            buttons,
+        }
     }
 }
 
 impl Widget for &SettingsForm {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 8 || area.height < 3 {
+        let layout = self.layout(area);
+        let rect = layout.rect;
+        if rect.is_empty() {
             return;
         }
 
@@ -566,11 +720,6 @@ impl Widget for &SettingsForm {
         } else {
             HINT
         };
-        let width = self.desired_width().min(area.width);
-        let height = u16::try_from(self.rows.len() + 2)
-            .unwrap_or(u16::MAX)
-            .min(area.height);
-        let rect = centred(area, width, height);
 
         // It floats over the grid, so whatever it covers is erased rather
         // than left showing through.
@@ -589,13 +738,21 @@ impl Widget for &SettingsForm {
             .saturating_add(1)
             .saturating_add(u16::try_from(label_width + 2).unwrap_or(u16::MAX));
 
-        for (index, row) in self.rows.iter().enumerate().take(usize::from(inner.height)) {
-            let y = inner.y + u16::try_from(index).unwrap_or(0);
+        for (line, index) in &layout.rows {
+            let (y, index) = (line.y, *index);
+            let row = &self.rows[index];
             let chosen = index == self.selected;
             let base = if chosen {
                 self.chrome.selection
             } else {
                 Style::default()
+            };
+            // Underlined rather than barred, so what the pointer is over
+            // never reads as what is chosen.
+            let label = if !chosen && self.hovered == Some(index) {
+                button::hover(&self.chrome)
+            } else {
+                base
             };
 
             // The whole row, so the highlight is a bar rather than just
@@ -615,18 +772,22 @@ impl Widget for &SettingsForm {
                 write(buf, inner, value_x + 2, y, NOT_AVAILABLE, faded);
                 continue;
             }
-            write(buf, inner, inner.x + 1, y, &row.label, base);
+            write(buf, inner, inner.x + 1, y, &row.label, label);
 
-            let shown = match (&self.editing, chosen, &row.shape) {
-                (Some(edit), true, Shape::Text) => format!("{}▏", edit.text),
-                (Some(edit), true, _) => format!("Custom: {}▏", edit.text),
-                _ => row.shown(),
-            };
+            let shown = self.value_text(index, row);
             let arrows = base.patch(self.chrome.secondary);
             let x = write(buf, inner, value_x, y, "◂ ", arrows);
             let x = write(buf, inner, x, y, &shown, base);
             write(buf, inner, x, y, " ▸", arrows);
         }
+
+        button::render(
+            buf,
+            &self.buttons,
+            &layout.buttons,
+            &self.chrome,
+            self.pressed,
+        );
     }
 }
 
