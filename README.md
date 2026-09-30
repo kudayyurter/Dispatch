@@ -59,7 +59,7 @@ Open the directory you are in as a project:
 Every other key goes to the focused pane. All modes, tabs, the sidebar's glyphs and key rebinding are in [docs/usage.md](docs/usage.md).
 
 > [!WARNING]
-> Every agent Dispatch ships **starts without its permission prompts** (Codex also without its sandbox), so it can work without stopping to ask. Turn them back on per agent in the new-pane picker: `e`, change **Permissions**, then `s` to save. Anything that can reach the daemon's socket can do what a client can; read [docs/security-model.md](docs/security-model.md) before running agents you don't trust.
+> Every agent Dispatch ships **starts without its permission prompts** (Codex also without its sandbox), so it can work without stopping to ask. Turn them back on per agent in the new-pane picker: `e`, change Claude's **Permissions** or turn **Skip prompts** (Codex, agy) or **Auto-approve** (opencode) off, then `s` to save. Anything that can reach the daemon's socket can do what a client can; read [docs/security-model.md](docs/security-model.md) before running agents you don't trust.
 
 ## Configuration
 
