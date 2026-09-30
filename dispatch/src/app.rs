@@ -2825,6 +2825,9 @@ impl App {
         // An overlay takes the keyboard while it is open, so arrow keys choose
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
+            // The overlay eats whatever would have ended a drag, so none is
+            // still live once it closes.
+            self.dragging_sidebar = false;
             return self.handle_overlay(event, area);
         }
 
@@ -2960,6 +2963,17 @@ impl App {
             } else {
                 offset.saturating_add(1)
             };
+            return Ok(());
+        }
+
+        // The drawer hides the panes beneath it, so a pointer event on its
+        // blank space or border is nobody's: it must not reach them.
+        if self.drawer_open
+            && let Event::Mouse(mouse) = event
+            && self
+                .sidebar_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
             return Ok(());
         }
 
@@ -13194,6 +13208,88 @@ args = ["--effort", "{value}"]
             "the drawer never touched the docked state"
         );
         assert_eq!(app.frames[0].1.x, sidebar::WIDTH);
+    }
+
+    #[test]
+    fn blank_drawer_space_does_not_reach_the_panes_beneath() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut narrow);
+        for pane in &panes {
+            print(&mut app, &daemon, *pane, b"\x1b[?1000h");
+        }
+        app.focus_pane(panes[1]);
+        press_alt(&mut app, 's');
+        drawn(&mut app, &mut narrow);
+        let _ = sent.try_iter().count();
+
+        let column = app.sidebar_area.x + 2;
+        let row = app.sidebar_area.y + app.sidebar_area.height - 2;
+        let mouse = |kind| {
+            Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        use crossterm::event::MouseButton;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            app.handle(&mouse(kind), Size::new(60, 24))
+                .expect("handled");
+        }
+
+        assert_eq!(app.state.focused_pane(), Some(panes[1]), "focus unmoved");
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "nothing reached a hidden pane"
+        );
+        assert!(app.drawer_open, "a click on the drawer leaves it open");
+    }
+
+    #[test]
+    fn a_drag_cut_off_by_an_overlay_does_not_go_on_resizing() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        let mouse = |kind, column| {
+            Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        use crossterm::event::MouseButton;
+        let size = Size::new(220, 30);
+        app.handle(&mouse(MouseEventKind::Down(MouseButton::Left), edge), size)
+            .expect("handled");
+        app.open_attention_picker();
+        app.overlay = Some(Overlay::Harness(Picker::new(
+            "New pane",
+            vec![Item::new("x", "x")],
+        )));
+        app.handle(&mouse(MouseEventKind::Up(MouseButton::Left), edge), size)
+            .expect("handled");
+        app.overlay = None;
+        app.handle(
+            &mouse(MouseEventKind::Drag(MouseButton::Left), edge + 9),
+            size,
+        )
+        .expect("handled");
+
+        assert_eq!(app.sidebar_width, sidebar::WIDTH, "no drag was live");
     }
 
     #[test]
