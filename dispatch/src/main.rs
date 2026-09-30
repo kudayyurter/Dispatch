@@ -7,6 +7,7 @@ mod backend;
 mod delegate;
 mod frame_stats;
 mod machine;
+mod pointer;
 mod tabs;
 mod terminal;
 
