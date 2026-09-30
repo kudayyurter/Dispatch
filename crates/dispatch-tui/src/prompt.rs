@@ -113,6 +113,29 @@ impl Prompt {
     }
 }
 
+impl Prompt {
+    /// The width it needs to be drawn whole.
+    ///
+    /// The note counts: it is usually the reason something was refused, and a
+    /// reason cut at the box's edge loses the part that says why.
+    #[must_use]
+    pub fn desired_width(&self) -> u16 {
+        let note = self.note.as_ref().map_or(0, |note| match note {
+            Note::Busy(text) | Note::Error(text) => text.chars().count(),
+        });
+        let widest = [
+            self.title.chars().count(),
+            self.hint.chars().count(),
+            self.input.chars().count(),
+            note,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        u16::try_from(widest + 6).unwrap_or(u16::MAX).max(MIN_WIDTH)
+    }
+}
+
 impl Widget for &Prompt {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 8 || area.height < 5 {
@@ -124,19 +147,8 @@ impl Widget for &Prompt {
             Note::Error(text) => (text.as_str(), Color::Red),
         });
 
-        // The note counts: it is usually the reason something was refused,
-        // and a reason cut at the box's edge loses the part that says why.
-        let widest = [
-            self.title.chars().count(),
-            self.hint.chars().count(),
-            self.input.chars().count(),
-            note.map_or(0, |(text, _)| text.chars().count()),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-        let width = u16::try_from(widest + 6)
-            .unwrap_or(u16::MAX)
+        let width = self
+            .desired_width()
             .clamp(MIN_WIDTH.min(area.width), area.width);
 
         // A note still wider than the box, because the area is, takes a

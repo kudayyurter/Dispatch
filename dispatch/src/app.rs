@@ -189,6 +189,9 @@ fn strip_mark(title: &str) -> &str {
         .trim()
 }
 
+/// Under this many columns the sidebar takes none, and opens as a drawer.
+const NARROW: u16 = 80;
+
 /// Frame budget. A chatty agent can produce output faster than any terminal
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
@@ -417,6 +420,26 @@ impl Overlay {
         }
     }
 
+    /// The width the overlay needs to be drawn whole.
+    fn desired_width(&self) -> u16 {
+        match self {
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker)
+            | Overlay::Attention(picker) => picker.desired_width(),
+            Overlay::Settings { form, .. } => form.desired_width(),
+            Overlay::OpenOn { prompt, .. }
+            | Overlay::RenameTab { prompt, .. }
+            | Overlay::CloseTab { prompt, .. } => prompt.desired_width(),
+            Overlay::AddMachine(add) => add.prompt().desired_width(),
+            // It shows as much of the directory as it has room for.
+            Overlay::Browse(_) => 30,
+            // Its fields and its task wrap to whatever width it is given.
+            Overlay::Approval { .. } => 44,
+        }
+    }
+
     /// Draws the overlay in `chrome`.
     fn set_chrome(&mut self, chrome: Chrome) {
         match self {
@@ -596,6 +619,22 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// How wide the sidebar is when docked, and as wide as its drawer.
+    sidebar_width: u16,
+    /// Whether the sidebar is folded away while the window is wide enough to
+    /// dock it.
+    sidebar_collapsed: bool,
+    /// Whether the sidebar is open over the panes, in a window too narrow to
+    /// dock it. Never set in a wide one.
+    drawer_open: bool,
+    /// Whether the sidebar's right edge is held by the pointer.
+    dragging_sidebar: bool,
+    /// Where the sidebar's width and fold are kept, when this client keeps
+    /// them.
+    ui_dir: Option<PathBuf>,
+    /// The whole window, as last drawn: what tells a toggle whether there is
+    /// room to dock the sidebar.
+    window: Rect,
     /// How far each machine's section of the sidebar is scrolled.
     sidebar_scroll: sidebar::Scroll,
     /// The row the sidebar was last scrolled to follow, and the area it was
@@ -772,6 +811,12 @@ impl App {
             frames_project: None,
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            sidebar_width: sidebar::WIDTH,
+            sidebar_collapsed: false,
+            drawer_open: false,
+            dragging_sidebar: false,
+            ui_dir: None,
+            window: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
             anchored: (None, Rect::default()),
             expanded: HashSet::new(),
@@ -1301,6 +1346,51 @@ impl App {
     /// Reads and saves harness settings in `dir`.
     pub fn keep_settings_in(&mut self, dir: impl Into<PathBuf>) {
         self.settings_dir = Some(dir.into());
+    }
+
+    /// Keeps the sidebar's width and fold in `dir`, and takes up what was
+    /// kept there.
+    pub fn keep_ui_in(&mut self, dir: impl Into<PathBuf>) {
+        let dir = dir.into();
+        let kept = dispatch_config::ui_state::load(&dir);
+        self.sidebar_width = kept.sidebar_width;
+        self.sidebar_collapsed = kept.sidebar_collapsed;
+        self.ui_dir = Some(dir);
+    }
+
+    /// Writes the sidebar's width and fold back, when this client keeps them.
+    fn save_ui(&self) {
+        let Some(dir) = &self.ui_dir else {
+            return;
+        };
+        let state = dispatch_config::ui_state::UiState {
+            sidebar_width: self.sidebar_width,
+            sidebar_collapsed: self.sidebar_collapsed,
+        };
+        if let Err(error) = dispatch_config::ui_state::save(dir, state) {
+            tracing::warn!(%error, "failed to keep the sidebar's width");
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        if self.window.width < NARROW {
+            self.drawer_open = !self.drawer_open;
+            return;
+        }
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.save_ui();
+    }
+
+    fn resize_sidebar(&mut self, by: i16) {
+        use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
+        let width = self
+            .sidebar_width
+            .saturating_add_signed(by)
+            .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+        if width != self.sidebar_width {
+            self.sidebar_width = width;
+            self.save_ui();
+        }
     }
 
     /// What the user saved for `harness`, or nothing when this client
@@ -2738,6 +2828,27 @@ impl App {
             return self.handle_overlay(event, area);
         }
 
+        // The drawer lies over the panes: Esc or a click beside it puts it
+        // away; a click on it is the sidebar's, below, and then puts it away.
+        if self.drawer_open {
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc => {
+                    self.drawer_open = false;
+                    return Ok(());
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(_))
+                        && !self
+                            .sidebar_area
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row)) =>
+                {
+                    self.drawer_open = false;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         // The tab row is not part of input routing either: a click on it is
         // resolved against what was drawn there last frame. Reversed, so an
         // overlap (there should be none, but a narrow row leaves little
@@ -2761,6 +2872,39 @@ impl App {
                 TabHit::Next => self.select_tab(self.current_tab() + 1),
             }
             return Ok(());
+        }
+
+        // The sidebar's right edge is a handle: pressed, dragged, let go.
+        // Only a docked sidebar has one; the drawer's width is the docked
+        // width, changed from a window wide enough to dock it.
+        if let Event::Mouse(mouse) = event {
+            let area = self.sidebar_area;
+            let on_edge = !self.drawer_open
+                && area.width > 0
+                && mouse.column == area.x + area.width - 1
+                && mouse.row >= area.y
+                && mouse.row < area.y + area.height;
+            match mouse.kind {
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) if on_edge => {
+                    self.dragging_sidebar = true;
+                    return Ok(());
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                    if self.dragging_sidebar =>
+                {
+                    use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
+                    self.sidebar_width = (mouse.column + 1)
+                        .saturating_sub(area.x)
+                        .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+                    return Ok(());
+                }
+                MouseEventKind::Up(_) if self.dragging_sidebar => {
+                    self.dragging_sidebar = false;
+                    self.save_ui();
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         // The sidebar is not otherwise part of input routing — `layout` below
@@ -2787,6 +2931,10 @@ impl App {
                 }
                 sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
                 sidebar::Hit::Pane(id) => self.focus_pane(id),
+            }
+            // Picking something is what the drawer was opened for.
+            if matches!(hit, sidebar::Hit::Project(_) | sidebar::Hit::Pane(_)) {
+                self.drawer_open = false;
             }
             return Ok(());
         }
@@ -2849,6 +2997,8 @@ impl App {
             Action::ToggleFold => self.toggle_fold(),
             Action::NextAttention => self.next_attention(),
             Action::AttentionPicker => self.open_attention_picker(),
+            Action::ToggleSidebar => self.toggle_sidebar(),
+            Action::ResizeSidebar(by) => self.resize_sidebar(by),
             Action::OpenProject => self.start_open(),
             Action::AddMachine => self.open_add_machine(),
             Action::ExpandChild => self.expand_child(),
@@ -4297,14 +4447,103 @@ impl App {
             area.height.saturating_sub(top.height + 1),
         );
 
-        let sidebar_width = sidebar::WIDTH.min(area.width);
-        let sidebar_area = Rect::new(body.x, body.y, sidebar_width, body.height);
+        self.window = area;
+        let narrow = area.width < NARROW;
+        // Widened past narrow, the drawer has nothing to be: the sidebar is
+        // docked again, as it was left.
+        if !narrow {
+            self.drawer_open = false;
+        }
+        let docked = if narrow || self.sidebar_collapsed {
+            0
+        } else {
+            self.sidebar_width.min(area.width)
+        };
         let panes_area = Rect::new(
-            body.x + sidebar_width,
+            body.x + docked,
             body.y,
-            body.width.saturating_sub(sidebar_width),
+            body.width.saturating_sub(docked),
             body.height,
         );
+        // Empty when the sidebar is neither docked nor open as a drawer, so a
+        // click there is never read as one on the sidebar.
+        let sidebar_area = if docked > 0 {
+            Rect::new(body.x, body.y, docked, body.height)
+        } else if self.drawer_open {
+            Rect::new(
+                body.x,
+                body.y,
+                self.sidebar_width.min(body.width),
+                body.height,
+            )
+        } else {
+            Rect::default()
+        };
+
+        let mut sidebar_spun = false;
+        if docked > 0 {
+            sidebar_spun = self.draw_sidebar(frame, sidebar_area, now);
+        }
+
+        self.draw_name(frame, Rect::new(top.x, top.y, docked, top.height));
+        let tab = self.current_tab();
+        if tab != self.last_tab {
+            self.tab_from = self.last_tab;
+            self.animations.start(Target::Tab, now, SLIDE, 0.0);
+            self.last_tab = tab;
+        }
+        let shown = self.current_tab_id();
+        if shown != self.tab_shown {
+            self.tab_back = self.tab_shown;
+            self.tab_shown = shown;
+        }
+        self.draw_tabs(
+            frame,
+            Rect::new(panes_area.x, top.y, panes_area.width, top.height),
+            now,
+        );
+
+        self.frames = self.lay_out(panes_area, now);
+        self.layout = self
+            .frames
+            .iter()
+            .map(|(id, frame)| (*id, Self::interior(*frame)))
+            .collect();
+        self.draw_panes(frame, now);
+        if docked == 0 {
+            if self.drawer_open {
+                Clear.render(sidebar_area, frame.buffer_mut());
+                sidebar_spun = self.draw_sidebar(frame, sidebar_area, now);
+            } else {
+                sidebar_spun = self.draw_sidebar(frame, Rect::default(), now);
+            }
+        }
+        self.draw_status(frame, area);
+
+        self.draw_overlay(frame, panes_area, body);
+
+        // Combined once, here, so it does not matter which was drawn first.
+        self.spinner_drawn = sidebar_spun || self.tabs_spun;
+
+        if let Some(summary) = self.frame_stats.record(drawing.elapsed(), now) {
+            tracing::debug!(
+                p50 = ?summary.p50,
+                p95 = ?summary.p95,
+                max = ?summary.max,
+                frames = summary.frames,
+                "frame timing"
+            );
+        }
+    }
+
+    /// Draws the sidebar in `area`, settling its scroll first, and says
+    /// whether it drew a spinner. An empty `area` draws nothing, and leaves
+    /// a click there to be nobody's.
+    fn draw_sidebar(&mut self, frame: &mut Frame<'_>, area: Rect, now: Instant) -> bool {
+        self.sidebar_area = area;
+        if area.is_empty() {
+            return false;
+        }
 
         // Scrolled to the focus only when the focus has moved or the sidebar
         // has been resized, so the wheel's scroll survives every frame drawn
@@ -4314,14 +4553,14 @@ impl App {
             .focused_pane()
             .map(sidebar::Anchor::Pane)
             .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
-        let moved = (anchor, sidebar_area) != self.anchored;
+        let moved = (anchor, area) != self.anchored;
         sidebar::settle(
             &self.state,
-            sidebar_area,
+            area,
             &mut self.sidebar_scroll,
             if moved { anchor } else { None },
         );
-        self.anchored = (anchor, sidebar_area);
+        self.anchored = (anchor, area);
 
         let sidebar_motion = sidebar::SidebarMotion {
             pulses: self
@@ -4347,61 +4586,24 @@ impl App {
                 .with_scroll(&self.sidebar_scroll)
                 .with_spinner(self.spinner_frame())
                 .with_motion(&sidebar_motion),
-            sidebar_area,
+            area,
         );
-        self.sidebar_area = sidebar_area;
-        let sidebar_spun =
-            self.motion && sidebar::spins(&self.state, sidebar_area, &self.sidebar_scroll);
-
-        self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
-        let tab = self.current_tab();
-        if tab != self.last_tab {
-            self.tab_from = self.last_tab;
-            self.animations.start(Target::Tab, now, SLIDE, 0.0);
-            self.last_tab = tab;
-        }
-        let shown = self.current_tab_id();
-        if shown != self.tab_shown {
-            self.tab_back = self.tab_shown;
-            self.tab_shown = shown;
-        }
-        self.draw_tabs(
-            frame,
-            Rect::new(panes_area.x, top.y, panes_area.width, top.height),
-            now,
-        );
-
-        self.frames = self.lay_out(panes_area, now);
-        self.layout = self
-            .frames
-            .iter()
-            .map(|(id, frame)| (*id, Self::interior(*frame)))
-            .collect();
-        self.draw_panes(frame, now);
-        self.draw_status(frame, area);
-
-        self.draw_overlay(frame, panes_area);
-
-        // Combined once, here, so it does not matter which was drawn first.
-        self.spinner_drawn = sidebar_spun || self.tabs_spun;
-
-        if let Some(summary) = self.frame_stats.record(drawing.elapsed(), now) {
-            tracing::debug!(
-                p50 = ?summary.p50,
-                p95 = ?summary.p95,
-                max = ?summary.max,
-                frames = summary.frames,
-                "frame timing"
-            );
-        }
+        self.motion && sidebar::spins(&self.state, area, &self.sidebar_scroll)
     }
 
     /// Draws whichever overlay is open, if any.
-    fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
+    fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect, body: Rect) {
         let chrome = self.theme.chrome();
         if let Some(overlay) = &mut self.overlay {
             overlay.set_chrome(chrome);
         }
+
+        // Over the panes when they have the room, so the sidebar stays in
+        // view; over the whole window when they do not.
+        let panes_area = match &self.overlay {
+            Some(overlay) if overlay.desired_width().saturating_add(2) > panes_area.width => body,
+            _ => panes_area,
+        };
 
         let Some(overlay) = &self.overlay else {
             return;
@@ -12154,7 +12356,7 @@ mod tests {
             &[&panes[..1], &panes[1..2], &panes[2..]],
         );
         app.focus_pane(panes[1]);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(56, 30))
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 30))
             .expect("a test backend can be created");
 
         drawn(&mut app, &mut terminal);
@@ -12178,7 +12380,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_too_narrow_for_the_plus_draws_none_and_leaves_the_sidebar_alone() {
+    fn a_narrow_window_gives_the_tab_row_the_whole_width() {
         let (mut app, project, daemon, _sent) = attached_app_with_shell();
         let panes = spawn_several(&mut app, &daemon, project, 1);
         send_tabs(&mut app, &daemon, project, &[&panes]);
@@ -12187,18 +12389,15 @@ mod tests {
 
         drawn(&mut app, &mut terminal);
         let row = top_row(&terminal);
-        assert!(
-            !row.contains('+'),
-            "no room for it, so none is drawn: {row:?}"
-        );
+        assert_eq!(app.tab_row.x, 0, "the row starts at the window's edge");
+        assert!(row.contains('+'), "{row:?}");
 
-        // The column the old, unclamped `+` used to spill onto: still the
-        // sidebar's own, so a click there is the sidebar's to answer.
-        click(&mut app, sidebar::WIDTH - 1, 0);
+        let plus = cell_of(&row, " + ") + 1;
+        click(&mut app, plus, 0);
 
         assert!(
-            app.overlay.is_none(),
-            "too narrow for a `+` to open a picker from"
+            matches!(app.overlay, Some(Overlay::Harness(_))),
+            "a click on the `+` opens the picker"
         );
     }
 
@@ -12834,6 +13033,205 @@ args = ["--effort", "{value}"]
     fn a_wide_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30))
             .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn the_sidebar_keeps_the_default_width_until_changed() {
+        assert_eq!(sidebar::WIDTH, dispatch_config::ui_state::DEFAULT_SIDEBAR);
+    }
+
+    #[test]
+    fn alt_s_folds_the_sidebar_away_and_back() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let tiled = app.frames[0].1;
+        assert_eq!(tiled.x, sidebar::WIDTH);
+
+        press_alt(&mut app, 's');
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.frames[0].1.x, 0, "the panes take the whole width");
+        assert!(
+            app.sidebar_area.is_empty(),
+            "and a click there is not the sidebar's"
+        );
+
+        press_alt(&mut app, 's');
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.frames[0].1.x, sidebar::WIDTH);
+    }
+
+    #[test]
+    fn session_keys_resize_the_sidebar_within_its_bounds() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.sidebar_width = dispatch_config::ui_state::MIN_SIDEBAR;
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Size::new(120, 30),
+        )
+        .expect("handled");
+        press(&mut app, KeyCode::Char('<'));
+        assert_eq!(
+            app.sidebar_width,
+            dispatch_config::ui_state::MIN_SIDEBAR,
+            "no narrower"
+        );
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(
+            app.sidebar_width,
+            dispatch_config::ui_state::MIN_SIDEBAR + 2
+        );
+        assert!(
+            app.router.key_mode().is_modal(),
+            "resizing stays in the mode"
+        );
+        app.sidebar_width = dispatch_config::ui_state::MAX_SIDEBAR;
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(
+            app.sidebar_width,
+            dispatch_config::ui_state::MAX_SIDEBAR,
+            "no wider"
+        );
+    }
+
+    #[test]
+    fn dragging_the_sidebars_edge_resizes_it_and_keeps_the_width() {
+        let dir = scratch("ui-drag");
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.keep_ui_in(&dir);
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        let mouse = |kind, column| {
+            Event::Mouse(dispatch_tui::input::MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        use crossterm::event::MouseButton;
+        app.handle(
+            &mouse(MouseEventKind::Down(MouseButton::Left), edge),
+            Size::new(120, 30),
+        )
+        .expect("handled");
+        app.handle(
+            &mouse(MouseEventKind::Drag(MouseButton::Left), edge + 6),
+            Size::new(120, 30),
+        )
+        .expect("handled");
+        app.handle(
+            &mouse(MouseEventKind::Up(MouseButton::Left), edge + 6),
+            Size::new(120, 30),
+        )
+        .expect("handled");
+
+        assert_eq!(app.sidebar_width, sidebar::WIDTH + 6);
+        assert_eq!(
+            dispatch_config::ui_state::load(&dir).sidebar_width,
+            sidebar::WIDTH + 6
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_narrow_window_gives_the_panes_every_column_and_the_sidebar_is_a_drawer() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha-pane");
+        app.focus_pane(panes[1]);
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut narrow);
+        assert_eq!(app.frames.iter().map(|(_, r)| r.x).min(), Some(0));
+        assert!(app.sidebar_area.is_empty());
+
+        press_alt(&mut app, 's');
+        drawn(&mut app, &mut narrow);
+        assert!(!app.sidebar_area.is_empty(), "the drawer is open");
+        assert_eq!(
+            app.frames.iter().map(|(_, r)| r.x).min(),
+            Some(0),
+            "over the panes, not beside"
+        );
+
+        // A click on a pane row picks it and closes the drawer.
+        let screen = rendered_text(&narrow);
+        let row = (app.sidebar_area.y..app.sidebar_area.y + app.sidebar_area.height)
+            .find(|&y| {
+                screen
+                    .lines()
+                    .nth(y as usize)
+                    .is_some_and(|line| sidebar_column(line).contains("alpha-pane"))
+            })
+            .expect("the first pane's row is drawn in the drawer");
+        let column = app.sidebar_area.x + 8;
+        click(&mut app, column, row);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+        assert!(!app.drawer_open);
+    }
+
+    #[test]
+    fn widening_the_window_closes_the_drawer_and_brings_the_sidebar_back() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut narrow);
+        press_alt(&mut app, 's');
+        drawn(&mut app, &mut narrow);
+
+        let mut wide = a_wide_terminal();
+        drawn(&mut app, &mut wide);
+
+        assert!(!app.drawer_open);
+        assert!(
+            !app.sidebar_collapsed,
+            "the drawer never touched the docked state"
+        );
+        assert_eq!(app.frames[0].1.x, sidebar::WIDTH);
+    }
+
+    #[test]
+    fn nothing_panics_in_a_window_narrower_than_the_sidebar() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 2);
+        for width in [1, 5, 12, 19, 20, 21, 33, 34, 35, 79, 80] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10))
+                    .expect("a test backend can be created");
+            drawn(&mut app, &mut terminal);
+            app.drawer_open = true;
+            drawn(&mut app, &mut terminal);
+            app.drawer_open = false;
+            app.open_attention_picker();
+            app.open_harness_picker();
+            drawn(&mut app, &mut terminal);
+            app.overlay = None;
+        }
+    }
+
+    #[test]
+    fn a_dialog_wider_than_the_panes_uses_the_whole_window() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.sidebar_width = dispatch_config::ui_state::MAX_SIDEBAR;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24))
+            .expect("a test backend can be created");
+        let long = "a very long harness name that will not fit in thirty columns";
+        app.overlay = Some(Overlay::Harness(Picker::new(
+            "New pane",
+            vec![Item::new("x", long)],
+        )));
+        drawn(&mut app, &mut terminal);
+        assert!(
+            rendered_text(&terminal).contains(long),
+            "drawn whole, over the sidebar"
+        );
     }
 
     #[test]

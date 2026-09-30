@@ -15,7 +15,22 @@ Dispatch keeps its settings in one directory:
 `DISPATCH_CONFIG_DIR` points Dispatch at another directory. The examples below
 show the Linux path. The directory holds `config.toml`, a `harnesses/`
 directory with one file per agent (written on first run), your saved
-`harness-settings.toml`, and the project and machine lists.
+`harness-settings.toml`, your `ui.toml`, and the project and machine lists.
+
+## Interface state
+
+How you left the interface lives in `ui.toml`, beside `config.toml`:
+
+```toml
+# ~/.config/dispatch/ui.toml
+sidebar_width = 41        # 20 to 60 columns; 34 until you change it
+sidebar_collapsed = true  # folded away with Alt s
+```
+
+Dispatch writes it, when you fold the sidebar or finish dragging its edge, so
+`config.toml` keeps its comments. A width outside 20 to 60 is brought into
+range, and a value that is not a number, or a file that is not TOML, falls
+back to the default.
 
 ## Shell panes
 

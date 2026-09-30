@@ -428,7 +428,7 @@ fn each_mode_spells_out_its_keys() {
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Session),
-        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting"
+        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting  b sidebar  < narrower  > wider"
     );
     assert_eq!(
         keymap.normal_help(),

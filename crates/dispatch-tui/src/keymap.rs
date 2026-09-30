@@ -393,6 +393,9 @@ pub enum Command {
     Fold,
     NextAttention,
     AttentionPicker,
+    ToggleSidebar,
+    SidebarNarrower,
+    SidebarWider,
     Quit,
 }
 
@@ -447,6 +450,9 @@ impl Command {
         (Command::Fold, "fold"),
         (Command::NextAttention, "next_attention"),
         (Command::AttentionPicker, "attention_picker"),
+        (Command::ToggleSidebar, "toggle_sidebar"),
+        (Command::SidebarNarrower, "sidebar_narrower"),
+        (Command::SidebarWider, "sidebar_wider"),
         (Command::Quit, "quit"),
     ];
 
@@ -524,6 +530,9 @@ impl Command {
             Command::Fold => "fold",
             Command::NextAttention => "attention",
             Command::AttentionPicker => "waiting",
+            Command::ToggleSidebar => "sidebar",
+            Command::SidebarNarrower => "narrower",
+            Command::SidebarWider => "wider",
             Command::Quit => "quit",
         }
     }
@@ -558,6 +567,8 @@ impl Command {
                 | Command::ScrollPageUp
                 | Command::ScrollTop
                 | Command::ScrollBottom
+                | Command::SidebarNarrower
+                | Command::SidebarWider
         )
     }
 
@@ -628,6 +639,9 @@ impl Command {
             Command::Fold => Action::ToggleFold,
             Command::NextAttention => Action::NextAttention,
             Command::AttentionPicker => Action::AttentionPicker,
+            Command::ToggleSidebar => Action::ToggleSidebar,
+            Command::SidebarNarrower => Action::ResizeSidebar(-2),
+            Command::SidebarWider => Action::ResizeSidebar(2),
             Command::Quit => Action::Quit,
         })
     }
@@ -675,6 +689,7 @@ impl Keymap {
             (Chord::alt_key(Down), Command::FocusDown),
             (Chord::alt('j'), Command::FocusDown),
             (Chord::alt('a'), Command::NextAttention),
+            (Chord::alt('s'), Command::ToggleSidebar),
         ];
 
         let mut prefix = vec![
@@ -695,6 +710,7 @@ impl Keymap {
             (Chord::char('m'), Command::AddMachine),
             (Chord::char('['), Command::ScrollMode),
             (Chord::char('w'), Command::NextAttention),
+            (Chord::char('b'), Command::ToggleSidebar),
         ];
         prefix.extend(digits(Command::GoToTab));
         prefix.push((Chord::key(Tab), Command::NextTab));
@@ -773,6 +789,9 @@ impl Keymap {
             (Chord::char('f'), Command::Fold),
             (Chord::char('q'), Command::Quit),
             (Chord::char('w'), Command::AttentionPicker),
+            (Chord::char('b'), Command::ToggleSidebar),
+            (Chord::char('<'), Command::SidebarNarrower),
+            (Chord::char('>'), Command::SidebarWider),
             (Chord::key(Esc), Command::LeaveMode),
             (Chord::key(Enter), Command::LeaveMode),
         ];

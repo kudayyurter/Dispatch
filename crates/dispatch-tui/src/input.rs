@@ -126,6 +126,11 @@ pub enum Action {
     NextAttention,
     /// Open the list of every pane waiting on the user.
     AttentionPicker,
+    /// Fold the sidebar away or bring it back; in a narrow window, open or
+    /// close it as a drawer over the panes.
+    ToggleSidebar,
+    /// Make the sidebar this many columns wider; negative narrows it.
+    ResizeSidebar(i16),
     /// Quit.
     Quit,
 }

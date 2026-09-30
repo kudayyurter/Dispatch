@@ -9,6 +9,7 @@ pub mod projects;
 pub mod settings;
 pub mod status;
 mod store;
+pub mod ui_state;
 
 /// Shared by this crate's test modules, so there is one temporary-directory
 /// counter rather than one per module.

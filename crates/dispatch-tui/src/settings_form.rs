@@ -516,12 +516,10 @@ impl SettingsForm {
     }
 }
 
-impl Widget for &SettingsForm {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 8 || area.height < 3 {
-            return;
-        }
-
+impl SettingsForm {
+    /// The width it needs to be drawn whole.
+    #[must_use]
+    pub fn desired_width(&self) -> u16 {
         let label_width = self
             .rows
             .iter()
@@ -547,9 +545,28 @@ impl Widget for &SettingsForm {
         let widest = row_width
             .max(self.title.chars().count() + 4)
             .max(hint.chars().count() + 4);
-        let width = u16::try_from(widest + 2)
-            .unwrap_or(u16::MAX)
-            .min(area.width);
+        u16::try_from(widest + 2).unwrap_or(u16::MAX)
+    }
+}
+
+impl Widget for &SettingsForm {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width < 8 || area.height < 3 {
+            return;
+        }
+
+        let label_width = self
+            .rows
+            .iter()
+            .map(|row| row.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let hint = if self.editing.is_some() {
+            EDITING_HINT
+        } else {
+            HINT
+        };
+        let width = self.desired_width().min(area.width);
         let height = u16::try_from(self.rows.len() + 2)
             .unwrap_or(u16::MAX)
             .min(area.height);

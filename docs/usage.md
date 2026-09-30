@@ -56,12 +56,13 @@ other key goes to the pane.
 | `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
 | `Ctrl t` | tab: see [Tabs](#tabs) above |
 | `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
-| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you |
+| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you, `b` fold the sidebar, `<` `>` narrow or widen it |
 | `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
-| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you |
+| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you, `^a b` folds the sidebar |
 
 Some keys work without a mode: `Alt n` opens a new pane on this tab,
 `Alt a` goes to the next agent waiting on you, in any project,
+`Alt s` folds the sidebar away and back,
 `Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
 moves focus, going on to the next tab at the grid's edge. As in zellij, a
 quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
@@ -116,6 +117,14 @@ subagents, and clicking anywhere else on a pane's row focuses it. `^a f` folds
 from the keyboard, for a terminal with no mouse reporting: the focused pane's
 subagents, or the project above it when that pane has none. The project
 the grid is showing is highlighted across the full width of the row.
+
+`Alt s` folds the sidebar away and back, giving the panes its columns.
+`Ctrl o <` and `Ctrl o >` make it narrower or wider by two columns, and so does
+dragging its right edge with the mouse; it stays between 20 and 60 columns.
+How you left it is kept in `ui.toml`. Under 80 columns the sidebar takes none:
+the panes have the whole window, and `Alt s` opens the sidebar as a drawer over
+them. Picking a pane or project, `Esc`, or a click beside the drawer puts it
+away, and so does widening the window.
 
 A row is marked on both sides. On the left, a project shows a folder -- open
 while you are looking inside it, shut while its panes are folded away or it has

@@ -149,12 +149,11 @@ pub(crate) fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-impl Widget for &Picker {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 4 || area.height < 3 {
-            return;
-        }
-
+impl Picker {
+    /// The width it needs to be drawn whole: its widest row, title or hint,
+    /// and room for the border and a margin.
+    #[must_use]
+    pub fn desired_width(&self) -> u16 {
         let widest = self
             .items
             .iter()
@@ -165,11 +164,19 @@ impl Widget for &Picker {
             .unwrap_or(0);
 
         let hint_width = self.hint.as_ref().map_or(0, |hint| hint.chars().count());
-        let width = u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
+        u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
             .unwrap_or(u16::MAX)
-            // The floor gives way to a narrower area, as the prompt's and the
-            // browser's do: `clamp` panics when its minimum is above its maximum.
-            .clamp(20.min(area.width), area.width);
+            .max(20)
+    }
+}
+
+impl Widget for &Picker {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width < 4 || area.height < 3 {
+            return;
+        }
+
+        let width = self.desired_width().clamp(20.min(area.width), area.width);
         let height = u16::try_from(self.items.len() + 2)
             .unwrap_or(u16::MAX)
             .clamp(3, area.height);
