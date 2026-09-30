@@ -3085,6 +3085,12 @@ impl App {
         match owner {
             pointer::Target::SidebarEdge => {
                 if gesture.button == crossterm::event::MouseButton::Left {
+                    // The second click of a double is the handle's way back
+                    // to its default, and what is saved is that width rather
+                    // than one the press may have dragged to.
+                    if self.pressed_double {
+                        self.sidebar_width = dispatch_config::ui_state::DEFAULT_SIDEBAR;
+                    }
                     self.save_ui();
                 }
             }
@@ -3141,13 +3147,10 @@ impl App {
                 };
                 match hit {
                     sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
-                    // A heading carries no pane, so the whole row is the
-                    // project's: a click both moves the view there and folds
-                    // the panes away.
-                    sidebar::Hit::Project(id) => {
-                        self.select_project(id);
-                        self.state.toggle_project_collapsed(id);
-                    }
+                    // A heading carries no pane, so the click moves the view
+                    // to the project; folding it is the chevron's alone.
+                    sidebar::Hit::Project(id) => self.select_project(id),
+                    sidebar::Hit::ProjectChevron(id) => self.state.toggle_project_collapsed(id),
                     sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
                     sidebar::Hit::Pane(id) => self.focus_pane(id),
                 }
@@ -9136,18 +9139,37 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_project_row_selects_it_and_folds_its_panes() {
+    fn a_click_on_a_project_row_selects_it_and_only_its_chevron_folds() {
         let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
-
-        // The first row inside the sidebar's frame — below the top row and
-        // the frame's own edge — is the first project.
-        click(&mut app, 1, 2);
-
+        click(&mut app, 8, 2);
         assert_eq!(app.state.selected_project(), Some(first));
-        assert!(app.state.is_project_collapsed(first), "and it folds");
+        assert!(
+            !app.state.is_project_collapsed(first),
+            "the row selects; it does not fold"
+        );
 
         click(&mut app, 1, 2);
-        assert!(!app.state.is_project_collapsed(first), "and unfolds again");
+        assert!(app.state.is_project_collapsed(first), "the chevron folds");
+        click(&mut app, 1, 2);
+        assert!(!app.state.is_project_collapsed(first));
+    }
+
+    #[test]
+    fn a_double_click_on_the_sidebar_edge_restores_its_width() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        spawn_several(&mut app, &daemon, project, 1);
+        app.sidebar_width = 50;
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        click(&mut app, edge, 5);
+        advance(&clock, Duration::from_millis(100));
+        click(&mut app, edge, 5);
+        assert_eq!(
+            app.sidebar_width,
+            dispatch_config::ui_state::DEFAULT_SIDEBAR
+        );
     }
 
     #[test]

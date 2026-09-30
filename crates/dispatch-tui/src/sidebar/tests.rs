@@ -354,16 +354,38 @@ fn a_click_on_a_child_row_finds_the_child_rather_than_its_parent() {
 }
 
 #[test]
-fn a_click_anywhere_on_a_project_heading_finds_the_project() {
-    // The heading names no pane, so the whole row is the project's control:
-    // clicking it selects the project and folds its panes away.
+fn a_click_on_a_project_heading_finds_its_chevron_or_the_project() {
+    // The twisty and the blank after it fold the project; the rest of the
+    // row selects it.
     let (mut state, alpha, _) = state();
     spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    assert_eq!(hit(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
+    assert_eq!(
+        hit(&state, area, LEFT, TOP),
+        Some(Hit::ProjectChevron(alpha))
+    );
+    assert_eq!(
+        hit(&state, area, LEFT + 1, TOP),
+        Some(Hit::ProjectChevron(alpha))
+    );
+    assert_eq!(hit(&state, area, LEFT + 2, TOP), Some(Hit::Project(alpha)));
     assert_eq!(hit(&state, area, WIDTH - 2, TOP), Some(Hit::Project(alpha)));
+}
+
+#[test]
+fn a_click_on_a_branch_row_never_finds_a_chevron() {
+    let (state, project) = repository();
+    let area = Rect::new(0, 0, WIDTH, 6);
+
+    for x in LEFT..WIDTH - 1 {
+        assert_eq!(
+            hit(&state, area, x, TOP + 1),
+            Some(Hit::Project(project)),
+            "column {x}"
+        );
+    }
 }
 
 #[test]

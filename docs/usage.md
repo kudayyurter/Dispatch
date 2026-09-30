@@ -120,15 +120,17 @@ and the shell and the pane carry on.
 
 The project list is framed on the left. It is a tree: each project carries a
 twisty, and so does any pane running subagents. Clicking a project's row moves
-the view to it and folds its panes away; clicking a pane's twisty folds its
-subagents, and clicking anywhere else on a pane's row focuses it. `^a f` folds
+the view to it, and clicking its chevron folds its panes away; clicking a
+pane's twisty folds its subagents, and clicking anywhere else on a pane's row
+focuses it. `^a f` folds
 from the keyboard, for a terminal with no mouse reporting: the focused pane's
 subagents, or the project above it when that pane has none. The project
 the grid is showing is highlighted across the full width of the row.
 
 `Alt s` folds the sidebar away and back, giving the panes its columns.
 `Ctrl o <` and `Ctrl o >` make it narrower or wider by two columns, and so does
-dragging its right edge with the mouse; it stays between 20 and 60 columns.
+dragging its right edge with the mouse, and double-clicking that edge restores
+its width; it stays between 20 and 60 columns.
 How you left it is kept in `ui.toml`. Under 80 columns the sidebar takes none:
 the panes have the whole window, and `Alt s` opens the sidebar as a drawer over
 them. Picking a pane or project, `Esc`, or a click beside the drawer puts it

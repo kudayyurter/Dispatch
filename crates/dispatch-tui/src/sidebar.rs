@@ -950,9 +950,11 @@ impl Widget for Sidebar<'_> {
 pub enum Hit {
     /// The line naming a machine. Folding is all there is to do on one.
     Device(DeviceId),
-    /// A project heading. The whole row is its control: there is no pane on it
-    /// to focus, so a click both selects the project and folds its panes.
+    /// A project's row, past its chevron. A click selects the project and no
+    /// longer folds it: folding is the chevron's job.
     Project(ProjectId),
+    /// A project's twisty and the blank after it: folding is all it does.
+    ProjectChevron(ProjectId),
     /// The twisty of a pane that has children.
     Twisty(PaneId),
     /// The rest of a live pane's row.
@@ -999,7 +1001,12 @@ pub fn hit_test(state: &AppState, area: Rect, scroll: &Scroll, x: u16, y: u16) -
 /// What a click at column `x` on `row` means.
 fn hit_row(state: &AppState, body: Rect, row: &Row<'_>, x: u16) -> Option<Hit> {
     match *row {
-        Row::Project(id) | Row::Branch(id, _) => Some(Hit::Project(id)),
+        Row::Project(id) => Some(if x < body.x + 2 {
+            Hit::ProjectChevron(id)
+        } else {
+            Hit::Project(id)
+        }),
+        Row::Branch(id, _) => Some(Hit::Project(id)),
         Row::Pane(id, indent) => {
             let pane = state.pane(id)?;
 
