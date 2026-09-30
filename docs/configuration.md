@@ -1,0 +1,217 @@
+# Configuring Dispatch
+
+Where settings live, the shell panes open, per-agent harness settings, status rules, and motion. Rebinding keys is under [Keys in usage.md](usage.md#keys).
+
+## The configuration directory
+
+Dispatch keeps its settings in one directory:
+
+| System | Directory |
+|---|---|
+| Linux | `~/.config/dispatch` |
+| macOS | `~/Library/Application Support/dispatch` |
+| Windows | `%APPDATA%\dispatch\config` |
+
+`DISPATCH_CONFIG_DIR` points Dispatch at another directory. The examples below
+show the Linux path. The directory holds `config.toml`, a `harnesses/`
+directory with one file per agent (written on first run), your saved
+`harness-settings.toml`, and the project and machine lists.
+
+## Shell panes
+
+The picker's first entry is your own shell — `Shell · zsh`, or whatever
+`$SHELL` is on the machine the project is on — so `Enter` opens a terminal
+in the project's directory. It starts the way your terminal starts it (a
+login shell on macOS, a plain interactive one elsewhere), so your rc file
+runs and your prompt, Starship or otherwise, looks as it does anywhere else.
+To choose it yourself:
+
+```toml
+# ~/.config/dispatch/config.toml
+[shell]
+command = "/usr/bin/fish"   # default: $SHELL, then your login record, then /bin/sh
+args = []
+login = "auto"              # auto | always | never
+```
+
+`[shell]` is read when the daemon (or a standalone Dispatch) starts, so
+restart the daemon after changing it.
+
+Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
+`COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
+runs in, so a program never sends it another terminal's private sequences.
+A harness's own `env` still wins.
+
+## Harness settings
+
+Every agent Dispatch ships starts **without its permission prompts**: Claude
+Code in `bypassPermissions` mode, Codex with
+`--dangerously-bypass-approvals-and-sandbox` (which also drops its sandbox),
+agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
+[security-model.md](security-model.md) before running an agent you
+do not trust this way.
+
+Claude Code refuses to start in bypass mode when it runs as root: on a
+machine where Dispatch's daemon runs as root — a container, many remote
+machines — every Claude pane and every delegated `claude -p` exits at once.
+Save another **Permissions** mode for Claude on that machine (`e`, then
+`s`), or, only when the machine really is a sandbox such as a container,
+set `IS_SANDBOX = "1"` in that machine's `claude.toml` under `[env]`, which
+Claude reads as permission to bypass.
+
+In the new-pane picker, `e` opens the highlighted harness's settings:
+
+| Key | Does |
+|---|---|
+| `↑` `↓` | move between settings |
+| `←` `→` | step through a setting's values; `Space` flips one that is on or off |
+| `Enter` | open a pane with what is shown, saving nothing |
+| `s` | save what is shown as the harness's default |
+| `Esc` | back to the picker |
+
+A model that is not on the list is typed on the setting's **Custom…** value.
+**agent default** passes nothing, and the agent decides as its own
+configuration says. Beside each harness, the picker shows what you have saved
+that differs from its file.
+
+opencode takes its model from a variable its shared background service never
+sees, so an opencode pane with a chosen model runs a private opencode server
+of its own.
+
+Saved defaults live beside `config.toml`:
+
+```toml
+# ~/.config/dispatch/harness-settings.toml
+[claude]
+model = "opus"
+permissions = ""   # agent default: Claude asks, as it does outside Dispatch
+
+[codex]
+bypass = false     # Codex's prompts and sandbox are back
+```
+
+These are per machine: a subagent is started by the daemon on its own
+machine, so it follows that machine's saved defaults, not the file of the
+machine you are typing on, and not a one-off choice made in the pane that
+asked for it.
+
+A harness file says what its settings are, and how each becomes a flag, so a
+harness you add can have them as well:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"                 # choice | text | bool
+options = ["low", "medium", "high", "xhigh", "max"]
+custom = false                  # true adds a typed value to a choice
+args = ["--effort", "{value}"]  # after the launch's own; nothing when unset
+# env = { NAME = "{value}" }    # or a variable
+
+[[settings]]
+key = "permissions"
+label = "Permissions"
+kind = "choice"
+options = ["bypassPermissions", "auto", "acceptEdits", "plan", "manual"]
+default = "bypassPermissions"
+args = ["--permission-mode", "{value}"]
+```
+
+An option can be a table instead, to show a clean name, and one choice can
+limit another. While a model is chosen, a setting `limited_by` the model
+offers only the values that model lists for it, and moves to the highest of
+them when the one set is not among them. A model that lists none fades the
+row out, and passes nothing for it. A model typed in by hand leaves it free.
+
+```toml
+# ~/.config/dispatch/harnesses/agy.toml
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = [
+  { value = "gemini-3.1-pro", label = "Gemini 3.1 Pro", effort = ["low", "high"] },
+  { value = "claude-sonnet-4-6", label = "Claude Sonnet 4.6" },  # no effort
+]
+custom = true
+args = ["--model", "{value}"]
+
+[[settings]]
+key = "effort"
+label = "Effort"
+kind = "choice"
+limited_by = "model"
+options = [{ value = "low", label = "Low" }, { value = "high", label = "High" }]
+args = ["--effort", "{value}"]
+```
+
+A `bool` adds its `args` when it is on. A value may hold only letters, digits
+and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
+`cmd.exe`'s command line. The daemon reads harness files when it starts, so
+restart it after editing one, and after upgrading Dispatch too: a daemon
+started before this release ignores the settings a newer client sends, and
+keeps the harness files it already loaded.
+
+A harness file you have edited is left as it is when Dispatch upgrades: it
+keeps its prompts and offers no settings until you delete it (Dispatch
+writes the current one back on its next start) or add `[[settings]]` to it
+yourself.
+
+## Status rules
+
+A pane's state comes from its terminal: output arriving means it is working,
+and quiet means idle -- though not the echo of your own typing, or its repaint
+after a resize. Each harness's rules recognise what activity alone cannot -- a
+spinner in the title, a permission prompt. `claude`, `codex`, `opencode` and
+`agy` have rules built in, adapted from
+[herdr](https://github.com/ogulcancelik/herdr)'s detection manifests. A
+harness's own TOML can carry its own:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+# Claude Code's permission prompt: the question, with a numbered yes under it.
+[[status.rules]]
+state = "blocked"
+region = "bottom:15"
+contains = ["do you want to proceed?"]
+regex = ['(?i)^\s*❯?\s*1\.\s*yes\b']
+priority = 990
+```
+
+- `state` is `working`, `idle` or `blocked`.
+- `region` is where to look: `title`, the title the program last set, spinner
+  and all; `progress`, its last `OSC 9;4` progress report, after the `9;`;
+  `bottom:N`, the last N non-blank lines of the screen; or `screen`, all of it.
+- `contains` must all appear, `any` at least one, and `not` none; all three
+  ignore case. `regex` must match some line of the region, and is
+  case-sensitive unless it says `(?i)`. A rule needs at least one of
+  `contains`, `any` or `regex`.
+- `priority` orders the rules, highest first, ties in file order, and the
+  first that matches decides. An `idle` rule does not outrank output still
+  arriving.
+
+A harness's own `[status]` replaces the built-ins for it rather than adding to
+them, so start from a copy of them in
+[`crates/dispatch-config/src/status/builtin.rs`](../crates/dispatch-config/src/status/builtin.rs). `[status]` with `rules = []`
+means activity alone decides; with no `[status]` at all, the built-ins for its
+id apply, and a harness with none goes by activity alone. A rule with an
+unknown state or region, a regex that does not compile, or nothing to match on
+is logged and skipped, and the harness loads without it.
+
+## Motion
+
+Working panes spin, a pane that wants you pulses its row, focus eases from one
+border to the next, a new pane draws its border in and a closed one retracts
+it, and the active tab's tint slides across. To keep the screen still:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+motion = false   # default true
+```
+
+Every change then shows at once, a working pane shows a still play glyph, and
+nothing pulses; every state is still shown.
+
+[Back to the README](../README.md)

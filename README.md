@@ -1,612 +1,89 @@
+<div align="center">
+
 # Dispatch
 
-An agent orchestration TUI. One control surface for multiple coding agents
-(Claude Code, Codex, agy, opencode): a project sidebar, tiled live agent
-terminals, and — in later slices — an orchestrator that delegates work to
-spawned subagents under explicit approval.
+**Run several coding agents side by side, and see which one needs you.**
 
-Status: **early**. The TUI multiplexes local agents, and `dispatchd` can own
-them instead so they outlive the interface.
+[![CI](https://github.com/namelessmonarch0/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/namelessmonarch0/Dispatch/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)](LICENSE)
 
-## Building
+[Install](#install) · [Usage](#usage) · [Docs](docs/usage.md)
 
-Requires:
+<img src=".github/assets/demo.gif" alt="Dispatch with four panes: one agent done, one blocked on a permission prompt until it is answered, one working, and a shell, with a sidebar marking each pane's state" width="880">
 
-- Rust 1.89 or newer (edition 2024). CI builds with exactly 1.89, so a
-  change that needs a newer compiler fails there first.
-- **Zig 0.16.0** — builds the vendored `libghostty-vt` terminal engine
+</div>
 
-```sh
-brew install zig        # macOS
-cargo build --workspace
-```
+Dispatch is a terminal interface for Claude Code, Codex, agy, opencode, or your own shell, across all your projects. It reads each pane's terminal as it runs, so one sidebar tells you which agent is working, done, or waiting on a permission prompt.
 
-The first build runs `zig build` against `vendor/libghostty-vt`, which fetches
-Zig dependencies into `vendor/libghostty-vt/zig-pkg/` (gitignored) and needs
-network access. For an offline or hermetic build, point Zig at a pre-fetched
-package set:
+- **Tiled live terminals:** up to four panes per tab, as many tabs as you like, with zellij-style keys.
+- **State at a glance:** each pane is marked working, idle, done, or blocked, and the status row counts the ones waiting on you.
+- **Agents that outlive the window:** with `--attach`, a daemon owns the agents, so you can close the interface and come back, or watch from several windows.
+- **Per-agent settings:** pick the model, effort and permission mode before a pane opens.
+- **Delegation and other machines:** an agent can hand a task to a second agent once you approve it, and agents on other machines show up over ssh.
 
-```sh
-LIBGHOSTTY_VT_ZIG_SYSTEM_DIR=/path/to/packages cargo build --workspace
-```
+> [!NOTE]
+> Early (0.1.0): no packaged releases yet, so you build from source. Runs on Linux, macOS and Windows; CI tests all three.
 
-On Windows, build for the GNU ABI so Zig supplies its own MinGW libc and no
-Visual Studio install is needed:
+## Install
+
+You need Rust 1.89+, [Zig 0.16.0](https://ziglang.org/download/) (it builds the vendored `libghostty-vt` terminal engine; set `ZIG` if the `zig` on your `PATH` is another version), a [Nerd Font](https://www.nerdfonts.com/) in your terminal, and at least one of `claude`, `codex`, `agy` or `opencode` on your `PATH` (your shell works without any). Offline, Windows and contributor builds are in [docs/building.md](docs/building.md).
 
 ```sh
-rustup target add x86_64-pc-windows-gnu
-cargo build --workspace --target x86_64-pc-windows-gnu
+git clone https://github.com/namelessmonarch0/Dispatch.git && cd Dispatch
+cargo build --release    # the first build fetches Zig packages, so it needs network
 ```
 
-## Security model
+## Usage
 
-One daemon serves one operating-system user, and anything that can reach
-its socket can do anything a client can. Delegation approval keeps
-well-meaning agents in check; it is not a sandbox for untrusted ones. See
-[docs/security-model.md](docs/security-model.md).
+Open the directory you are in as a project:
 
-Agents also start without their own permission prompts; see
-[Harness settings](#harness-settings) to turn them back on.
+```sh
+./target/release/dispatch --attach .
+```
 
-## Layout
-
-| Crate | Responsibility |
-|---|---|
-| `dispatch-core` | Domain types and state. Zero I/O. |
-| `dispatch-layout` | Tiling algorithm. Pure functions. |
-| `dispatch-config` | Harness definitions, config loading. |
-| `dispatch-os` | All platform-specific code. The only crate with `#[cfg(windows)]`. |
-| `dispatch-pty` | PTY supervision, VT screen state, title scanning. |
-| `dispatch-proto` | The client-daemon wire protocol. |
-| `dispatch-client` | The client half of that protocol. |
-| `dispatch-daemon` | The daemon's loop: it owns the agents. |
-| `dispatch-tui` | Rendering, input routing, keymap. |
-| `dispatch` | The client binary. |
-| `dispatchd` | The daemon binary. |
-| `xtask` | Build tooling — regenerates FFI bindings on version bumps. |
-
-## The grid
-
-Every pane is drawn inside a thin border carrying its title, so one agent's
-output cannot be mistaken for the next one's or for the sidebar.
-
-At most four panes are tiled at once, on a tab. Tabs are yours: a new pane
-opens on the tab you are on, and a fifth on a full tab opens the next one.
-Closing a pane never moves panes on other tabs. The sidebar always lists
-every pane, whichever tab it is on.
-
-A pane whose process exits gives its tile back straight away and the remaining
-panes spread into the space. It stays in the sidebar, where selecting it shows
-what it printed — `Ctrl p x` (or `^a x`) is what removes it for good.
-
-On Linux and macOS, a pane whose program has exited keeps its process as a
-`<defunct>` entry under `dispatchd` until you close the pane; closing it
-clears the entry.
-
-## Tabs
-
-The row across the top names each tab after its first pane's title, or the
-name you give it, with `+` at its end for a new one. Click a tab to go to
-it. When there are more tabs than fit, the row scrolls to keep yours in view.
-
-`Ctrl t` enters tab mode, and the status row lists its keys:
+`--attach` starts the daemon, `dispatchd`, if none is running, and the agents belong to it from then on. Without `--attach`, the agents are children of the window and quitting ends them.
 
 | Key | Does |
 |---|---|
-| `n` | new tab: the picker, with your shell first |
-| `r` | rename the tab (empty goes back to the first pane's title) |
-| `x` | close the tab and every pane on it, after a y/n |
-| `←` `→` / `h` `l` / `k` `j` | previous / next tab |
-| `[` `]` | move the focused pane to the previous / next tab (a new one past the last) |
-| `i` `o` | move the tab left / right |
-| `1`–`9` | go to a tab by position |
-| `Tab` | the tab you were on before |
-| `Esc` / `Enter` | leave tab mode |
-| `Ctrl t` | send `Ctrl t` itself to the pane (Claude Code and fzf use it) |
+| `Alt n` | new pane: pick your shell or an agent (`e` first for its model, effort, permissions) |
+| `Alt` + arrows | move between panes |
+| `Ctrl p x` | close the focused pane and end its agent |
+| `Ctrl t` | tab mode; the status row lists its keys |
+| `Ctrl s` | scroll mode |
+| `Ctrl o q` | quit; attached, the agents keep running for next time |
 
-Some keys work without a mode: see Keys below.
-
-A daemon keeps its projects' tabs, so they survive detaching and look the
-same from every client. A daemon older than tabs still works: its panes are
-grouped four at a time, as before.
-
-## Keys
-
-Keys work the way zellij's do: a `Ctrl` key enters a mode for one kind of
-thing, the status row lists that mode's keys, and `Esc` leaves it. Every
-other key goes to the pane.
-
-| Key | Mode |
+| Command | Does |
 |---|---|
-| `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
-| `Ctrl t` | tab: see Tabs above |
-| `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
-| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit |
-| `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
-| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode |
+| `dispatch delegate "…"` | an agent hands a task to a second one ([more](docs/delegation.md)) |
+| `dispatch machine add me@tower` | add a machine's agents over ssh ([more](docs/daemon.md)) |
 
-Some keys work without a mode: `Alt n` opens a new pane on this tab,
-`Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
-moves focus, going on to the next tab at the grid's edge. As in zellij, a
-quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
-that letter.
+Every other key goes to the focused pane. All modes, tabs, the sidebar's glyphs and key rebinding are in [docs/usage.md](docs/usage.md).
 
-Four of these keys are newly taken from panes: `Ctrl p` is a shell's
-previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is
-bash's operate-and-get-next, and `Ctrl g` is emacs's cancel. `Ctrl t` was
-already taken, by fzf's file finder and Claude Code's task list. A mode's
-key pressed twice goes to the pane instead (`Ctrl s Ctrl s` gives a shell
-its `Ctrl s`), lock mode gives a program every key until you unlock, and
-`"none"` in `[keys]` gives a key back for good. `Ctrl q` does not quit on
-its own — standalone, quitting ends every agent — so quit is `Ctrl o q` or
-`^a q`.
+> [!WARNING]
+> Every agent Dispatch ships **starts without its permission prompts** (Codex also without its sandbox), so it can work without stopping to ask. Turn them back on per agent in the new-pane picker: `e`, change **Permissions**, then `s` to save. Anything that can reach the daemon's socket can do what a client can; read [docs/security-model.md](docs/security-model.md) before running agents you don't trust.
 
-To change a key, say only what differs in `config.toml`:
+## Configuration
 
-```toml
-[keys.normal]
-"Ctrl q" = "quit"        # bind something new
-"Ctrl a" = "none"        # give Ctrl a back to the shell…
-"Ctrl b" = "prefix"      # …and use tmux's key for the prefix
+Settings live in `~/.config/dispatch` on Linux, `~/Library/Application Support/dispatch` on macOS, and `%APPDATA%\dispatch\config` on Windows; `DISPATCH_CONFIG_DIR` points elsewhere. Every option, with examples, is in [docs/configuration.md](docs/configuration.md).
 
-[keys.pane]
-"w" = "close_pane"       # a second key for a command
-"x" = "none"             # unbind a default
-```
-
-The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
-`lock`, and a key is written as zellij writes one: `"Ctrl t"`, `"Alt n"`,
-`"x"`, `"H"`, `"Shift Tab"`, `"PageUp"`, `"F5"`. `clear = true` in a table
-drops that mode's defaults. A command is named in snake_case — `new_pane`,
-`close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
-`next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
-`quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
-name and skipped, and the rest still applies. `Esc` always leaves a mode,
-lock always has a key that unlocks, and a config that leaves no key to quit
-is logged. Keys are read when Dispatch starts.
-
-`Ctrl z` in an agent's pane closes that pane and ends the agent, as `Ctrl p x`
-would. An agent cannot be suspended in a pane -- there is no shell behind it to
-bring it back with `fg` -- so the key never reaches it. In a shell pane,
-`Ctrl z` reaches the shell as usual: it suspends the job the shell is running,
-and the shell and the pane carry on.
-
-## Shell panes
-
-The picker's first entry is your own shell — `Shell · zsh`, or whatever
-`$SHELL` is on the machine the project is on — so `Enter` opens a terminal
-in the project's directory. It starts the way your terminal starts it (a
-login shell on macOS, a plain interactive one elsewhere), so your rc file
-runs and your prompt, Starship or otherwise, looks as it does anywhere else.
-To choose it yourself:
-
-```toml
-# ~/.config/dispatch/config.toml
-[shell]
-command = "/usr/bin/fish"   # default: $SHELL, then your login record, then /bin/sh
-args = []
-login = "auto"              # auto | always | never
-```
-
-`[shell]` is read when the daemon (or a standalone Dispatch) starts, so
-restart the daemon after changing it.
-
-Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
-`COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
-runs in, so a program never sends it another terminal's private sequences.
-A harness's own `env` still wins.
-
-## Harness settings
-
-Every agent Dispatch ships starts **without its permission prompts**: Claude
-Code in `bypassPermissions` mode, Codex with
-`--dangerously-bypass-approvals-and-sandbox` (which also drops its sandbox),
-agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
-[docs/security-model.md](docs/security-model.md) before running an agent you
-do not trust this way.
-
-Claude Code refuses to start in bypass mode when it runs as root: on a
-machine where Dispatch's daemon runs as root — a container, many remote
-machines — every Claude pane and every delegated `claude -p` exits at once.
-Save another **Permissions** mode for Claude on that machine (`e`, then
-`s`), or, only when the machine really is a sandbox such as a container,
-set `IS_SANDBOX = "1"` in that machine's `claude.toml` under `[env]`, which
-Claude reads as permission to bypass.
-
-In the new-pane picker, `e` opens the highlighted harness's settings:
-
-| Key | Does |
+| File | Holds |
 |---|---|
-| `↑` `↓` | move between settings |
-| `←` `→` | step through a setting's values; `Space` flips one that is on or off |
-| `Enter` | open a pane with what is shown, saving nothing |
-| `s` | save what is shown as the harness's default |
-| `Esc` | back to the picker |
+| `config.toml` | keys, shell, motion, delegation caps |
+| `harnesses/*.toml` | one file per agent: how to launch it, its settings, its status rules; add a file to add an agent |
+| `harness-settings.toml` | the defaults you saved from the picker |
+| `projects.toml`, `machines.toml` | the projects and machines in the sidebar |
 
-A model that is not on the list is typed on the setting's **Custom…** value.
-**agent default** passes nothing, and the agent decides as its own
-configuration says. Beside each harness, the picker shows what you have saved
-that differs from its file.
+## How it works
 
-opencode takes its model from a variable its shared background service never
-sees, so an opencode pane with a chosen model runs a private opencode server
-of its own.
-
-Saved defaults live beside `config.toml`:
-
-```toml
-# ~/.config/dispatch/harness-settings.toml
-[claude]
-model = "opus"
-permissions = ""   # agent default: Claude asks, as it does outside Dispatch
-
-[codex]
-bypass = false     # Codex's prompts and sandbox are back
+```mermaid
+flowchart LR
+  UI["dispatch<br/>grid, sidebar, status rules"] <-->|local socket| D["dispatchd"]
+  UI <-->|ssh| R["dispatchd on another machine"]
+  D --> A1["agents in PTYs"]
+  R --> A2["agents in PTYs"]
 ```
 
-These are per machine: a subagent is started by the daemon on its own
-machine, so it follows that machine's saved defaults, not the file of the
-machine you are typing on, and not a one-off choice made in the pane that
-asked for it.
-
-A harness file says what its settings are, and how each becomes a flag, so a
-harness you add can have them as well:
-
-```toml
-# ~/.config/dispatch/harnesses/claude.toml
-[[settings]]
-key = "effort"
-label = "Effort"
-kind = "choice"                 # choice | text | bool
-options = ["low", "medium", "high", "xhigh", "max"]
-custom = false                  # true adds a typed value to a choice
-args = ["--effort", "{value}"]  # after the launch's own; nothing when unset
-# env = { NAME = "{value}" }    # or a variable
-
-[[settings]]
-key = "permissions"
-label = "Permissions"
-kind = "choice"
-options = ["bypassPermissions", "auto", "acceptEdits", "plan", "manual"]
-default = "bypassPermissions"
-args = ["--permission-mode", "{value}"]
-```
-
-An option can be a table instead, to show a clean name, and one choice can
-limit another. While a model is chosen, a setting `limited_by` the model
-offers only the values that model lists for it, and moves to the highest of
-them when the one set is not among them. A model that lists none fades the
-row out, and passes nothing for it. A model typed in by hand leaves it free.
-
-```toml
-# ~/.config/dispatch/harnesses/agy.toml
-[[settings]]
-key = "model"
-label = "Model"
-kind = "choice"
-options = [
-  { value = "gemini-3.1-pro", label = "Gemini 3.1 Pro", effort = ["low", "high"] },
-  { value = "claude-sonnet-4-6", label = "Claude Sonnet 4.6" },  # no effort
-]
-custom = true
-args = ["--model", "{value}"]
-
-[[settings]]
-key = "effort"
-label = "Effort"
-kind = "choice"
-limited_by = "model"
-options = [{ value = "low", label = "Low" }, { value = "high", label = "High" }]
-args = ["--effort", "{value}"]
-```
-
-A `bool` adds its `args` when it is on. A value may hold only letters, digits
-and `. _ : / @ # + -`, and may not start with `-`: on Windows it sits on
-`cmd.exe`'s command line. The daemon reads harness files when it starts, so
-restart it after editing one, and after upgrading Dispatch too: a daemon
-started before this release ignores the settings a newer client sends, and
-keeps the harness files it already loaded.
-
-A harness file you have edited is left as it is when Dispatch upgrades: it
-keeps its prompts and offers no settings until you delete it (Dispatch
-writes the current one back on its next start) or add `[[settings]]` to it
-yourself.
-
-## The sidebar
-
-The project list is framed on the left. It is a tree: each project carries a
-twisty, and so does any pane running subagents. Clicking a project's row moves
-the view to it and folds its panes away; clicking a pane's twisty folds its
-subagents, and clicking anywhere else on a pane's row focuses it. `^a f` folds
-from the keyboard, for a terminal with no mouse reporting: the focused pane's
-subagents, or the project above it when that pane has none. The project
-the grid is showing is highlighted across the full width of the row.
-
-A row is marked on both sides. On the left, a project shows a folder -- open
-while you are looking inside it, shut while its panes are folded away or it has
-none -- with a git mark beside it when its root is a repository. A pane shows
-the icon of the harness running in it -- the `icon` key in that harness's TOML, so a harness you
-register yourself can have one too. On the right, one glyph says what the pane
-is doing, read off its terminal as it runs:
-
-| Glyph | The pane is |
-|---|---|
-| a spinner | working: output is arriving, or its rules say it is busy |
-| a faded pause | idle: waiting for you to give it something |
-| a yellow warning | blocked: waiting on a decision only you can make, such as a permission prompt |
-| an accent check-circle | done: it finished while you were looking elsewhere |
-| an hourglass | starting |
-| a faded check, a red cross | exited cleanly, exited badly |
-| a faded ban | closed, and still listed for the sake of a subagent under it |
-
-A pane is marked done when it goes from working to idle, or rings the bell,
-while another pane has the focus; its row pulses, as does one that turns
-blocked out of sight. The mark stays until you look: focusing the pane clears
-it. Nothing is marked in a pane's first three seconds, so reattaching to a
-daemon, which replays every pane's recent output, does not bring them all
-back done. A subagent reads as working from the moment it starts until it
-exits, unless it is blocked: its one-shot task prints little before its
-answer, and quiet is not finished.
-
-A folded project's row carries the most urgent state among its panes --
-blocked, then done, then working -- and each tab is prefixed the same way, so
-a pane that needs you shows from anywhere. The status row counts the blocked
-panes too: `2 waiting on you`.
-
-Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
-terminal it runs in.
-
-## Status rules
-
-A pane's state comes from its terminal: output arriving means it is working,
-and quiet means idle -- though not the echo of your own typing, or its repaint
-after a resize. Each harness's rules recognise what activity alone cannot -- a
-spinner in the title, a permission prompt. `claude`, `codex`, `opencode` and
-`agy` have rules built in, adapted from
-[herdr](https://github.com/ogulcancelik/herdr)'s detection manifests. A
-harness's own TOML can carry its own:
-
-```toml
-# ~/.config/dispatch/harnesses/claude.toml
-# Claude Code's permission prompt: the question, with a numbered yes under it.
-[[status.rules]]
-state = "blocked"
-region = "bottom:15"
-contains = ["do you want to proceed?"]
-regex = ['(?i)^\s*❯?\s*1\.\s*yes\b']
-priority = 990
-```
-
-- `state` is `working`, `idle` or `blocked`.
-- `region` is where to look: `title`, the title the program last set, spinner
-  and all; `progress`, its last `OSC 9;4` progress report, after the `9;`;
-  `bottom:N`, the last N non-blank lines of the screen; or `screen`, all of it.
-- `contains` must all appear, `any` at least one, and `not` none; all three
-  ignore case. `regex` must match some line of the region, and is
-  case-sensitive unless it says `(?i)`. A rule needs at least one of
-  `contains`, `any` or `regex`.
-- `priority` orders the rules, highest first, ties in file order, and the
-  first that matches decides. An `idle` rule does not outrank output still
-  arriving.
-
-A harness's own `[status]` replaces the built-ins for it rather than adding to
-them, so start from a copy of them in
-`crates/dispatch-config/src/status/builtin.rs`. `[status]` with `rules = []`
-means activity alone decides; with no `[status]` at all, the built-ins for its
-id apply, and a harness with none goes by activity alone. A rule with an
-unknown state or region, a regex that does not compile, or nothing to match on
-is logged and skipped, and the harness loads without it.
-
-## Motion
-
-Working panes spin, a pane that wants you pulses its row, focus eases from one
-border to the next, a new pane draws its border in and a closed one retracts
-it, and the active tab's tint slides across. To keep the screen still:
-
-```toml
-# ~/.config/dispatch/config.toml
-[interface]
-motion = false   # default true
-```
-
-Every change then shows at once, a working pane shows a still play glyph, and
-nothing pulses; every state is still shown.
-
-## Keeping projects
-
-The sidebar is the list of projects you keep, not the one directory Dispatch
-was started in. Opening Dispatch in a directory adds it to that list, and it is
-there on every later start, whichever directory you started in. The list lives
-in `projects.toml` beside the rest of the configuration.
-
-Beside it, and beside `machines.toml`, a change leaves an empty
-`projects.toml.lock` or `machines.toml.lock`: the lock two Dispatches take in
-turn to change the list. It is safe to ignore; delete one only while no
-Dispatch is running, or two of them can each take a lock of their own and
-write over each other.
-
-`^a o` opens a directory browser: arrows walk it, `→` steps into a directory
-and `←` back out, typing filters the listing, and a typed path with a `/` in it
-is read as a path instead -- Tab completes it. `^g` lists every git repository
-under the current directory, three levels deep, so a directory of checkouts
-answers in one keystroke. `Enter` opens what is highlighted, or the path you
-typed, as a project.
-
-`^a p` opens the list; `d` on a row drops that project for good. A project with
-panes is not dropped -- close them first, or its agents would carry on running
-with no row left to reach them by. Attached, the daemon is asked to forget it
-too, since it is the daemon that hands a client its projects on every connect.
-
-Nothing scans your disk, and nothing is kept that you did not open.
-
-## More than one machine
-
-Register a machine once, and every Dispatch after that reaches it over ssh:
-
-```sh
-dispatch machine add me@tower          # dials it first; saved only if it answers
-dispatch machine add gpu-box --name gpu
-dispatch machine list
-dispatch machine remove gpu            # its daemon and agents keep running
-```
-
-The machine needs `dispatchd` on its `PATH`; nothing is copied to it. Dispatch
-runs `ssh -T -o BatchMode=yes -o ConnectTimeout=10 <target> dispatchd --stdio`,
-so ssh never prompts: run `ssh <target>` once by hand first to accept its host
-key, and use a key or an agent rather than a password. Anything else — a
-wrapper, a nix shell, a transport other than ssh — goes after `--`:
-
-```sh
-dispatch machine add gpu-box -- /opt/tools/tunnel gpu-box dispatchd --stdio
-```
-
-With any machine registered, `dispatch` attaches to its daemons on its own —
-this machine's included — and draws a row for each at once. Every project is
-drawn under the machine it is on. A machine that is asleep, or whose daemon
-has gone down since, stays in the sidebar — dimmed and labelled
-`unreachable` — and joins (or rejoins) when it answers again; keystrokes
-aimed at it are refused rather than swallowed. Its agents are not lost in the
-meantime: they belong to the daemon on that machine, not to the connection to
-it, so a dropped connection costs the view and nothing else, and the client
-redials until the panes are there again. `^a m` adds a machine without
-restarting. `^a o` asks which machine to open a project on; a remote one takes
-a typed path, such as `~/code/app`.
-
-`--daemon <endpoint>` and `--daemon-command "<command>"` still reach a daemon
-for one run without registering it. `--daemon-command` is split on
-whitespace, with no shell; a program whose path holds a space needs the
-registry.
-
-## Running the daemon
-
-Dispatch works on its own, with the agents as its children. Started that way,
-closing it closes them.
-
-`dispatchd` owns the agents instead, so they survive a client exiting. `--attach`
-starts one if none is listening, so the daemon stays an implementation detail:
-
-```sh
-dispatch --attach /path/to/project             # starts a daemon if needed
-dispatch --attach --no-start                   # or insist on one already there
-dispatchd /path/to/project                     # or run it yourself
-```
-
-A daemon a client starts is detached from that client's terminal: it keeps
-running when the client exits, and a Ctrl-C meant for the interface does not
-reach the agents. It records its process id in `dispatchd.pid` beside the socket,
-which is what to stop when you want it gone.
-
-Several clients can attach at once and see the same panes. Each pane takes the
-size of the window you used last: the one you typed or clicked in, resized, or
-opened most recently. The other windows show it at that size, with blank space
-around it or its edges cut off to fit their tile. A client attaching to a pane
-that is already running is replayed the last 256 KiB it printed, so reattaching
-shows the work rather than a blank rectangle.
-
-Moving the pointer over a window does not count as using it, so a forgotten
-window cannot resize every agent as the pointer crosses it. To have the window
-under the pointer take the panes instead:
-
-```toml
-# ~/.config/dispatch/config.toml
-[interface]
-hover_claims_panes = true
-```
-
-An attached client reconnects on its own: restart the daemon, or lose the socket,
-and it waits, says so, and rebuilds its view from what the daemon reports when it
-answers again. A connection that goes quiet is asked whether it is still there,
-so a socket that is up but carrying nothing is noticed rather than waited on.
-
-The daemon runs in the foreground and logs to a file. Projects given on its
-command line are served immediately; an attached client opens more over the
-socket. One daemon per configuration directory: a second refuses to start rather
-than splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops
-it and terminates its panes. `DISPATCH_CONFIG_DIR` gives a separate daemon its
-own endpoint, harnesses, and log.
-
-## Delegation
-
-An agent in a pane can ask for a second agent to work on something:
-
-```sh
-dispatch delegate "write the tests for the http client"
-```
-
-Dispatch asks you first, every time — unless you have approved that pane
-wholesale with `A`, which lasts until the daemon stops. The subagent runs as a
-pane under the one that asked, and the caller gets its output and exit code when
-it finishes. Focus stays where it was: open the subagent with `Ctrl p s` (or
-`^a s`) to watch it.
-
-Delegation needs two things. The daemon must own the panes (`--attach`), because
-it is what starts the subagent; and the harness must declare a non-interactive
-form, since an interactive agent never exits:
-
-```toml
-# ~/.config/dispatch/harnesses/claude.toml
-[task]
-args = ["-p", "{task}"]
-
-# cmd.exe would run the task's & and % as commands, so on Windows the task
-# is written to a file and redirected into the agent's standard input.
-[task.platform.windows]
-args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
-input = "file"
-```
-
-`claude` and `codex` ship with one. A subagent starts on the daemon's own
-machine and follows that machine's saved settings, auto-approve included,
-so it can use its tools without waiting on a prompt nobody would see —
-not a one-off choice made in the pane that asked for it, and not another
-machine's saved file. On Windows the
-daemon refuses a form that would put the task on `cmd.exe`'s
-command line, and says which file to fix. Caps live in `config.toml`,
-and refuse rather than prompt:
-
-```toml
-[delegation]
-max_depth = 1              # a subagent cannot delegate
-max_live_per_parent = 4
-request_timeout_secs = 600 # no value disables this; 0 refuses on the next tick
-```
-
-There is deliberately no way to turn the deadline off: an agent on an unattended
-daemon would otherwise wait for a person who is not there. To wait longer, raise
-the number.
-
-The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
-from that pane for this daemon's lifetime, and `Esc` to defer. The status line
-reports how many are waiting and which key reopens them — that key is `^a a`,
-or wherever `[keys]` has moved it.
-
-There are also keyboard bindings to open and close a subagent pane: `^a s` expands
-the focused pane's next child into the tiled grid, and `^a c` collapses it back out.
-
-The subagent's output goes to stdout and every status line to stderr, so
-`dispatch delegate "…" > result.md` captures the work and nothing else. Fan-out
-needs no feature: the agent's own shell does it:
-
-```sh
-dispatch delegate "write the tests" > tests.md &
-dispatch delegate "write the docs"  > docs.md  &
-wait
-```
-
-Exit codes follow `sysexits(3)` so an agent can branch without parsing prose.
-Dispatch's own codes (69, 75, 77, 78) sit inside the same 0–125 band a subagent's
-own exit code comes from, so a subagent that exits 78 is indistinguishable from a
-refusal. An agent branching on exit codes should keep that in mind.
-
-| Code | Meaning |
-|---|---|
-| 0–125 | the subagent's own exit code |
-| 69 | no daemon is listening |
-| 75 | timed out, or the connection dropped, or the daemon does not know the asking pane, or the subagent was stopped before it finished |
-| 77 | denied by the user |
-| 78 | refused: caps, or the harness has no `[task]` form |
+Each pane is a real terminal, emulated with Ghostty's vendored `libghostty-vt`. The client reads every pane's screen and title with per-agent rules (adapted from [herdr](https://github.com/ogulcancelik/herdr)) to spot spinners and permission prompts. Crate-by-crate layout: [docs/building.md](docs/building.md).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for attribution of
-vendored and derived code.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for vendored and derived code.
