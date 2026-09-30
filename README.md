@@ -4,7 +4,7 @@
 
 **Run several coding agents side by side, and see which one needs you.**
 
-[![CI](https://github.com/namelessmonarch0/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/namelessmonarch0/Dispatch/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)](LICENSE)
+[![CI](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)](LICENSE)
 
 [Install](#install) · [Usage](#usage) · [Docs](docs/usage.md)
 
@@ -28,7 +28,7 @@ Dispatch is a terminal interface for Claude Code, Codex, agy, opencode, or your 
 You need Rust 1.89+, [Zig 0.16.0](https://ziglang.org/download/) (it builds the vendored `libghostty-vt` terminal engine; set `ZIG` if the `zig` on your `PATH` is another version), a [Nerd Font](https://www.nerdfonts.com/) in your terminal, and at least one of `claude`, `codex`, `agy` or `opencode` on your `PATH` (your shell works without any). Offline, Windows and contributor builds are in [docs/building.md](docs/building.md).
 
 ```sh
-git clone https://github.com/namelessmonarch0/Dispatch.git && cd Dispatch
+git clone https://github.com/kudayyurter/Dispatch.git && cd Dispatch
 cargo build --release    # the first build fetches Zig packages, so it needs network
 ```
 
