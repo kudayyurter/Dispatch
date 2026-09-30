@@ -327,9 +327,11 @@ enum MenuAction {
     NewPaneIn(ProjectId),
     FoldProject(ProjectId),
     RemoveProject(ProjectId),
-    RenameTab(usize),
-    MoveTab(usize, isize),
-    CloseTab(usize),
+    /// A tab by its place on the row and, when the project keeps them, its
+    /// id: the row may have changed since the menu opened.
+    RenameTab(usize, Option<TabId>),
+    MoveTab(usize, Option<TabId>, isize),
+    CloseTab(usize, Option<TabId>),
 }
 
 /// What has the keyboard, so a keystroke meant for an agent — or an approval
@@ -3406,37 +3408,62 @@ impl App {
     /// Opens the menu for the tab at `index` at `anchor`, changing nothing
     /// else.
     fn open_tab_menu(&mut self, index: usize, anchor: (u16, u16)) {
-        let count = self.tab_count();
-        if index >= count {
+        let views = self.tab_views();
+        let count = views.len();
+        let Some(id) = views.get(index).map(|view| view.id) else {
             return;
-        }
+        };
         let items = vec![
             self.menu_item(
                 "Rename",
                 Some(Command::RenameTab),
-                MenuAction::RenameTab(index),
+                MenuAction::RenameTab(index, id),
                 true,
             ),
             self.menu_item(
                 "Move left",
                 Some(Command::MoveTabLeft),
-                MenuAction::MoveTab(index, -1),
+                MenuAction::MoveTab(index, id, -1),
                 index > 0,
             ),
             self.menu_item(
                 "Move right",
                 Some(Command::MoveTabRight),
-                MenuAction::MoveTab(index, 1),
+                MenuAction::MoveTab(index, id, 1),
                 index + 1 < count,
             ),
             self.menu_item(
                 "Close tab",
                 Some(Command::CloseTab),
-                MenuAction::CloseTab(index),
+                MenuAction::CloseTab(index, id),
                 true,
             ),
         ];
         self.overlay = Some(Overlay::Menu(Menu::new(items, anchor)));
+    }
+
+    /// Brings a menu's pane into view and gives it the focus, which may mean
+    /// selecting its project. Says whether it is the focus now: a pane that
+    /// closed while the menu was open is not, and nothing then acts on
+    /// whichever pane is.
+    fn go_to_menu_pane(&mut self, id: PaneId) -> bool {
+        self.go_to_pane(id);
+        if self.state.focused_pane() == Some(id) {
+            return true;
+        }
+        self.status = "that pane is gone".into();
+        false
+    }
+
+    /// Shows a menu's tab, if the tab at `index` is still the one it was
+    /// opened on. `select_tab` would wrap a stale index to the first tab.
+    fn select_menu_tab(&mut self, index: usize, id: Option<TabId>) -> bool {
+        if self.tab_views().get(index).map(|view| view.id) != Some(id) {
+            self.status = "that tab is gone".into();
+            return false;
+        }
+        self.select_tab(index);
+        true
     }
 
     /// Closes the menu and does what its chosen item says, by giving its
@@ -3445,7 +3472,9 @@ impl App {
         self.overlay = None;
         match action {
             MenuAction::ZoomPane(id) => {
-                self.focus_pane(id);
+                if !self.go_to_menu_pane(id) {
+                    return;
+                }
                 // Another pane being zoomed would be restored by the toggle
                 // instead of this one being zoomed.
                 if self.state.zoomed_pane().is_some_and(|zoomed| zoomed != id) {
@@ -3454,8 +3483,9 @@ impl App {
                 self.state.toggle_zoom();
             }
             MenuAction::MovePane(id, by) => {
-                self.focus_pane(id);
-                self.move_focused_pane(by);
+                if self.go_to_menu_pane(id) {
+                    self.move_focused_pane(by);
+                }
             }
             MenuAction::ClosePane(id) => self.close_pane(id),
             MenuAction::NewPaneIn(project) => {
@@ -3467,17 +3497,20 @@ impl App {
                 self.state.toggle_project_collapsed(project);
             }
             MenuAction::RemoveProject(project) => self.drop_project(project),
-            MenuAction::RenameTab(index) => {
-                self.select_tab(index);
-                self.open_rename_tab();
+            MenuAction::RenameTab(index, id) => {
+                if self.select_menu_tab(index, id) {
+                    self.open_rename_tab();
+                }
             }
-            MenuAction::MoveTab(index, by) => {
-                self.select_tab(index);
-                self.move_current_tab(by);
+            MenuAction::MoveTab(index, id, by) => {
+                if self.select_menu_tab(index, id) {
+                    self.move_current_tab(by);
+                }
             }
-            MenuAction::CloseTab(index) => {
-                self.select_tab(index);
-                self.open_close_tab();
+            MenuAction::CloseTab(index, id) => {
+                if self.select_menu_tab(index, id) {
+                    self.open_close_tab();
+                }
             }
         }
         if self.overlay.is_none() {
@@ -15543,5 +15576,60 @@ args = ["--effort", "{value}"]
                 .all(|project| project.id != second),
             "an empty project is dropped, as the picker's d drops it"
         );
+    }
+
+    #[test]
+    fn a_pane_menu_outlives_its_pane_without_acting_on_another() {
+        let (mut app, mut terminal, _first, parent, child) = app_with_a_drawn_sidebar();
+        app.focus_pane(parent);
+        app.open_pane_menu(child, (8, 5));
+        drawn(&mut app, &mut terminal);
+        app.close_pane(child);
+        let focus = app.state.focused_pane();
+
+        app.choose_menu(MenuAction::ZoomPane(child));
+        assert_eq!(app.state.zoomed_pane(), None, "nothing was zoomed");
+        assert_eq!(
+            app.state.focused_pane(),
+            focus,
+            "and the focus did not move"
+        );
+    }
+
+    #[test]
+    fn a_pane_menu_on_an_unselected_projects_pane_zooms_that_pane() {
+        let (mut app, mut terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+        let second = app.state.projects()[1].id;
+        let other = app
+            .state
+            .spawn_pane(second, HarnessId::new("shell"))
+            .expect("the project exists");
+        app.select_project(first);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.state.selected_project(), Some(first));
+
+        app.open_pane_menu(other, (8, 5));
+        app.choose_menu(MenuAction::ZoomPane(other));
+        assert_eq!(app.state.selected_project(), Some(second));
+        assert_eq!(app.state.zoomed_pane(), Some(other));
+    }
+
+    #[test]
+    fn a_tab_menu_outlives_its_tab_without_acting_on_the_first() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&[panes[0]], &[panes[1]]]);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        app.open_tab_menu(1, (8, 1));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("a menu is open");
+        };
+        let rename = menu.items()[0].action;
+
+        send_tabs(&mut app, &daemon, project, &[&[panes[0]]]);
+        drawn(&mut app, &mut terminal);
+        app.choose_menu(rename);
+        assert!(app.overlay.is_none(), "no prompt opened for tab 0");
     }
 }
