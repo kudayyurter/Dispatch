@@ -8,7 +8,7 @@
 
 [Install](#install) · [Usage](#usage) · [Docs](docs/usage.md)
 
-<img src=".github/assets/demo.gif" alt="Dispatch with four panes: one agent done, one blocked on a permission prompt until it is answered, one working, and a shell, with a sidebar marking each pane's state" width="880">
+<img src=".github/assets/demo.gif" alt="Dispatch working on its own repo: Claude Code waits on a permission prompt to run the tests while Codex explains how Dispatch spots a blocked pane; Codex is marked done, the prompt is approved, and Claude reports all 14 tests passing, with the sidebar marking each pane's state" width="880">
 
 </div>
 
