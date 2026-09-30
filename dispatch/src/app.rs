@@ -2921,12 +2921,12 @@ impl App {
                         last: (mouse.column, mouse.row),
                         ..gesture
                     });
-                    self.drag_gesture(gesture.owner, mouse);
+                    self.drag_gesture(gesture, mouse);
                     return true;
                 }
                 MouseEventKind::Up(button) if button == gesture.button => {
                     self.gesture = None;
-                    self.release_gesture(gesture.owner, mouse);
+                    self.release_gesture(gesture, mouse);
                     return true;
                 }
                 // Anything else mid-gesture is noise from a terminal that
@@ -2964,6 +2964,14 @@ impl App {
                 owner: target,
                 button,
                 last: (mouse.column, mouse.row),
+                rect: match target {
+                    pointer::Target::PaneContent(id) => self
+                        .layout
+                        .iter()
+                        .find(|(pane, _)| *pane == id)
+                        .map(|(_, rect)| *rect),
+                    _ => None,
+                },
             });
             self.pressed_sidebar = None;
             if button == MouseButton::Left {
@@ -3024,10 +3032,13 @@ impl App {
     }
 
     /// A held press moved: what its owner does with the motion.
-    fn drag_gesture(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
-        match owner {
+    fn drag_gesture(&mut self, gesture: pointer::Gesture, mouse: &MouseEvent) {
+        match gesture.owner {
             // The sidebar's right edge is a handle: pressed, dragged, let go.
-            pointer::Target::SidebarEdge => {
+            // Only the left button moves it, like every Dispatch control.
+            pointer::Target::SidebarEdge
+                if gesture.button == crossterm::event::MouseButton::Left =>
+            {
                 use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
                 self.sidebar_width = (mouse.column + 1)
                     .saturating_sub(self.sidebar_area.x)
@@ -3035,6 +3046,7 @@ impl App {
             }
             pointer::Target::PaneContent(id) => self.send_mouse_to(
                 id,
+                gesture.rect,
                 (mouse.column, mouse.row),
                 dispatch_pty::MouseAction::Motion,
                 mouse.kind,
@@ -3045,11 +3057,17 @@ impl App {
     }
 
     /// A held press was let go: what its owner does with the release.
-    fn release_gesture(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+    fn release_gesture(&mut self, gesture: pointer::Gesture, mouse: &MouseEvent) {
+        let owner = gesture.owner;
         match owner {
-            pointer::Target::SidebarEdge => self.save_ui(),
+            pointer::Target::SidebarEdge => {
+                if gesture.button == crossterm::event::MouseButton::Left {
+                    self.save_ui();
+                }
+            }
             pointer::Target::PaneContent(id) => self.send_mouse_to(
                 id,
+                gesture.rect,
                 (mouse.column, mouse.row),
                 dispatch_pty::MouseAction::Release,
                 mouse.kind,
@@ -3125,19 +3143,23 @@ impl App {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
+        // Any pane still alive is sent its release, in or out of the grid: the
+        // rectangle it was pressed in stands in for one it no longer has.
         if let pointer::Target::PaneContent(id) = gesture.owner
             && self.panes.contains_key(&id)
-            && self.layout.iter().any(|(pane, _)| *pane == id)
         {
             self.send_mouse_to(
                 id,
+                gesture.rect,
                 gesture.last,
                 dispatch_pty::MouseAction::Release,
                 MouseEventKind::Up(gesture.button),
                 KeyModifiers::NONE,
             );
         }
-        if gesture.owner == pointer::Target::SidebarEdge {
+        if gesture.owner == pointer::Target::SidebarEdge
+            && gesture.button == crossterm::event::MouseButton::Left
+        {
             self.save_ui();
         }
     }
@@ -3147,6 +3169,7 @@ impl App {
     fn send_mouse_to(
         &mut self,
         id: PaneId,
+        pressed_in: Option<Rect>,
         at: (u16, u16),
         action: dispatch_pty::MouseAction,
         kind: MouseEventKind,
@@ -3161,7 +3184,13 @@ impl App {
         else {
             return;
         };
-        let Some(&(_, rect)) = self.layout.iter().find(|(pane, _)| *pane == id) else {
+        let Some(rect) = self
+            .layout
+            .iter()
+            .find(|(pane, _)| *pane == id)
+            .map(|(_, rect)| *rect)
+            .or(pressed_in)
+        else {
             return;
         };
         let button = match button {
@@ -8930,9 +8959,16 @@ mod tests {
     fn a_control_acts_on_release_inside_it_and_not_when_the_pointer_slides_off() {
         let (mut app, terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
         let second = app.state.projects()[1].id;
+        let row = sidebar_row_of(&terminal, "second");
         use crossterm::event::MouseButton::Left;
 
-        mouse_at(&mut app, MouseEventKind::Down(Left), 8, 2);
+        // The press alone, and a press let go elsewhere, change nothing.
+        mouse_at(&mut app, MouseEventKind::Down(Left), 8, row);
+        assert_eq!(
+            app.state.selected_project(),
+            Some(first),
+            "a press alone does not act"
+        );
         mouse_at(&mut app, MouseEventKind::Up(Left), 8, 20);
         assert_eq!(
             app.state.selected_project(),
@@ -8940,9 +8976,63 @@ mod tests {
             "slid off: nothing happened"
         );
 
-        let row = sidebar_row_of(&terminal, "second");
         click(&mut app, 8, row);
         assert_eq!(app.state.selected_project(), Some(second));
+    }
+
+    #[test]
+    fn the_other_buttons_on_the_sidebar_edge_do_not_resize_it() {
+        let (mut app, _terminal, _first, _parent, _child) = app_with_a_drawn_sidebar();
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        let width = app.sidebar_width;
+        for button in [
+            crossterm::event::MouseButton::Right,
+            crossterm::event::MouseButton::Middle,
+        ] {
+            mouse_at(&mut app, MouseEventKind::Down(button), edge, 5);
+            mouse_at(&mut app, MouseEventKind::Drag(button), edge + 10, 5);
+            mouse_at(&mut app, MouseEventKind::Up(button), edge + 10, 5);
+            assert_eq!(app.sidebar_width, width, "{button:?} does not resize");
+        }
+        use crossterm::event::MouseButton::Left;
+        mouse_at(&mut app, MouseEventKind::Down(Left), edge, 5);
+        mouse_at(&mut app, MouseEventKind::Drag(Left), edge + 6, 5);
+        mouse_at(&mut app, MouseEventKind::Up(Left), edge + 6, 5);
+        assert_eq!(app.sidebar_width, width + 6, "the left button still does");
+    }
+
+    #[test]
+    fn a_pane_that_leaves_the_grid_still_gets_its_release() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        track_mouse(&mut app, &daemon, panes[0]);
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let (ax, ay) = middle_of(&app, panes[0]);
+        use crossterm::event::MouseButton::Left;
+        mouse_at(&mut app, MouseEventKind::Down(Left), ax, ay);
+        drain(&sent);
+
+        app.select_tab(1);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        let writes = writes_by_pane(&sent);
+        assert_eq!(
+            writes.get(&panes[0]).map(Vec::len),
+            Some(1),
+            "exactly one release"
+        );
+        assert!(app.gesture.is_none());
     }
 
     #[test]

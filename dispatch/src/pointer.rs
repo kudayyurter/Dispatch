@@ -161,6 +161,9 @@ pub struct Gesture {
     pub button: MouseButton,
     /// Where the pointer last was, for a release sent on its behalf.
     pub last: (u16, u16),
+    /// The owner pane's interior when it was pressed, so a release can still
+    /// be addressed to a pane that has since left the grid.
+    pub rect: Option<Rect>,
 }
 
 #[cfg(test)]
