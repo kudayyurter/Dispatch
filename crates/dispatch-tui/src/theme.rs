@@ -6,7 +6,7 @@
 //! mixes everything else from those three; a terminal that does not answer
 //! gets a built-in dark palette in the same spirit.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 /// A colour as three 8-bit channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +142,77 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::fallback()
+    }
+}
+
+/// The colours every dialog is drawn in, so a picker, a prompt and the
+/// settings form read as one interface rather than four.
+///
+/// Only decoration: a colour that means something — an error's red, a state
+/// glyph's — stays its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chrome {
+    /// A highlighted row: the tint behind the palette's text, bold.
+    pub selection: Style,
+    /// What has the keyboard: a caret, the path being browsed.
+    pub accent: Style,
+    /// A dialog's frame and the hint on it.
+    pub border: Style,
+    /// Detail after a label, text for an empty list, hints inside a dialog.
+    pub secondary: Style,
+    /// Text drawn on the tint.
+    pub text: Style,
+}
+
+impl Theme {
+    /// The dialog colours this theme draws.
+    #[must_use]
+    pub fn chrome(&self) -> Chrome {
+        Chrome {
+            selection: Style::default()
+                .bg(self.tint)
+                .fg(self.text)
+                .add_modifier(Modifier::BOLD),
+            accent: Style::default().fg(self.accent),
+            border: Style::default().fg(self.faded),
+            secondary: Style::default().fg(self.faded),
+            text: Style::default().fg(self.text),
+        }
+    }
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Theme::fallback().chrome()
+    }
+}
+
+/// A chrome no widget could arrive at by accident, for asserting that a
+/// widget draws in the chrome it was given.
+#[cfg(test)]
+pub(crate) fn loud_chrome() -> Chrome {
+    let rgb = |n: u8| Color::Rgb(n, n.wrapping_add(1), n.wrapping_add(2));
+    Chrome {
+        selection: Style::default().bg(rgb(10)).fg(rgb(20)),
+        accent: Style::default().fg(rgb(30)),
+        border: Style::default().fg(rgb(40)),
+        secondary: Style::default().fg(rgb(50)),
+        text: Style::default().fg(rgb(60)),
+    }
+}
+
+/// Fails if any cell of `buf` is in one of the colours the dialogs used to
+/// hardcode.
+#[cfg(test)]
+pub(crate) fn assert_no_fixed_colours(buf: &ratatui::buffer::Buffer) {
+    for cell in buf.content() {
+        for colour in [cell.fg, cell.bg] {
+            assert!(
+                !matches!(colour, Color::Cyan | Color::Black | Color::DarkGray),
+                "a hardcoded {colour:?} at {:?}",
+                cell.symbol()
+            );
+        }
     }
 }
 

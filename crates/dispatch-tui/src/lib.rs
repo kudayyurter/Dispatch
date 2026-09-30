@@ -19,4 +19,4 @@ pub use picker::{Item, Picker};
 pub use prompt::{Note, Prompt};
 pub use settings_form::{FormAction, SettingsForm};
 pub use sidebar::{Sidebar, truncate};
-pub use theme::Theme;
+pub use theme::{Chrome, Theme};

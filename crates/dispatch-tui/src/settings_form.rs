@@ -11,12 +11,13 @@ use dispatch_config::{
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::picker::{centred, write};
+use crate::theme::Chrome;
 
 /// What a key in the popup asks of whoever holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,13 +217,8 @@ pub struct SettingsForm {
     rows: Vec<Row>,
     selected: usize,
     editing: Option<Edit>,
-    /// The frame's colour, set by whoever draws it so it matches the rest
-    /// of the interface.
-    border: Style,
-    /// The selected row.
-    highlight: Style,
-    /// The arrows and the hint.
-    faded: Style,
+    /// The dialog colours, set by whoever draws the overlay.
+    chrome: Chrome,
 }
 
 impl SettingsForm {
@@ -247,9 +243,7 @@ impl SettingsForm {
             rows,
             selected: 0,
             editing: None,
-            border: Style::default().fg(Color::Cyan),
-            highlight: Style::default().bg(Color::DarkGray),
-            faded: Style::default().fg(Color::DarkGray),
+            chrome: Chrome::default(),
         };
         form.refit();
         if form
@@ -262,16 +256,9 @@ impl SettingsForm {
         form
     }
 
-    /// Draws the frame in `style`.
-    pub fn set_border(&mut self, style: Style) {
-        self.border = style;
-    }
-
-    /// Draws the selected row in `highlight`, and the arrows and hint in
-    /// `faded`.
-    pub fn set_styles(&mut self, highlight: Style, faded: Style) {
-        self.highlight = highlight;
-        self.faded = faded;
+    /// Draws in `chrome`.
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.chrome = chrome;
     }
 
     /// Every row's value, by key: what opening or saving uses.
@@ -575,8 +562,8 @@ impl Widget for &SettingsForm {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
-            .title_bottom(Line::styled(format!(" {hint} "), self.faded).right_aligned())
-            .border_style(self.border);
+            .title_bottom(Line::styled(format!(" {hint} "), self.chrome.secondary).right_aligned())
+            .border_style(self.chrome.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 
@@ -589,7 +576,7 @@ impl Widget for &SettingsForm {
             let y = inner.y + u16::try_from(index).unwrap_or(0);
             let chosen = index == self.selected;
             let base = if chosen {
-                self.highlight
+                self.chrome.selection
             } else {
                 Style::default()
             };
@@ -606,7 +593,7 @@ impl Widget for &SettingsForm {
             }
 
             if row.allowed == Allowed::Unavailable {
-                let faded = base.patch(self.faded);
+                let faded = base.patch(self.chrome.secondary);
                 write(buf, inner, inner.x + 1, y, &row.label, faded);
                 write(buf, inner, value_x + 2, y, NOT_AVAILABLE, faded);
                 continue;
@@ -618,7 +605,7 @@ impl Widget for &SettingsForm {
                 (Some(edit), true, _) => format!("Custom: {}▏", edit.text),
                 _ => row.shown(),
             };
-            let arrows = base.patch(self.faded);
+            let arrows = base.patch(self.chrome.secondary);
             let x = write(buf, inner, value_x, y, "◂ ", arrows);
             let x = write(buf, inner, x, y, &shown, base);
             write(buf, inner, x, y, " ▸", arrows);

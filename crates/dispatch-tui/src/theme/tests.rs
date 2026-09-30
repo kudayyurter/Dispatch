@@ -196,3 +196,17 @@ fn the_pulse_colour_is_the_background_most_of_the_way_to_the_accent() {
     );
     assert_eq!(theme.rgb(Role::Background), palette.background);
 }
+
+#[test]
+fn chrome_is_drawn_from_the_theme() {
+    let theme = Theme::fallback();
+    let chrome = theme.chrome();
+
+    assert_eq!(chrome.selection.bg, Some(theme.tint));
+    assert_eq!(chrome.selection.fg, Some(theme.text));
+    assert_eq!(chrome.accent.fg, Some(theme.accent));
+    assert_eq!(chrome.border.fg, Some(theme.faded));
+    assert_eq!(chrome.secondary.fg, Some(theme.faded));
+    assert_eq!(chrome.text.fg, Some(theme.text));
+    assert_eq!(Chrome::default(), chrome);
+}

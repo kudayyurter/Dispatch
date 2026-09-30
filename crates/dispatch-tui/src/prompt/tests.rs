@@ -128,3 +128,19 @@ fn a_note_wraps_between_words_and_never_inside_a_character() {
     // `…` is three bytes; a cut at it must land on its edge.
     assert_eq!(wrap("ab…cd", 2), ("ab", Some("…cd")));
 }
+
+#[test]
+fn the_prompt_draws_only_in_its_chrome() {
+    let mut prompt = Prompt::new("Open on laptop", "a path on that machine");
+    prompt.set_note(Some(Note::Error("no such directory".into())));
+    prompt.set_chrome(crate::theme::loud_chrome());
+    let area = Rect::new(0, 0, 60, 12);
+    let mut buf = Buffer::empty(area);
+    (&prompt).render(area, &mut buf);
+
+    crate::theme::assert_no_fixed_colours(&buf);
+    assert!(
+        buf.content().iter().any(|cell| cell.fg == Color::Red),
+        "an error keeps its red: it means something"
+    );
+}

@@ -402,14 +402,9 @@ fn the_row_the_user_is_on_is_highlighted() {
     let beta = row_of("beta").expect("beta has a row");
     let alpha = row_of("alpha").expect("alpha has a row");
 
-    let reversed = |y: u16| {
-        (0..area.width).any(|x| {
-            buf.cell((x, y))
-                .expect("cell exists")
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        })
-    };
+    let bar = crate::theme::Chrome::default().selection.bg;
+    let reversed =
+        |y: u16| (0..area.width).any(|x| Some(buf.cell((x, y)).expect("cell exists").bg) == bar);
 
     assert!(reversed(beta), "the selected row is marked");
     assert!(!reversed(alpha), "and the others are not");
@@ -448,4 +443,16 @@ fn a_path_too_long_to_show_keeps_its_end() {
         header.contains(&tail),
         "{header:?} keeps the end of the path"
     );
+}
+
+#[test]
+fn the_browser_draws_only_in_its_chrome() {
+    let tree = Tree::new("chrome", &["alpha", "beta+git"]);
+    let mut browser = Browser::new(tree.path());
+    browser.set_chrome(crate::theme::loud_chrome());
+    let area = Rect::new(0, 0, 60, 16);
+    let mut buf = Buffer::empty(area);
+    (&browser).render(area, &mut buf);
+
+    crate::theme::assert_no_fixed_colours(&buf);
 }

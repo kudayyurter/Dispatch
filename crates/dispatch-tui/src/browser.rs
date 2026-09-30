@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::sidebar::{REPOSITORY, SHUT_FOLDER};
+use crate::theme::Chrome;
 
 /// One directory on offer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,9 +60,8 @@ pub struct Browser {
     /// Whether the listing is a scan's findings rather than one directory's
     /// own children.
     scanning: bool,
-    /// The frame's colour, set by whoever draws the overlay so it matches
-    /// the rest of the interface.
-    border: Style,
+    /// The dialog colours, set by whoever draws the overlay.
+    chrome: Chrome,
 }
 
 impl Browser {
@@ -78,13 +78,13 @@ impl Browser {
             input: String::new(),
             selected: 0,
             scanning: false,
-            border: Style::default().fg(Color::Cyan),
+            chrome: Chrome::default(),
         }
     }
 
-    /// Draws the frame in `style`.
-    pub fn set_border(&mut self, style: Style) {
-        self.border = style;
+    /// Draws in `chrome`.
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.chrome = chrome;
     }
 
     /// Whether the listing is a scan's findings.
@@ -438,7 +438,7 @@ impl Widget for &Browser {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(TITLE)
-            .border_style(self.border);
+            .border_style(self.chrome.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 
@@ -458,7 +458,7 @@ impl Widget for &Browser {
         let label = u16::try_from(prefix.chars().count()).unwrap_or(0);
         let room = inner.width.saturating_sub(label) as usize;
 
-        let style = Style::default().fg(Color::Cyan);
+        let style = self.chrome.accent;
         write(buf, inner, inner.x, inner.y, prefix, style);
         write(
             buf,
@@ -488,7 +488,7 @@ impl Widget for &Browser {
         for (offset, entry) in visible.iter().skip(first).take(rows as usize).enumerate() {
             let y = inner.y + 2 + offset as u16;
             let style = if first + offset == self.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                self.chrome.selection
             } else {
                 Style::default()
             };
@@ -526,7 +526,7 @@ impl Widget for &Browser {
             inner.x,
             inner.y + inner.height - 1,
             KEYS,
-            Style::default().fg(Color::DarkGray),
+            self.chrome.secondary,
         );
     }
 }

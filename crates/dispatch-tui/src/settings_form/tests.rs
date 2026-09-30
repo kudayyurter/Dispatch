@@ -476,7 +476,7 @@ fn an_unavailable_row_reads_not_available_faded_and_is_skipped() {
     assert!(render(&form, 60, 8).contains(NOT_AVAILABLE));
     assert_eq!(
         style_of(&form, 60, 8, NOT_AVAILABLE).fg,
-        Some(Color::DarkGray),
+        crate::theme::Chrome::default().secondary.fg,
         "drawn faded"
     );
 
@@ -541,4 +541,15 @@ fn an_unavailable_first_row_is_not_selected_when_the_popup_opens() {
         1,
         "the model row, not the faded effort"
     );
+}
+
+#[test]
+fn the_settings_form_draws_only_in_its_chrome() {
+    let mut form = form();
+    form.set_chrome(crate::theme::loud_chrome());
+    let area = Rect::new(0, 0, 60, 12);
+    let mut buf = Buffer::empty(area);
+    (&form).render(area, &mut buf);
+
+    crate::theme::assert_no_fixed_colours(&buf);
 }

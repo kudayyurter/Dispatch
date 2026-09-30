@@ -10,6 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::picker::{centred, write};
+use crate::theme::Chrome;
 
 /// A line under the input saying what is happening, or what went wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,9 +28,8 @@ pub struct Prompt {
     hint: String,
     input: String,
     note: Option<Note>,
-    /// The frame's colour, set by whoever draws the overlay so it matches
-    /// the rest of the interface.
-    border: Style,
+    /// The dialog colours, set by whoever draws the overlay.
+    chrome: Chrome,
 }
 
 /// The narrowest a prompt is drawn, so a short title still leaves room to
@@ -45,13 +45,13 @@ impl Prompt {
             hint: hint.into(),
             input: String::new(),
             note: None,
-            border: Style::default().fg(Color::Cyan),
+            chrome: Chrome::default(),
         }
     }
 
-    /// Draws the frame in `style`.
-    pub fn set_border(&mut self, style: Style) {
-        self.border = style;
+    /// Draws in `chrome`.
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.chrome = chrome;
     }
 
     /// The same prompt with something already typed, for a default the user
@@ -162,7 +162,7 @@ impl Widget for &Prompt {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
-            .border_style(self.border);
+            .border_style(self.chrome.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 
@@ -175,23 +175,9 @@ impl Widget for &Prompt {
             .chars()
             .skip(count.saturating_sub(room))
             .collect();
-        let x = write(
-            buf,
-            inner,
-            inner.x,
-            inner.y,
-            "> ",
-            Style::default().fg(Color::Cyan),
-        );
+        let x = write(buf, inner, inner.x, inner.y, "> ", self.chrome.accent);
         let x = write(buf, inner, x, inner.y, &shown, Style::default());
-        write(
-            buf,
-            inner,
-            x,
-            inner.y,
-            "▏",
-            Style::default().fg(Color::Cyan),
-        );
+        write(buf, inner, x, inner.y, "▏", self.chrome.accent);
 
         write(
             buf,
@@ -199,7 +185,7 @@ impl Widget for &Prompt {
             inner.x,
             inner.y + 1,
             &self.hint,
-            Style::default().fg(Color::DarkGray),
+            self.chrome.secondary,
         );
 
         if let Some(((first, second), colour)) = lines {

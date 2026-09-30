@@ -20,6 +20,14 @@ fn render(picker: &Picker, width: u16, height: u16) -> Buffer {
     buf
 }
 
+/// The bar a chosen row is drawn on when nothing set the chrome.
+fn selection_bg() -> ratatui::style::Color {
+    crate::theme::Chrome::default()
+        .selection
+        .bg
+        .expect("a background")
+}
+
 fn text(buf: &Buffer) -> String {
     (0..buf.area.height)
         .map(|y| {
@@ -106,7 +114,7 @@ fn the_selected_row_is_highlighted_across_its_width() {
         .expect("the first label is drawn");
 
     let highlighted = (1..buf.area.width - 1)
-        .filter(|x| buf.cell((*x, row)).expect("cell exists").bg == Color::Cyan)
+        .filter(|x| buf.cell((*x, row)).expect("cell exists").bg == selection_bg())
         .count();
 
     assert!(
@@ -134,7 +142,7 @@ fn an_unselected_row_is_not_highlighted() {
 
     assert_ne!(
         buf.cell((2, row)).expect("cell exists").bg,
-        Color::Cyan,
+        selection_bg(),
         "only the selected row should be highlighted"
     );
 }
@@ -247,4 +255,25 @@ fn a_picker_draws_at_any_size_without_panicking() {
             render(&picker, width, height);
         }
     }
+}
+
+#[test]
+fn the_picker_draws_only_in_its_chrome() {
+    let mut picker = picker();
+    let chrome = crate::theme::loud_chrome();
+    picker.set_chrome(chrome);
+    let buf = render(&picker, 40, 8);
+
+    crate::theme::assert_no_fixed_colours(&buf);
+    // The first row is selected: its bar is the chrome's selection.
+    let y = (0..buf.area.height)
+        .find(|&y| {
+            text(&buf)
+                .lines()
+                .nth(y as usize)
+                .is_some_and(|l| l.contains("Claude Code"))
+        })
+        .expect("the first row is drawn");
+    let cell = buf.cell((buf.area.width / 2, y)).expect("on screen");
+    assert_eq!(cell.bg, chrome.selection.bg.expect("a background"));
 }

@@ -31,7 +31,7 @@ use dispatch_tui::input::{
     MouseEventKind,
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
-use dispatch_tui::theme::Role;
+use dispatch_tui::theme::{Chrome, Role};
 use dispatch_tui::{
     Command, FormAction, Item, Keymap, PaneWidget, Picker, Prompt, SettingsForm, Sidebar, Theme,
     sidebar, truncate,
@@ -398,20 +398,20 @@ impl Overlay {
         }
     }
 
-    /// Draws the overlay's frame in `style`.
-    fn set_border(&mut self, style: Style) {
+    /// Draws the overlay in `chrome`.
+    fn set_chrome(&mut self, chrome: Chrome) {
         match self {
             Overlay::Harness(picker)
             | Overlay::Project(picker)
             | Overlay::Register(picker)
-            | Overlay::Machine(picker) => picker.set_border(style),
-            Overlay::Settings { form, .. } => form.set_border(style),
-            Overlay::Browse(browser) => browser.set_border(style),
-            Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
+            | Overlay::Machine(picker) => picker.set_chrome(chrome),
+            Overlay::Settings { form, .. } => form.set_chrome(chrome),
+            Overlay::Browse(browser) => browser.set_chrome(chrome),
+            Overlay::OpenOn { prompt, .. } => prompt.set_chrome(chrome),
             Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
-                prompt.set_border(style)
+                prompt.set_chrome(chrome)
             }
-            Overlay::AddMachine(add) => add.prompt_mut().set_border(style),
+            Overlay::AddMachine(add) => add.prompt_mut().set_chrome(chrome),
             // Built fresh each frame, with the theme's border already on it.
             Overlay::Approval { .. } => {}
         }
@@ -3210,7 +3210,7 @@ impl App {
             task: &request.task,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
-            border: Style::default().fg(self.theme.faded),
+            chrome: self.theme.chrome(),
         })
     }
 
@@ -4166,16 +4166,9 @@ impl App {
 
     /// Draws whichever overlay is open, if any.
     fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
-        let border = Style::default().fg(self.theme.faded);
+        let chrome = self.theme.chrome();
         if let Some(overlay) = &mut self.overlay {
-            overlay.set_border(border);
-        }
-
-        if let Some(Overlay::Settings { form, .. }) = &mut self.overlay {
-            form.set_styles(
-                Style::default().bg(self.theme.tint).fg(self.theme.text),
-                Style::default().fg(self.theme.faded),
-            );
+            overlay.set_chrome(chrome);
         }
 
         let Some(overlay) = &self.overlay else {

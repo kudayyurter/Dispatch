@@ -5,9 +5,11 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
+
+use crate::theme::Chrome;
 
 /// One row of a picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +48,8 @@ pub struct Picker {
     pub title: String,
     items: Vec<Item>,
     selected: usize,
-    /// The frame's colour, set by whoever draws the overlay so it matches
-    /// the rest of the interface.
-    border: Style,
+    /// The dialog colours, set by whoever draws the overlay.
+    chrome: Chrome,
     /// What the keys do, drawn on the bottom border.
     hint: Option<String>,
 }
@@ -61,14 +62,14 @@ impl Picker {
             title: title.into(),
             items,
             selected: 0,
-            border: Style::default().fg(Color::Cyan),
+            chrome: Chrome::default(),
             hint: None,
         }
     }
 
-    /// Draws the frame in `style`.
-    pub fn set_border(&mut self, style: Style) {
-        self.border = style;
+    /// Draws in `chrome`.
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.chrome = chrome;
     }
 
     /// The same picker, saying on its bottom border what its keys do.
@@ -182,10 +183,11 @@ impl Widget for &Picker {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
-            .border_style(self.border);
+            .border_style(self.chrome.border);
         if let Some(hint) = &self.hint {
-            block =
-                block.title_bottom(Line::styled(format!(" {hint} "), self.border).right_aligned());
+            block = block.title_bottom(
+                Line::styled(format!(" {hint} "), self.chrome.border).right_aligned(),
+            );
         }
         let inner = block.inner(rect);
         block.render(rect, buf);
@@ -197,7 +199,7 @@ impl Widget for &Picker {
                 inner.x,
                 inner.y,
                 "nothing to choose",
-                Style::default().fg(Color::DarkGray),
+                self.chrome.secondary,
             );
             return;
         }
@@ -212,10 +214,7 @@ impl Widget for &Picker {
             let chosen = index == self.selected;
 
             let style = if chosen {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                self.chrome.selection
             } else {
                 Style::default()
             };
@@ -232,11 +231,7 @@ impl Widget for &Picker {
             let x = write(buf, inner, inner.x + 1, y, &item.label, style);
 
             if let Some(detail) = &item.detail {
-                let detail_style = if chosen {
-                    style
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
+                let detail_style = if chosen { style } else { self.chrome.secondary };
                 write(buf, inner, x + 2, y, detail, detail_style);
             }
         }
