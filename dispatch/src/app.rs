@@ -4803,10 +4803,18 @@ impl App {
             } else {
                 self.theme.faded
             };
-            frame.render_widget(
-                pane_block(colour, is_focused).title(pane_title(&self.state, *id)),
-                *outer,
-            );
+            let mut block = pane_block(colour, is_focused).title(pane_title(&self.state, *id));
+            // The focused pane says what it is doing in words, on the right
+            // of its top border; the others leave it to their glyphs, or the
+            // grid would fill with words.
+            if is_focused && let Some(state) = self.state.pane(*id) {
+                let words = sidebar::status_text(state.status, None);
+                block = block.title_top(
+                    Line::styled(format!(" {words} "), Style::default().fg(self.theme.faded))
+                        .right_aligned(),
+                );
+            }
+            frame.render_widget(block, *outer);
             if let Some(t) = self.animations.value(Target::Open(*id), now) {
                 mask_border(frame.buffer_mut(), *outer, t);
             }
@@ -12752,5 +12760,49 @@ args = ["--effort", "{value}"]
             assert_eq!(cell.bg, app.theme.tab, "Ctrl {key}");
             key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
         }
+    }
+
+    #[test]
+    fn the_focused_pane_says_what_it_is_doing() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Running)
+            .expect("exists");
+        app.focus_pane(panes[0]);
+        // Past the opening animation, which hides a new pane's border.
+        advance(&clock, Duration::from_secs(1));
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let top_of = |pane: PaneId| {
+            let (_, rect) = app
+                .frames
+                .iter()
+                .find(|(id, _)| *id == pane)
+                .expect("tiled");
+            let line = rendered_text(&terminal)
+                .lines()
+                .nth(rect.y as usize)
+                .unwrap_or("")
+                .to_string();
+            line.chars()
+                .skip(rect.x as usize)
+                .take(rect.width as usize)
+                .collect::<String>()
+        };
+        assert!(
+            top_of(panes[0]).contains(" Working "),
+            "{}",
+            top_of(panes[0])
+        );
+        assert!(
+            !top_of(panes[1]).contains(" Working "),
+            "only the focused one says"
+        );
     }
 }

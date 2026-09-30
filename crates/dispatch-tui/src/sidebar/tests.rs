@@ -1861,3 +1861,17 @@ fn a_running_row_on_screen_spins_and_one_hidden_does_not() {
         "the child's row is below the fold"
     );
 }
+
+#[test]
+fn every_state_has_words() {
+    assert_eq!(status_text(PaneStatus::Starting, None), "Starting");
+    assert_eq!(status_text(PaneStatus::Running, None), "Working");
+    assert_eq!(status_text(PaneStatus::Blocked, None), "Needs approval");
+    assert_eq!(
+        status_text(PaneStatus::Blocked, Some("Permission prompt")),
+        "Permission prompt"
+    );
+    assert_eq!(status_text(PaneStatus::Idle, None), "Finished");
+    assert_eq!(status_text(PaneStatus::Exited(0), None), "Exited");
+    assert_eq!(status_text(PaneStatus::Exited(2), None), "Exited (2)");
+}

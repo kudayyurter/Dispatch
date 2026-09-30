@@ -18,10 +18,8 @@ fn every_role_is_mixed_from_the_palette() {
     let theme = Theme::new(palette, Depth::TrueColor);
     let rgb = |c: Rgb| Color::Rgb(c.0, c.1, c.2);
 
-    assert_eq!(
-        theme.faded,
-        rgb(palette.foreground.mix(palette.background, 0.45))
-    );
+    assert_eq!(theme.faded, rgb(Theme::fallback().rgb(Role::Faded)));
+    assert!(contrast(theme.rgb(Role::Faded), palette.background) >= READABLE);
     assert_eq!(
         theme.tint,
         rgb(palette.background.mix(palette.foreground, 0.10))
@@ -209,4 +207,60 @@ fn chrome_is_drawn_from_the_theme() {
     assert_eq!(chrome.secondary.fg, Some(theme.faded));
     assert_eq!(chrome.text.fg, Some(theme.text));
     assert_eq!(Chrome::default(), chrome);
+}
+
+fn hex(value: u32) -> Rgb {
+    Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+fn faded_rgb(palette: Palette) -> Rgb {
+    Theme::new(palette, Depth::TrueColor).rgb(Role::Faded)
+}
+
+#[test]
+fn contrast_is_the_wcag_ratio() {
+    assert!((contrast(Rgb(0, 0, 0), Rgb(255, 255, 255)) - 21.0).abs() < 0.01);
+    assert!((contrast(Rgb(9, 9, 9), Rgb(9, 9, 9)) - 1.0).abs() < 0.001);
+}
+
+#[test]
+fn secondary_text_is_readable_on_dark_light_and_low_contrast_themes() {
+    for (background, foreground) in [
+        (0x16161e, 0xc8c8d8), // the fallback
+        (0xfafafa, 0x383a42), // a light theme
+        (0x2e3440, 0x81a1c1), // low contrast
+    ] {
+        let palette = Palette {
+            background: hex(background),
+            foreground: hex(foreground),
+            accent: hex(0xb4a0f0),
+        };
+        let faded = faded_rgb(palette);
+        assert!(
+            contrast(faded, palette.background) >= READABLE,
+            "{faded:?} on {:?}",
+            palette.background
+        );
+        assert!(
+            contrast(faded, palette.background) <= contrast(palette.foreground, palette.background),
+            "never louder than the text itself"
+        );
+    }
+}
+
+#[test]
+fn a_foreground_that_is_itself_faint_is_used_as_it_is() {
+    let palette = Palette {
+        background: hex(0x303030),
+        foreground: hex(0x707070),
+        accent: hex(0xb4a0f0),
+    };
+    assert_eq!(faded_rgb(palette), palette.foreground);
+}
+
+#[test]
+fn the_colour_drawn_and_the_colour_animated_agree() {
+    let theme = Theme::fallback();
+    let rgb = theme.rgb(Role::Faded);
+    assert_eq!(theme.faded, Color::Rgb(rgb.0, rgb.1, rgb.2));
 }

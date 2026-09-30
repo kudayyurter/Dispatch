@@ -12,6 +12,48 @@ use ratatui::style::{Color, Modifier, Style};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+/// The contrast secondary text needs against the background: WCAG's AA
+/// ratio for body text.
+pub const READABLE: f32 = 4.5;
+
+/// WCAG relative luminance, 0.0 for black to 1.0 for white.
+fn luminance(colour: Rgb) -> f32 {
+    let channel = |value: u8| {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.039_28 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(colour.0) + 0.7152 * channel(colour.1) + 0.0722 * channel(colour.2)
+}
+
+/// The WCAG contrast ratio between two colours, from 1.0 to 21.0.
+#[must_use]
+pub fn contrast(a: Rgb, b: Rgb) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Secondary text: the foreground faded toward the background, but only as
+/// far as it stays readable.
+///
+/// A fixed mix read well on the fallback's dark palette and fell below
+/// readable on light and low-contrast themes. This starts at the same 0.45
+/// and steps back by 0.05 until the text reaches [`READABLE`]; a foreground
+/// that never does is used as it is, since fading it further only hurts.
+fn secondary(palette: Palette) -> Rgb {
+    (0..9u8)
+        .map(|step| {
+            palette
+                .foreground
+                .mix(palette.background, 0.45 - 0.05 * f32::from(step))
+        })
+        .find(|colour| contrast(*colour, palette.background) >= READABLE)
+        .unwrap_or(palette.foreground)
+}
+
 impl Rgb {
     /// `self` moved `amount` of the way toward `other`, from 0.0 to 1.0.
     #[must_use]
@@ -82,7 +124,8 @@ impl Depth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     /// Secondary text: branches, the app name, inactive tabs, unfocused
-    /// borders, the status row.
+    /// borders, the status row. Faded only as far as it stays readable: see
+    /// [`secondary`].
     pub faded: Color,
     /// The row behind a selected project or a focused pane.
     pub tint: Color,
@@ -119,7 +162,7 @@ impl Theme {
         };
 
         Theme {
-            faded: colour(palette.foreground.mix(palette.background, 0.45)),
+            faded: colour(secondary(palette)),
             tint: colour(palette.background.mix(palette.foreground, 0.10)),
             tab: colour(palette.background.mix(palette.accent, 0.30)),
             accent,
@@ -242,7 +285,7 @@ impl Theme {
         let p = self.palette;
         match role {
             Role::Background => p.background,
-            Role::Faded => p.foreground.mix(p.background, 0.45),
+            Role::Faded => secondary(p),
             Role::Tint => p.background.mix(p.foreground, 0.10),
             Role::Tab => p.background.mix(p.accent, 0.30),
             Role::Accent => p.accent,

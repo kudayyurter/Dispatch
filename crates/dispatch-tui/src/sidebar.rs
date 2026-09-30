@@ -3,6 +3,7 @@
 //! With more than one machine, the list is split into a section per machine,
 //! each headed by the machine's name and scrolled on its own.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::theme::{Role, Theme};
@@ -23,6 +24,22 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// wider than its cell otherwise runs into whatever is next to it. Those gaps
 /// cost two columns, and the sidebar is two wider so titles keep their room.
 pub const WIDTH: u16 = 34;
+
+/// A pane's state in words, for where a glyph alone would have to be decoded:
+/// the attention picker and the focused pane's border.
+///
+/// Blocked says why when its rule does, and "Needs approval" when it does not.
+#[must_use]
+pub fn status_text(status: PaneStatus, reason: Option<&str>) -> Cow<'_, str> {
+    match status {
+        PaneStatus::Starting => Cow::Borrowed("Starting"),
+        PaneStatus::Running => Cow::Borrowed("Working"),
+        PaneStatus::Blocked => Cow::Borrowed(reason.unwrap_or("Needs approval")),
+        PaneStatus::Idle => Cow::Borrowed("Finished"),
+        PaneStatus::Exited(0) => Cow::Borrowed("Exited"),
+        PaneStatus::Exited(code) => Cow::Owned(format!("Exited ({code})")),
+    }
+}
 
 /// What the sidebar is called when it is one list.
 const TITLE: &str = "Projects";
