@@ -122,6 +122,10 @@ pub enum Action {
     /// Open the overlay that registers a machine, to add one without
     /// restarting.
     AddMachine,
+    /// Focus the next pane waiting on the user, wherever it is.
+    NextAttention,
+    /// Open the list of every pane waiting on the user.
+    AttentionPicker,
     /// Quit.
     Quit,
 }

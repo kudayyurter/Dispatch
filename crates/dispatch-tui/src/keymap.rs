@@ -391,6 +391,8 @@ pub enum Command {
     HarnessManager,
     Approvals,
     Fold,
+    NextAttention,
+    AttentionPicker,
     Quit,
 }
 
@@ -443,6 +445,8 @@ impl Command {
         (Command::HarnessManager, "harness_manager"),
         (Command::Approvals, "approvals"),
         (Command::Fold, "fold"),
+        (Command::NextAttention, "next_attention"),
+        (Command::AttentionPicker, "attention_picker"),
         (Command::Quit, "quit"),
     ];
 
@@ -518,6 +522,8 @@ impl Command {
             Command::HarnessManager => "harnesses",
             Command::Approvals => "approvals",
             Command::Fold => "fold",
+            Command::NextAttention => "attention",
+            Command::AttentionPicker => "waiting",
             Command::Quit => "quit",
         }
     }
@@ -620,6 +626,8 @@ impl Command {
             Command::HarnessManager => Action::HarnessManager,
             Command::Approvals => Action::Approvals,
             Command::Fold => Action::ToggleFold,
+            Command::NextAttention => Action::NextAttention,
+            Command::AttentionPicker => Action::AttentionPicker,
             Command::Quit => Action::Quit,
         })
     }
@@ -666,6 +674,7 @@ impl Keymap {
             (Chord::alt('k'), Command::FocusUp),
             (Chord::alt_key(Down), Command::FocusDown),
             (Chord::alt('j'), Command::FocusDown),
+            (Chord::alt('a'), Command::NextAttention),
         ];
 
         let mut prefix = vec![
@@ -685,6 +694,7 @@ impl Keymap {
             (Chord::char('o'), Command::OpenProject),
             (Chord::char('m'), Command::AddMachine),
             (Chord::char('['), Command::ScrollMode),
+            (Chord::char('w'), Command::NextAttention),
         ];
         prefix.extend(digits(Command::GoToTab));
         prefix.push((Chord::key(Tab), Command::NextTab));
@@ -762,6 +772,7 @@ impl Keymap {
             (Chord::char('a'), Command::Approvals),
             (Chord::char('f'), Command::Fold),
             (Chord::char('q'), Command::Quit),
+            (Chord::char('w'), Command::AttentionPicker),
             (Chord::key(Esc), Command::LeaveMode),
             (Chord::key(Enter), Command::LeaveMode),
         ];

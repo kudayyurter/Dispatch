@@ -208,3 +208,23 @@ fn progress_and_title_are_kept_until_replaced() {
 
     assert_eq!(tracker.evaluate(start, &[]), Some(Verdict::Idle));
 }
+
+#[test]
+fn the_tracker_keeps_the_blocked_reason() {
+    let mut tracker = Tracker::new(rules(
+        r#"
+        [[rules]]
+        state = "blocked"
+        region = "screen"
+        contains = ["allow?"]
+        reason = "Permission prompt"
+        "#,
+    ));
+    let now = Instant::now();
+
+    tracker.evaluate(now, &["Allow? [y/n]".to_string()]);
+    assert_eq!(tracker.reason(), Some("Permission prompt"));
+
+    tracker.evaluate(now, &["all quiet".to_string()]);
+    assert_eq!(tracker.reason(), None);
+}

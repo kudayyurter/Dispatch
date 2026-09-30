@@ -43,6 +43,10 @@ pub struct RuleDef {
     pub regex: Vec<String>,
     /// Higher is tried first; ties keep file order.
     pub priority: i32,
+    /// What the pane is waiting on, in a few words, for a `blocked` rule:
+    /// shown where the user picks which agent to answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A harness file's `[status]` section.
@@ -87,6 +91,16 @@ struct Rule {
     not: Vec<String>,
     regex: Vec<Regex>,
     priority: i32,
+    reason: Option<String>,
+}
+
+/// What the first matching rule says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleMatch<'a> {
+    /// The state it names.
+    pub state: RuleState,
+    /// Why, when it says: what a blocked pane is waiting on.
+    pub reason: Option<&'a str>,
 }
 
 /// What rules are matched against.
@@ -166,14 +180,24 @@ impl StatusRules {
         self.rules.is_empty()
     }
 
+    /// The first matching rule's state and reason, trying the highest
+    /// priority first; `None` when nothing matches.
+    #[must_use]
+    pub fn matching(&self, input: &StatusInput<'_>) -> Option<RuleMatch<'_>> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(input))
+            .map(|rule| RuleMatch {
+                state: rule.state,
+                reason: rule.reason.as_deref(),
+            })
+    }
+
     /// The state the first matching rule names, trying the highest priority
     /// first; `None` when nothing matches.
     #[must_use]
     pub fn evaluate(&self, input: &StatusInput<'_>) -> Option<RuleState> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches(input))
-            .map(|rule| rule.state)
+        self.matching(input).map(|found| found.state)
     }
 }
 
@@ -255,6 +279,12 @@ fn compile_rule(def: &RuleDef) -> Result<Rule, String> {
         not,
         regex,
         priority: def.priority,
+        reason: def
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(str::to_string),
     })
 }
 

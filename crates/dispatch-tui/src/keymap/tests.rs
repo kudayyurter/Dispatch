@@ -257,6 +257,8 @@ fn the_defaults_bind_what_the_spec_lists() {
         (KeyMode::Prefix, "4", Command::GoToTab(4)),
         (KeyMode::Prefix, "Tab", Command::NextTab),
         (KeyMode::Prefix, "q", Command::Quit),
+        (KeyMode::Prefix, "w", Command::NextAttention),
+        (KeyMode::Session, "w", Command::AttentionPicker),
         (KeyMode::Pane, "n", Command::NewPane),
         (KeyMode::Pane, "f", Command::Zoom),
         (KeyMode::Pane, "z", Command::Zoom),
@@ -426,7 +428,7 @@ fn each_mode_spells_out_its_keys() {
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Session),
-        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit"
+        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting"
     );
     assert_eq!(
         keymap.normal_help(),
@@ -773,5 +775,18 @@ fn a_binding_written_straight_under_keys_is_named_for_what_it_is() {
         keymap.lookup(KeyMode::Pane, &parsed("w")),
         Some(Command::ClosePane),
         "the rest still applies"
+    );
+}
+
+#[test]
+fn alt_a_goes_to_the_next_waiting_pane() {
+    assert_eq!(
+        Keymap::defaults().lookup(KeyMode::Normal, &Chord::alt('a')),
+        Some(Command::NextAttention)
+    );
+    assert_eq!(Command::NextAttention.action(), Some(Action::NextAttention));
+    assert_eq!(
+        Command::AttentionPicker.action(),
+        Some(Action::AttentionPicker)
     );
 }

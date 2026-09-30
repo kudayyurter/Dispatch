@@ -516,3 +516,56 @@ fn the_registry_hands_out_each_harnesss_rules() {
     );
     assert!(registry.status_rules("unknown").is_empty());
 }
+
+#[test]
+fn a_blocked_rule_says_why() {
+    let def: StatusDef = toml::from_str(
+        r#"
+        [[rules]]
+        state = "blocked"
+        region = "screen"
+        contains = ["allow?"]
+        reason = "Permission prompt"
+        "#,
+    )
+    .expect("parses");
+    let rules = StatusRules::compile("test", &def);
+    let screen = vec!["Allow? [y/n]".to_string()];
+    let input = StatusInput {
+        title: "",
+        progress: "",
+        screen: &screen,
+    };
+
+    assert_eq!(
+        rules.matching(&input),
+        Some(RuleMatch {
+            state: RuleState::Blocked,
+            reason: Some("Permission prompt")
+        })
+    );
+    assert_eq!(rules.evaluate(&input), Some(RuleState::Blocked));
+}
+
+#[test]
+fn every_built_in_blocked_rule_has_a_reason() {
+    #[derive(serde::Deserialize)]
+    struct File {
+        status: StatusDef,
+    }
+    for id in ["claude", "codex", "opencode", "agy"] {
+        let text = super::builtin::builtin(id).expect("built in");
+        let file: File = toml::from_str(text).expect("parses");
+        for rule in file
+            .status
+            .rules
+            .iter()
+            .filter(|rule| rule.state == "blocked")
+        {
+            assert!(
+                rule.reason.as_deref().is_some_and(|r| !r.trim().is_empty()),
+                "{id}: {rule:?}"
+            );
+        }
+    }
+}

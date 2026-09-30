@@ -179,6 +179,9 @@ priority = 990
   ignore case. `regex` must match some line of the region, and is
   case-sensitive unless it says `(?i)`. A rule needs at least one of
   `contains`, `any` or `regex`.
+- `reason` is an optional short text on a `blocked` rule, saying what the pane
+  is waiting on. It shows in the list of waiting agents and on the focused
+  pane's border; "Needs approval" stands in when a rule has none.
 - `priority` orders the rules, highest first, ties in file order, and the
   first that matches decides. An `idle` rule does not outrank output still
   arriving.

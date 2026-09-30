@@ -54,6 +54,8 @@ pub struct Tracker {
     reported: Option<Verdict>,
     /// When the raw verdict turned idle under a reported working one.
     idle_since: Option<Instant>,
+    /// Why the pane is blocked, from the rule that says so, while one does.
+    reason: Option<String>,
 }
 
 impl Tracker {
@@ -69,7 +71,14 @@ impl Tracker {
             last_output: None,
             reported: None,
             idle_since: None,
+            reason: None,
         }
+    }
+
+    /// Why the pane is blocked, when a rule said, as of the last evaluation.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// We sent the pane a keystroke, a paste or a pointer event.
@@ -112,11 +121,16 @@ impl Tracker {
     /// Works out the pane's state against its live `screen`, returning it
     /// when it differs from the last one reported.
     pub fn evaluate(&mut self, now: Instant, screen: &[String]) -> Option<Verdict> {
-        let rule = self.rules.evaluate(&StatusInput {
+        let found = self.rules.matching(&StatusInput {
             title: &self.title,
             progress: &self.progress,
             screen,
         });
+        let rule = found.map(|found| found.state);
+        self.reason = found
+            .filter(|found| found.state == RuleState::Blocked)
+            .and_then(|found| found.reason)
+            .map(str::to_string);
         let active = self
             .last_output
             .is_some_and(|at| now.saturating_duration_since(at) < ACTIVE_FOR);

@@ -29,6 +29,7 @@ priority = 1100
 # A permission prompt.
 [[status.rules]]
 state = "blocked"
+reason = "Permission prompt"
 region = "bottom:15"
 contains = ["do you want to proceed?"]
 regex = ['(?i)^\s*❯?\s*1\.\s*yes\b']
@@ -37,6 +38,7 @@ priority = 990
 # A form waiting on a choice.
 [[status.rules]]
 state = "blocked"
+reason = "Choice form"
 region = "bottom:15"
 contains = ["esc to cancel"]
 any = ["enter to confirm", "enter to select"]
@@ -73,6 +75,7 @@ priority = 250
 const CODEX: &str = r#"
 [[status.rules]]
 state = "blocked"
+reason = "Action required"
 region = "title"
 contains = ["action required"]
 priority = 1100
@@ -86,12 +89,14 @@ priority = 1050
 
 [[status.rules]]
 state = "blocked"
+reason = "Trust this directory?"
 region = "screen"
 contains = ["do you trust the contents of this directory?"]
 priority = 950
 
 [[status.rules]]
 state = "blocked"
+reason = "Confirm or answer"
 region = "bottom:20"
 any = [
   "press enter to confirm or esc to cancel",
@@ -103,6 +108,7 @@ priority = 900
 
 [[status.rules]]
 state = "blocked"
+reason = "Yes/no question"
 region = "bottom:20"
 any = ["[y/n]", "yes (y)"]
 priority = 600
@@ -118,12 +124,14 @@ priority = 500
 const OPENCODE: &str = r#"
 [[status.rules]]
 state = "blocked"
+reason = "Permission prompt"
 region = "screen"
 any = ["△ permission required"]
 priority = 300
 
 [[status.rules]]
 state = "blocked"
+reason = "Choice form"
 region = "screen"
 contains = ["esc dismiss"]
 any = ["enter confirm", "enter submit", "enter toggle"]
@@ -146,6 +154,7 @@ priority = 100
 const AGY: &str = r#"
 [[status.rules]]
 state = "blocked"
+reason = "Permission prompt"
 region = "screen"
 contains = ["requesting permission for:"]
 any = ["do you want to proceed?", "edit command"]

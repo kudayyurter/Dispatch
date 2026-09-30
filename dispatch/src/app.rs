@@ -54,6 +54,9 @@ const TAB_TITLE: usize = 16;
 /// What a tab command says on a project whose daemon keeps no tabs.
 const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
 
+/// What the status row says when no pane is waiting on the user.
+const NOTHING_WAITING: &str = "nothing waiting on you";
+
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
 ///
@@ -114,6 +117,16 @@ fn pane_title(state: &AppState, id: PaneId) -> String {
         .unwrap_or_default()
 }
 
+/// How long a pane has waited, as the waiting list says it: `12s`, `3m`, `1h`.
+fn waited_for(waited: Duration) -> String {
+    let seconds = waited.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3600),
+    }
+}
+
 /// The picker's name for the user's shell, after its program: `Shell · zsh`.
 fn shell_label(command: &str) -> String {
     let program = Path::new(command).file_stem().map_or_else(
@@ -129,6 +142,7 @@ fn shell_label(command: &str) -> String {
 /// directly rather than looked up by kind.
 #[derive(Debug, Clone, Copy)]
 enum OverlayKind {
+    Attention,
     Harness,
     Project,
     Register,
@@ -315,6 +329,8 @@ enum Overlay {
     Browse(Browser),
     /// A machine to open a project on, when there is more than one.
     Machine(Picker),
+    /// The panes waiting on the user, to go to one.
+    Attention(Picker),
     /// A machine being registered.
     AddMachine(AddMachine),
     /// A path to open on a machine this client cannot browse.
@@ -352,7 +368,8 @@ impl Overlay {
             Overlay::Harness(picker)
             | Overlay::Project(picker)
             | Overlay::Register(picker)
-            | Overlay::Machine(picker) => Some(picker),
+            | Overlay::Machine(picker)
+            | Overlay::Attention(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
@@ -369,7 +386,8 @@ impl Overlay {
             Overlay::Harness(picker)
             | Overlay::Project(picker)
             | Overlay::Register(picker)
-            | Overlay::Machine(picker) => Some(picker),
+            | Overlay::Machine(picker)
+            | Overlay::Attention(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
@@ -388,6 +406,7 @@ impl Overlay {
             Overlay::Project(_) => Some(OverlayKind::Project),
             Overlay::Register(_) => Some(OverlayKind::Register),
             Overlay::Machine(_) => Some(OverlayKind::Machine),
+            Overlay::Attention(_) => Some(OverlayKind::Attention),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
@@ -404,7 +423,8 @@ impl Overlay {
             Overlay::Harness(picker)
             | Overlay::Project(picker)
             | Overlay::Register(picker)
-            | Overlay::Machine(picker) => picker.set_chrome(chrome),
+            | Overlay::Machine(picker)
+            | Overlay::Attention(picker) => picker.set_chrome(chrome),
             Overlay::Settings { form, .. } => form.set_chrome(chrome),
             Overlay::Browse(browser) => browser.set_chrome(chrome),
             Overlay::OpenOn { prompt, .. } => prompt.set_chrome(chrome),
@@ -595,6 +615,9 @@ pub struct App {
     expanded: HashSet<PaneId>,
     /// Delegation requests waiting on a decision, oldest first.
     pending: VecDeque<PendingRequest>,
+    /// When each pane now blocked started waiting on the user, for the
+    /// waiting list to say how long.
+    blocked_since: HashMap<PaneId, Instant>,
     /// Tasks of requests this client itself approved, until the daemon says
     /// what became of them.
     ///
@@ -753,6 +776,7 @@ impl App {
             anchored: (None, Rect::default()),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
+            blocked_since: HashMap::new(),
             answered: HashMap::new(),
             child_titles: HashMap::new(),
             status: String::new(),
@@ -1071,6 +1095,142 @@ impl App {
             self.state.toggle_device_collapsed(device);
         }
         self.state.toggle_project_collapsed(project);
+    }
+
+    /// Every pane in the order the sidebar lists them: machine by machine,
+    /// project by project, each top-level pane followed by its subagents.
+    fn pane_order(&self) -> Vec<PaneId> {
+        let devices = self.state.devices();
+        let projects: Vec<ProjectId> = if devices.len() <= 1 {
+            self.state
+                .projects()
+                .iter()
+                .map(|project| project.id)
+                .collect()
+        } else {
+            devices
+                .iter()
+                .flat_map(|device| {
+                    self.state
+                        .projects()
+                        .iter()
+                        .filter(move |project| project.device == device.id)
+                        .map(|project| project.id)
+                })
+                .collect()
+        };
+
+        let mut order = Vec::new();
+        for project in projects {
+            for top in self
+                .state
+                .panes_for(project)
+                .into_iter()
+                .filter(|pane| pane.parent.is_none())
+            {
+                order.push(top.id);
+                order.extend(
+                    self.state
+                        .children_of(top.id)
+                        .into_iter()
+                        .map(|child| child.id),
+                );
+            }
+        }
+        order
+    }
+
+    /// Whether `id` is a live pane waiting on the user.
+    fn is_waiting(&self, id: PaneId) -> bool {
+        self.state
+            .pane(id)
+            .is_some_and(|pane| !pane.closed && pane.status == PaneStatus::Blocked)
+    }
+
+    /// Why `id` is blocked, when its rule said.
+    fn reason_of(&self, id: PaneId) -> Option<&str> {
+        self.panes.get(&id).and_then(|pane| pane.activity.reason())
+    }
+
+    /// Shows `id` wherever it is: its project selected, anything folded over
+    /// it unfolded, its tab on screen — the view follows the focus.
+    fn go_to_pane(&mut self, id: PaneId) {
+        if self.state.pane(id).is_none_or(|pane| pane.closed) {
+            return;
+        }
+        let Some((project, parent)) = self.state.pane(id).map(|pane| (pane.project, pane.parent))
+        else {
+            return;
+        };
+        if self.state.selected_project() != Some(project) {
+            self.select_project(project);
+        }
+        if self.state.is_project_collapsed(project) {
+            self.state.toggle_project_collapsed(project);
+        }
+        if let Some(parent) = parent
+            && self.state.is_pane_collapsed(parent)
+        {
+            self.state.toggle_pane_collapsed(parent);
+        }
+        self.focus_pane(id);
+    }
+
+    /// Focuses the next pane waiting on the user after the focused one, in
+    /// sidebar order, wrapping.
+    fn next_attention(&mut self) {
+        let order = self.pane_order();
+        let start = self
+            .state
+            .focused_pane()
+            .and_then(|focused| order.iter().position(|id| *id == focused))
+            .map_or(0, |index| index + 1);
+        let next = (0..order.len())
+            .map(|step| order[(start + step) % order.len()])
+            .find(|id| self.is_waiting(*id));
+
+        match next {
+            Some(id) => self.go_to_pane(id),
+            None => self.status = NOTHING_WAITING.to_string(),
+        }
+    }
+
+    /// Opens the list of every pane waiting on the user.
+    fn open_attention_picker(&mut self) {
+        let now = self.now();
+        let items: Vec<Item> = self
+            .pane_order()
+            .into_iter()
+            .filter(|id| self.is_waiting(*id))
+            .filter_map(|id| {
+                let pane = self.state.pane(id)?;
+                let project = self
+                    .state
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == pane.project)
+                    .map_or("", |project| project.name.as_str());
+                let why = sidebar::status_text(pane.status, self.reason_of(id));
+                let waited = self
+                    .blocked_since
+                    .get(&id)
+                    .map_or_else(String::new, |since| {
+                        format!(" · {}", waited_for(now.saturating_duration_since(*since)))
+                    });
+                Some(
+                    Item::new(id.to_string(), format!("{project} · {}", pane.title))
+                        .with_detail(format!("{why}{waited}")),
+                )
+            })
+            .collect();
+
+        if items.is_empty() {
+            self.status = NOTHING_WAITING.to_string();
+            return;
+        }
+        self.overlay = Some(Overlay::Attention(
+            Picker::new("Waiting on you", items).with_hint("↑↓ choose  Enter go  Esc close"),
+        ));
     }
 
     /// Records a title an agent set for one of its panes.
@@ -2462,6 +2622,11 @@ impl App {
             }
 
             let _ = self.state.set_pane_status(id, status);
+            if status == PaneStatus::Blocked {
+                self.blocked_since.insert(id, now);
+            } else {
+                self.blocked_since.remove(&id);
+            }
             changed = true;
 
             let was_unseen = self.state.is_unseen(id);
@@ -2670,6 +2835,8 @@ impl App {
             Action::NextTab => self.select_tab(self.current_tab() + 1),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
+            Action::NextAttention => self.next_attention(),
+            Action::AttentionPicker => self.open_attention_picker(),
             Action::OpenProject => self.start_open(),
             Action::AddMachine => self.open_add_machine(),
             Action::ExpandChild => self.expand_child(),
@@ -3257,6 +3424,19 @@ impl App {
     fn choose(&mut self, kind: OverlayKind, id: &str, area: Size) -> Result<()> {
         match kind {
             OverlayKind::Harness => self.spawn_pane(id, area)?,
+            OverlayKind::Attention => {
+                // Chosen from a list drawn a moment ago: the pane may have
+                // exited or been answered since, and then there is nowhere
+                // to go.
+                if let Some(pane) = self
+                    .pane_order()
+                    .into_iter()
+                    .find(|pane| pane.to_string() == id)
+                    .filter(|pane| self.state.pane(*pane).is_some_and(|p| !p.closed))
+                {
+                    self.go_to_pane(pane);
+                }
+            }
             OverlayKind::Project => {
                 if let Some(project) = self
                     .state
@@ -4808,7 +4988,7 @@ impl App {
             // of its top border; the others leave it to their glyphs, or the
             // grid would fill with words.
             if is_focused && let Some(state) = self.state.pane(*id) {
-                let words = sidebar::status_text(state.status, None);
+                let words = sidebar::status_text(state.status, self.reason_of(*id));
                 block = block.title_top(
                     Line::styled(format!(" {words} "), Style::default().fg(self.theme.faded))
                         .right_aligned(),
@@ -5111,7 +5291,8 @@ impl App {
         });
 
         // A blocked pane on another tab, or in a folded project, still needs
-        // to be found; the status row is the one place always on screen.
+        // to be found; the status row is the one place always on screen, and
+        // it stays said over an overlay, which may be what hides the pane.
         let blocked = self
             .state
             .projects()
@@ -5119,8 +5300,13 @@ impl App {
             .flat_map(|project| self.state.panes_for(project.id))
             .filter(|pane| !pane.closed && pane.status == PaneStatus::Blocked)
             .count();
-        let blocked_reminder =
-            (blocked > 0 && self.overlay.is_none()).then(|| format!("{blocked} waiting on you"));
+        let blocked_reminder = (blocked > 0).then(|| {
+            let waiting = format!("{blocked} waiting on you");
+            match self.router.keymap().path_to(Command::NextAttention) {
+                Some(keys) => format!("{waiting} — {keys}"),
+                None => waiting,
+            }
+        });
 
         // Read from the `Device.reachable` `sync_attachment` stamps each poll,
         // not asked live: this runs every frame, and re-checking the
@@ -7597,6 +7783,150 @@ mod tests {
     }
 
     /// Types one key at the app.
+    fn press_alt(app: &mut App, c: char) {
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+    }
+
+    fn block(app: &mut App, pane: PaneId) {
+        app.state
+            .set_pane_status(pane, PaneStatus::Blocked)
+            .expect("exists");
+    }
+
+    #[test]
+    fn alt_a_walks_the_waiting_panes_in_sidebar_order_across_projects() {
+        let (mut app, first, daemon, _sent) = attached_app();
+        let project = Project::new("/tmp/second", ProjectSource::LocalDir);
+        let second = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let ours = spawn_several(&mut app, &daemon, first, 3);
+        app.select_project(second);
+        let theirs = spawn_several(&mut app, &daemon, second, 2);
+        block(&mut app, ours[2]);
+        block(&mut app, theirs[0]);
+        app.select_project(first);
+        app.focus_pane(ours[0]);
+
+        press_alt(&mut app, 'a');
+        assert_eq!(app.state.focused_pane(), Some(ours[2]));
+        press_alt(&mut app, 'a');
+        assert_eq!(
+            app.state.selected_project(),
+            Some(second),
+            "it crosses projects"
+        );
+        assert_eq!(app.state.focused_pane(), Some(theirs[0]));
+        press_alt(&mut app, 'a');
+        assert_eq!(app.state.focused_pane(), Some(ours[2]), "and wraps");
+    }
+
+    #[test]
+    fn alt_a_unfolds_what_hides_the_pane() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        block(&mut app, panes[0]);
+        app.focus_pane(panes[1]);
+        app.state.toggle_project_collapsed(project);
+
+        press_alt(&mut app, 'a');
+
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+        assert!(!app.state.is_project_collapsed(project));
+    }
+
+    #[test]
+    fn with_nothing_waiting_alt_a_says_so() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        press_alt(&mut app, 'a');
+        assert_eq!(app.status, "nothing waiting on you");
+    }
+
+    #[test]
+    fn the_waiting_list_names_project_title_and_reason() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[1], "fixing tests");
+        block(&mut app, panes[1]);
+
+        app.open_attention_picker();
+
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("the waiting list is open");
+        };
+        let item = &picker.items()[0];
+        assert_eq!(item.label, "attached · fixing tests");
+        assert!(
+            item.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Needs approval")),
+            "{item:?}"
+        );
+        assert_eq!(picker.items().len(), 1);
+    }
+
+    #[test]
+    fn choosing_a_pane_that_stopped_waiting_does_nothing_harmful() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        block(&mut app, panes[0]);
+        app.focus_pane(panes[1]);
+        app.open_attention_picker();
+        // It exits while the list is open.
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Exited(0))
+            .expect("exists");
+        let _ = app.state.close_pane(panes[0]);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.state.focused_pane(), Some(panes[1]), "focus stays put");
+    }
+
+    #[test]
+    fn the_waiting_reminder_names_its_key_and_survives_an_overlay() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        block(&mut app, panes[0]);
+        let mut terminal = a_wide_terminal();
+
+        drawn(&mut app, &mut terminal);
+        assert!(
+            bottom_row(&terminal).contains("1 waiting on you — Alt a"),
+            "{}",
+            bottom_row(&terminal)
+        );
+
+        app.open_attention_picker();
+        assert!(app.overlay.is_some());
+        drawn(&mut app, &mut terminal);
+        assert!(
+            bottom_row(&terminal).contains("1 waiting on you"),
+            "{}",
+            bottom_row(&terminal)
+        );
+
+        app.overlay = None;
+        rebind(
+            &mut app,
+            &[("normal", "Alt a", "none"), ("prefix", "w", "none")],
+        );
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        assert!(
+            row.contains("1 waiting on you") && !row.contains("waiting on you —"),
+            "{row}"
+        );
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         app.handle(
             &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),

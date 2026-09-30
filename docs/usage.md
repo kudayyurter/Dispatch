@@ -56,11 +56,12 @@ other key goes to the pane.
 | `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
 | `Ctrl t` | tab: see [Tabs](#tabs) above |
 | `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
-| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit |
+| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you |
 | `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
-| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode |
+| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you |
 
 Some keys work without a mode: `Alt n` opens a new pane on this tab,
+`Alt a` goes to the next agent waiting on you, in any project,
 `Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
 moves focus, going on to the next tab at the grid's edge. As in zellij, a
 quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
@@ -95,7 +96,7 @@ The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
 drops that mode's defaults. A command is named in snake_case — `new_pane`,
 `close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
 `next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
-`quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
+`next_attention`, `attention_picker`, `quit`, `pane_mode`, `lock`, `prefix`, and so on. A mistake is logged by
 name and skipped, and the rest still applies. `Esc` always leaves a mode,
 lock always has a key that unlocks, and a config that leaves no key to quit
 is logged. Keys are read when Dispatch starts.
