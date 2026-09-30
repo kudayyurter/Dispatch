@@ -490,3 +490,48 @@ fn a_picker_with_buttons_draws_at_any_size_without_panicking() {
         }
     }
 }
+
+#[test]
+fn clicking_a_visible_row_of_a_scrolled_list_does_not_move_the_list() {
+    let items: Vec<Item> = (0..20)
+        .map(|i| Item::new(format!("id{i}"), format!("item-{i}")))
+        .collect();
+    let mut picker = Picker::new("Long", items);
+    let area = Rect::new(0, 0, 40, 8);
+    for _ in 0..15 {
+        picker.next();
+    }
+    let before = picker.layout(area).rows;
+    let (rect, index) = before[1];
+
+    picker.select_shown(index);
+
+    let after = picker.layout(area).rows;
+    assert_eq!(after, before, "the same rows are in the same places");
+    assert_eq!(picker.selected_index(), index);
+    let buf = render(&picker, 40, 8);
+    assert!(
+        drawn_in(&buf, rect).contains(&format!("item-{index}")),
+        "the row clicked still holds its label"
+    );
+}
+
+#[test]
+fn moving_up_inside_the_visible_rows_keeps_the_list_still_until_it_leaves_them() {
+    let items: Vec<Item> = (0..20)
+        .map(|i| Item::new(format!("id{i}"), format!("item-{i}")))
+        .collect();
+    let mut picker = Picker::new("Long", items);
+    let area = Rect::new(0, 0, 40, 8);
+    for _ in 0..15 {
+        picker.next();
+    }
+    let first = picker.layout(area).rows[0].1;
+
+    picker.previous();
+    assert_eq!(picker.layout(area).rows[0].1, first);
+    for _ in 0..14 {
+        picker.previous();
+    }
+    assert_eq!(picker.layout(area).rows[0].1, 0, "it follows the selection");
+}

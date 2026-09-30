@@ -595,3 +595,23 @@ fn a_browser_with_buttons_draws_at_any_size_without_panicking() {
         }
     }
 }
+
+#[test]
+fn clicking_a_visible_row_of_a_scrolled_listing_does_not_move_the_listing() {
+    let names: Vec<String> = (0..20).map(|i| format!("dir-{i:02}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = Tree::new("scrolled-click", &names);
+    let mut browser = Browser::new(tree.path());
+    let area = ratatui::layout::Rect::new(0, 0, 60, 12);
+    for _ in 0..15 {
+        browser.next();
+    }
+    let before = browser.layout(area).rows;
+    let (rect, index) = before[1];
+
+    browser.select_visible(index);
+
+    assert_eq!(browser.layout(area).rows, before);
+    let buf = buffer(&browser, 60, 12);
+    assert!(drawn_in(&buf, rect).contains(&format!("dir-{index:02}")));
+}

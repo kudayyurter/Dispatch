@@ -302,6 +302,13 @@ impl SettingsForm {
         }
     }
 
+    /// Moves to the next or previous row that has something to choose: what
+    /// a notch of the wheel does, by the code `↑` and `↓` run.
+    pub fn scroll_rows(&mut self, down: bool) {
+        self.confirm();
+        self.move_row(down);
+    }
+
     /// Steps row `index` to its next or previous value: what a click on its
     /// `◂` or `▸` does, through the code `←` and `→` run. A row with nothing
     /// to choose is left alone.

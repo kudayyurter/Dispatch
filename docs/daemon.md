@@ -22,8 +22,9 @@ reach the agents. It records its process id in `dispatchd.pid` beside the socket
 which is what to stop when you want it gone.
 
 Several clients can attach at once and see the same panes. Each pane takes the
-size of the window you used last: the one you typed or clicked in, resized, or
-opened most recently. The other windows show it at that size, with blank space
+size of the window you used last: the one you typed or clicked in, resized,
+opened, or switched to most recently (a terminal that reports focus counts
+coming back to a window as using it). The other windows show it at that size, with blank space
 around it or its edges cut off to fit their tile. A client attaching to a pane
 that is already running is replayed the last 256 KiB it printed, so reattaching
 shows the work rather than a blank rectangle.

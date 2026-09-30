@@ -3,6 +3,8 @@
 //! Used for choosing a harness, a project, or anything else that is a list of
 //! named things. Selection state lives here so the caller keeps only the list.
 
+use std::cell::Cell;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -61,6 +63,13 @@ pub struct Picker {
     pressed: Option<ButtonId>,
     /// The row the pointer is over, among the rows shown.
     hovered: Option<usize>,
+    /// The first row shown of a list taller than its box.
+    ///
+    /// Kept between frames so that moving the selection within the rows on
+    /// screen leaves them where they are: a click on a row must not make the
+    /// list jump from under the pointer. `layout` moves it, and only when the
+    /// selection has left the rows shown.
+    first: Cell<usize>,
 }
 
 impl Picker {
@@ -77,6 +86,7 @@ impl Picker {
             buttons: Vec::new(),
             pressed: None,
             hovered: None,
+            first: Cell::new(0),
         }
     }
 
@@ -226,6 +236,20 @@ impl Picker {
     }
 }
 
+/// The first row to show: `first` moved just far enough that `selected` is one
+/// of the `rows` shown out of `total`, and pulled back if the list has shrunk
+/// beneath it.
+pub(crate) fn scrolled(first: usize, selected: usize, rows: usize, total: usize) -> usize {
+    let first = if selected < first {
+        selected
+    } else if selected >= first + rows {
+        (selected + 1).saturating_sub(rows)
+    } else {
+        first
+    };
+    first.min(total.saturating_sub(rows))
+}
+
 /// Centres a box of at most `width` by `height` inside `area`.
 pub(crate) fn centred(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -323,8 +347,11 @@ impl Picker {
         let top = inner.y + u16::try_from(filter_rows).unwrap_or(0);
         let rows = usize::from(inner.bottom().saturating_sub(top));
 
-        // Scroll so the selection stays visible in a list taller than the box.
-        let first = self.selected.saturating_sub(rows.saturating_sub(1));
+        // Scroll only as far as keeps the selection visible in a list taller
+        // than the box, and never past the point where the last row is the
+        // list's last.
+        let first = scrolled(self.first.get(), self.selected, rows, shown);
+        self.first.set(first);
         let rows = (first..shown)
             .take(rows)
             .enumerate()

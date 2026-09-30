@@ -4,6 +4,7 @@
 //! ones it has been started against. This is the other way in: walk to a
 //! directory, or type its path, and open it without restarting.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
@@ -69,6 +70,9 @@ pub struct Browser {
     pressed: Option<ButtonId>,
     /// The entry the pointer is over, among the visible ones.
     hovered: Option<usize>,
+    /// The first entry shown of a listing longer than its box: see
+    /// `Picker`'s, which it follows.
+    first: Cell<usize>,
 }
 
 impl Browser {
@@ -89,6 +93,7 @@ impl Browser {
             buttons: Vec::new(),
             pressed: None,
             hovered: None,
+            first: Cell::new(0),
         }
     }
 
@@ -492,9 +497,12 @@ impl Browser {
             .height
             .saturating_sub(3 + u16::from(!placed.is_empty()));
 
-        // The selected row stays on screen in a listing longer than the box.
-        let first = (self.selected + 1).saturating_sub(usize::from(rows));
+        // The selected row stays on screen in a listing longer than the box,
+        // which moves only when it has to.
         let visible = self.visible().len();
+        let first =
+            crate::picker::scrolled(self.first.get(), self.selected, usize::from(rows), visible);
+        self.first.set(first);
         let rows = (first..visible)
             .take(usize::from(rows))
             .enumerate()

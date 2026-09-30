@@ -2861,7 +2861,13 @@ impl App {
         if is_use {
             self.note_active();
         }
+        let overlay = self.overlay_tag();
         let handled = self.act_on(event, area);
+        // A press on one dialog is not the first half of a double-click on
+        // the next, which may have a row or button in the same place.
+        if self.overlay_tag() != overlay {
+            self.clicks = pointer::Clicks::default();
+        }
         // Settled after the event, whichever way it went: a click, a paste
         // or a key can end scroll mode, or close or move focus off the pane
         // it reads, and a key can start it.
@@ -2928,6 +2934,14 @@ impl App {
             // frame beneath it, so none is still live once it closes. A press
             // on the overlay itself is its own, and waits for its release.
             self.end_gesture_beneath_overlay();
+            // A key or a paste is the user moving on from a press still held
+            // on the overlay: its release must not act on whatever the key
+            // has brought up, such as the next approval.
+            if matches!(event, Event::Paste(_))
+                || matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press)
+            {
+                self.end_gesture();
+            }
             if let Event::Mouse(mouse) = event {
                 self.route_pointer(mouse, area)?;
                 return Ok(());
@@ -3005,6 +3019,13 @@ impl App {
             // window never saw (an overlay took it, or the gesture ended
             // early): nothing owns it, and the pane under the pointer did not
             // receive the press.
+            return Ok(true);
+        }
+
+        // A frame drawn under another overlay knows nothing of this one: what
+        // it recorded is not what is on screen, and the layout beneath it may
+        // be covered. Nothing acts until the next frame has drawn.
+        if !self.hits.is_for(self.overlay_tag()) {
             return Ok(true);
         }
 
@@ -3180,6 +3201,14 @@ impl App {
                     Some(pointer::DialogHit::Button(_) | pointer::DialogHit::Step(..)),
                     Some(owner),
                 ) => {
+                    // The second press of a double on an approval button is
+                    // ignored: answering advances to the next request, which
+                    // is drawn in the same box, so the second click would
+                    // decide a request the user never read.
+                    let double = self.clicks.press(owner, self.now());
+                    if double && matches!(self.overlay, Some(Overlay::Approval { .. })) {
+                        return Ok(());
+                    }
                     self.gesture = Some(pointer::Gesture {
                         owner,
                         button: MouseButton::Left,
@@ -3205,6 +3234,7 @@ impl App {
                         }
                     }
                     Some(Overlay::Approval { .. }) => self.scroll_approval(down),
+                    Some(Overlay::Settings { form, .. }) => form.scroll_rows(down),
                     Some(overlay) => {
                         if let Some(picker) = overlay.picker_mut() {
                             if down {
@@ -3551,6 +3581,10 @@ impl App {
                 self.open_tab_menu(index, (mouse.column, mouse.row.saturating_add(1)));
             }
             pointer::Target::PaneHeader(id) => self.open_pane_menu(id, at),
+            // Under the `…`, where its left click hangs the same menu.
+            pointer::Target::PaneMenu(id) => {
+                self.open_pane_menu(id, (mouse.column, mouse.row.saturating_add(1)));
+            }
             _ => {}
         }
     }
@@ -3579,7 +3613,7 @@ impl App {
         let (project, shell) = (pane.project, pane.harness.as_str() == SHELL);
         // Moving left from the first tab has nowhere to go. Moving right from
         // the last makes a tab, so it is always open.
-        let on_first = tabs::views(&self.state, Some(project), &self.tileable())
+        let on_first = tabs::views(&self.state, Some(project), &self.tileable_in(Some(project)))
             .first()
             .is_some_and(|view| view.panes.contains(&id));
         let zoomed = self.state.zoomed_pane() == Some(id);
@@ -3699,6 +3733,17 @@ impl App {
         false
     }
 
+    /// Whether a menu's project is still listed. One dropped while the menu
+    /// was open is not, and nothing then acts on whichever project is
+    /// selected.
+    fn project_is_there(&mut self, id: ProjectId) -> bool {
+        if self.state.projects().iter().any(|project| project.id == id) {
+            return true;
+        }
+        self.status = "that project is gone".into();
+        false
+    }
+
     /// Shows a menu's tab, if the tab at `index` is still the one it was
     /// opened on. `select_tab` would wrap a stale index to the first tab.
     fn select_menu_tab(&mut self, index: usize, id: Option<TabId>) -> bool {
@@ -3714,6 +3759,8 @@ impl App {
     /// target the focus or selection and running what its key runs.
     fn choose_menu(&mut self, action: MenuAction) {
         self.overlay = None;
+        // Choosing is what the drawer was opened for, as picking a row is.
+        self.drawer_open = false;
         match action {
             MenuAction::ZoomPane(id) => {
                 if !self.go_to_menu_pane(id) {
@@ -3733,14 +3780,22 @@ impl App {
             }
             MenuAction::ClosePane(id) => self.close_pane(id),
             MenuAction::NewPaneIn(project) => {
-                self.select_project(project);
-                self.open_harness_picker();
+                if self.project_is_there(project) {
+                    self.select_project(project);
+                    self.open_harness_picker();
+                }
             }
             MenuAction::FoldProject(project) => {
-                self.select_project(project);
-                self.state.toggle_project_collapsed(project);
+                if self.project_is_there(project) {
+                    self.select_project(project);
+                    self.state.toggle_project_collapsed(project);
+                }
             }
-            MenuAction::RemoveProject(project) => self.drop_project(project),
+            MenuAction::RemoveProject(project) => {
+                if self.project_is_there(project) {
+                    self.drop_project(project);
+                }
+            }
             MenuAction::RenameTab(index, id) => {
                 if self.select_menu_tab(index, id) {
                     self.open_rename_tab();
@@ -5815,13 +5870,24 @@ impl App {
     /// spread into its place. It stays in the sidebar, where selecting it shows
     /// what it printed — the output is worth keeping, the floor space is not.
     fn tileable(&self) -> Vec<PaneId> {
+        self.tileable_in(self.state.selected_project())
+    }
+
+    /// What `project` would tile, whether or not it is the one on screen.
+    fn tileable_in(&self, project: Option<ProjectId>) -> Vec<PaneId> {
         let mut ordered = Vec::new();
+        let panes: Vec<&dispatch_core::Pane> = project
+            .map(|project| self.state.panes_for(project))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pane| !pane.closed)
+            .collect();
 
         // A tree walk rather than the order panes were created in. An opened
         // subagent has to sit next to the pane that asked for it — that is what
         // `^a s` is for — and with a grid that holds four, creation order can
         // put a parent on one tab and its child on the next.
-        for pane in self.state.visible_panes() {
+        for pane in &panes {
             if pane.parent.is_some() || !pane.status.is_live() {
                 continue;
             }
@@ -5833,7 +5899,7 @@ impl App {
         // A subagent whose parent is a tombstone — closed, but kept because
         // this work outlived it — has no parent row to follow and would drop
         // out of the grid entirely.
-        for pane in self.state.visible_panes() {
+        for pane in &panes {
             if pane.parent.is_some()
                 && pane.status.is_live()
                 && self.expanded.contains(&pane.id)
@@ -9943,7 +10009,9 @@ mod tests {
 
     #[test]
     fn a_double_click_on_the_sidebar_edge_restores_its_width() {
+        let dir = scratch("ui-edge-double");
         let (mut app, project, daemon, _sent) = attached_app();
+        app.keep_ui_in(&dir);
         let clock = hand_clock(&mut app);
         spawn_several(&mut app, &daemon, project, 1);
         app.sidebar_width = 50;
@@ -9957,6 +10025,12 @@ mod tests {
             app.sidebar_width,
             dispatch_config::ui_state::DEFAULT_SIDEBAR
         );
+        assert_eq!(
+            dispatch_config::ui_state::load(&dir).sidebar_width,
+            dispatch_config::ui_state::DEFAULT_SIDEBAR,
+            "the restored width is the one kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -16682,5 +16756,273 @@ args = ["--effort", "{value}"]
         drawn(&mut app, &mut terminal);
         let left = terminal.backend().buffer()[(rect.x + 2, rect.y)].modifier;
         assert!(!left.contains(Modifier::UNDERLINED), "{left:?}");
+    }
+
+    /// Two requests waiting, the first shown and drawn, with a hand clock.
+    fn two_approvals() -> (
+        App,
+        Rc<Cell<Instant>>,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) {
+        let (mut app, _first) = app_with_one_pending();
+        let clock = hand_clock(&mut app);
+        let first = &app.pending[0];
+        let second = PendingRequest {
+            request: RequestId::new(),
+            parent: first.parent,
+            project: first.project,
+            harness: first.harness.clone(),
+            task: "and the docs".into(),
+            depth: first.depth,
+        };
+        app.pending.push_back(second);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        (app, clock, terminal)
+    }
+
+    fn decisions(app: &App) -> Vec<(bool, bool)> {
+        app.sent
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::DelegateDecision {
+                    approve, blanket, ..
+                } => Some((*approve, *blanket)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_double_click_on_approve_answers_one_request_not_two() {
+        let (mut app, clock, mut terminal) = two_approvals();
+
+        click_button(&mut app, pointer::ButtonId::Approve);
+        advance(&clock, Duration::from_millis(120));
+        drawn(&mut app, &mut terminal);
+        click_button(&mut app, pointer::ButtonId::Approve);
+
+        assert_eq!(decisions(&app), vec![(true, false)], "only the first");
+        assert_eq!(app.pending.len(), 1, "the second is still waiting");
+
+        // A slow second click is a fresh decision.
+        advance(&clock, Duration::from_millis(500));
+        drawn(&mut app, &mut terminal);
+        click_button(&mut app, pointer::ButtonId::Approve);
+        assert_eq!(decisions(&app).len(), 2);
+    }
+
+    #[test]
+    fn a_key_pressed_while_a_button_is_held_ends_that_press() {
+        use crossterm::event::MouseButton::Left;
+        let (mut app, _clock, mut terminal) = two_approvals();
+        let (column, row) = middle(button_rect(&app, pointer::ButtonId::Approve));
+
+        mouse_at(&mut app, MouseEventKind::Down(Left), column, row);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.gesture.is_none(), "the key ended the press");
+        drawn(&mut app, &mut terminal);
+        mouse_at(&mut app, MouseEventKind::Up(Left), column, row);
+
+        assert_eq!(decisions(&app), vec![(true, false)], "only the key's");
+        assert_eq!(
+            app.approval_pressed, None,
+            "the next one draws no held button"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_row_of_a_scrolled_list_runs_the_row_under_the_pointer() {
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        app.overlay = None;
+        let clock = hand_clock(&mut app);
+        let mut terminal = a_wide_terminal();
+        app.open_help();
+        // Up from the top wraps to the last command, which scrolls the list.
+        press(&mut app, KeyCode::Up);
+        drawn(&mut app, &mut terminal);
+        let rows = dialog(&app).rows;
+        assert!(rows[0].1 > 0, "the list is scrolled: {rows:?}");
+
+        // A row in the middle whose command does something when run.
+        let (rect, index) = rows[rows.len() / 2..]
+            .iter()
+            .copied()
+            .find(|(_, index)| {
+                let Some(Overlay::Help(picker)) = &app.overlay else {
+                    panic!("the help is open");
+                };
+                Command::from_name(&picker.items()[*index].id)
+                    .and_then(Command::action)
+                    .is_some()
+            })
+            .expect("a command among the lower rows runs");
+        let (column, row) = middle(rect);
+
+        click(&mut app, column, row);
+        advance(&clock, Duration::from_millis(100));
+        drawn(&mut app, &mut terminal);
+        let Some(Overlay::Help(picker)) = &app.overlay else {
+            panic!("a single click leaves the help open");
+        };
+        assert_eq!(picker.selected_index(), index, "the click selected its row");
+        assert_eq!(
+            dialog(&app)
+                .rows
+                .iter()
+                .find(|(_, i)| *i == index)
+                .map(|(r, _)| *r),
+            Some(rect),
+            "and the row is still under the pointer"
+        );
+
+        click(&mut app, column, row);
+        assert!(
+            !matches!(app.overlay, Some(Overlay::Help(_))),
+            "the second click ran the command it landed on"
+        );
+    }
+
+    #[test]
+    fn a_project_menu_outlives_its_project_without_acting() {
+        let (mut app, _terminal, _first, _parent, _child) = app_with_a_drawn_sidebar();
+        let second = app.state.projects()[1].id;
+        app.open_project_menu(second, (8, 2));
+        app.drop_project(second);
+        assert!(app.state.projects().iter().all(|p| p.id != second));
+
+        for action in [
+            MenuAction::NewPaneIn(second),
+            MenuAction::FoldProject(second),
+            MenuAction::RemoveProject(second),
+        ] {
+            app.status.clear();
+            app.choose_menu(action);
+            assert!(app.overlay.is_none(), "{action:?} opened nothing");
+            assert_eq!(app.status, "that project is gone", "{action:?}");
+        }
+    }
+
+    #[test]
+    fn the_wheel_over_the_settings_form_moves_its_row() {
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        press(&mut app, KeyCode::Char('e'));
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let (column, row) = middle(dialog(&app).rect);
+        let selected = |app: &App| match &app.overlay {
+            Some(Overlay::Settings { form, .. }) => form.selected_index(),
+            _ => panic!("the settings are open"),
+        };
+        let start = selected(&app);
+
+        mouse_at(&mut app, MouseEventKind::ScrollDown, column, row);
+        assert_ne!(selected(&app), start, "a notch down moves a row");
+        mouse_at(&mut app, MouseEventKind::ScrollUp, column, row);
+        assert_eq!(selected(&app), start, "and a notch up moves it back");
+    }
+
+    #[test]
+    fn a_click_before_a_dialog_changes_is_not_half_a_double_on_the_next() {
+        let (mut app, _panes, _daemon, _sent, _clock, mut terminal) = waiting_list_of_three();
+
+        click_row(&mut app, 1);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+        app.open_attention_picker();
+        drawn(&mut app, &mut terminal);
+        click_row(&mut app, 1);
+
+        assert!(
+            matches!(app.overlay, Some(Overlay::Attention(_))),
+            "the same row of another list, at once, is a first click"
+        );
+    }
+
+    #[test]
+    fn a_press_over_a_frame_drawn_under_another_overlay_does_nothing() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        track_mouse(&mut app, &daemon, pane);
+        app.open_help();
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none(), "the help has closed since the frame");
+        drain(&sent);
+
+        // Undrawn, so the map is the help's and the layout is the panes'.
+        let (_, tile) = app.layout[0];
+        let interior = App::interior(tile);
+        click(&mut app, interior.x + 1, interior.y + 1);
+
+        assert!(
+            !writes_by_pane(&sent).contains_key(&pane),
+            "the click reached no pane"
+        );
+    }
+
+    #[test]
+    fn a_pane_menu_offers_moving_back_by_its_own_projects_tabs() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let other = app
+            .state
+            .add_project(Project::new("/tmp/other", ProjectSource::LocalDir));
+        app.select_project(other);
+
+        for (pane, enabled) in [(panes[0], false), (panes[1], true)] {
+            app.open_pane_menu(pane, (0, 0));
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("a menu is open");
+            };
+            let back = menu
+                .items()
+                .iter()
+                .find(|item| item.label == "Move to previous tab")
+                .expect("offered");
+            assert_eq!(back.enabled, enabled, "{pane:?}");
+        }
+    }
+
+    #[test]
+    fn choosing_from_a_menu_puts_the_drawer_away() {
+        let (mut app, _terminal, _first, parent, _child) = app_with_a_drawn_sidebar();
+        app.drawer_open = true;
+        app.open_pane_menu(parent, (8, 3));
+
+        app.choose_menu(MenuAction::ZoomPane(parent));
+
+        assert!(!app.drawer_open);
+    }
+
+    #[test]
+    fn a_right_click_on_the_ellipsis_opens_the_pane_menu() {
+        use crossterm::event::MouseButton::Right;
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let (_, tile) = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .copied()
+            .expect("tiled");
+        let at = (tile.x + tile.width - 3, tile.y);
+        assert_eq!(
+            app.hits.at(at.0, at.1),
+            Some(pointer::Target::PaneMenu(pane))
+        );
+
+        mouse_at(&mut app, MouseEventKind::Down(Right), at.0, at.1);
+        mouse_at(&mut app, MouseEventKind::Up(Right), at.0, at.1);
+
+        assert!(matches!(app.overlay, Some(Overlay::Menu(_))));
+        assert!(menu_labels(&app).contains(&"Zoom".to_string()));
     }
 }

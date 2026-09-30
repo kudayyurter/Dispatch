@@ -122,10 +122,10 @@ The project list is framed on the left. It is a tree: each project carries a
 twisty, and so does any pane running subagents. Clicking a project's row moves
 the view to it, and clicking its chevron folds its panes away; clicking a
 pane's twisty folds its subagents, and clicking anywhere else on a pane's row
-focuses it. `^a f` folds
-from the keyboard, for a terminal with no mouse reporting: the focused pane's
-subagents, or the project above it when that pane has none. The project
-the grid is showing is highlighted across the full width of the row.
+focuses it. `^a f` folds from the keyboard, for a terminal with no mouse
+reporting: the focused pane's subagents, or the project above it when that pane
+has none. The project the grid is showing is highlighted across the full width
+of the row.
 
 `Alt s` folds the sidebar away and back, giving the panes its columns.
 `Ctrl o <` and `Ctrl o >` make it narrower or wider by two columns, and so does
@@ -193,10 +193,11 @@ Right-clicking a pane's row or a tab changes nothing until an item is chosen.
 Every dialog takes the mouse, and while one is open nothing is sent to a pane:
 no click, paste or key. Click a row of a list to select it, and double-click it
 (or press its button) to act. Each dialog draws its buttons along its bottom
-edge, and a button does exactly what its key does; the one Enter presses is
-drawn in the accent colour. Press a button and slide off it before letting go
-to call the press back. A box too small for its buttons leaves them out, and
-the keys still work.
+edge, and a button does exactly what its key does; where Enter acts, the
+button it presses is drawn in the accent colour (the delegation request and the
+close-tab question have none, since Enter does nothing there). Press a button
+and slide off it before letting go to call the press back. A box too small for
+its buttons leaves them out, and the keys still work.
 
 | Dialog | Click | Double-click | Buttons |
 |---|---|---|---|
@@ -211,6 +212,9 @@ the keys still work.
 The wheel over a list moves its selection one row a notch, and never scrolls a
 pane behind it. A click outside a dialog does nothing; a click outside a menu
 closes it.
+
+In lock mode the mouse works exactly as it does in normal mode: locking hands
+every key to the pane, and leaves the pointer to Dispatch.
 
 ## Keeping projects
 

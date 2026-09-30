@@ -18,7 +18,8 @@ pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 pub use dispatch_tui::button::ButtonId;
 
 /// The buttons each kind of dialog carries, left to right. The default, which
-/// is the one Enter presses, is drawn in the accent.
+/// is the one Enter presses, is drawn in the accent. A dialog where Enter does
+/// nothing, such as the delegation request, has none.
 pub mod buttons {
     use dispatch_tui::button::{Button, ButtonId};
 
@@ -61,7 +62,7 @@ pub mod buttons {
             button(ButtonId::Later, "Later", false),
             button(ButtonId::Deny, "Deny", false),
             button(ButtonId::Always, "Always", false),
-            button(ButtonId::Approve, "Approve", true),
+            button(ButtonId::Approve, "Approve", false),
         ]
     }
 
@@ -79,7 +80,7 @@ pub mod buttons {
     pub fn close_cancel() -> Vec<Button> {
         vec![
             button(ButtonId::Cancel, "Cancel", false),
-            button(ButtonId::Close, "Close", true),
+            button(ButtonId::Close, "Close", false),
         ]
     }
 }
@@ -170,6 +171,13 @@ impl HitMap {
             .rev()
             .find(|(rect, _)| rect.contains(position))
             .map(|(_, target)| *target)
+    }
+
+    /// Whether this frame was drawn with `overlay_now` open, so that what it
+    /// recorded is what is on screen.
+    #[must_use]
+    pub fn is_for(&self, overlay_now: Option<&'static str>) -> bool {
+        overlay_now == self.overlay
     }
 
     /// What a press at `(x, y)` may act on, with `overlay_now` open.
@@ -285,5 +293,13 @@ mod tests {
         clicks.press(Target::PaneHeader(a), start);
         assert!(!clicks.press(Target::PaneHeader(a), start + Duration::from_millis(401)));
         assert!(!clicks.press(Target::PaneHeader(b), start + Duration::from_millis(450)));
+    }
+
+    #[test]
+    fn a_dialog_where_enter_does_nothing_accents_no_button() {
+        for buttons in [buttons::approval(), buttons::close_cancel()] {
+            assert!(buttons.iter().all(|button| !button.default));
+        }
+        assert!(buttons::open_cancel().iter().any(|button| button.default));
     }
 }
