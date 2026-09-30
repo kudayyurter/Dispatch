@@ -4,7 +4,7 @@
 
 **Run several coding agents side by side, and see which one needs you.**
 
-[![CI](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)](LICENSE)
+[![CI](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
 [Install](#install) · [Usage](#usage) · [Docs](docs/usage.md)
 
@@ -83,4 +83,4 @@ Each pane is a real terminal, emulated with Ghostty's vendored `libghostty-vt`. 
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for vendored and derived code.
+MIT. Vendored and derived code keeps its own license (Apache-2.0 for the herdr-derived files); see [LICENSE](LICENSE) and [NOTICE](NOTICE).
