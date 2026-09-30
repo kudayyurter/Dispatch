@@ -74,10 +74,12 @@ pub enum Target {
 }
 ```
 
-`Button` names every dialog button in §6. The sidebar's rows come from
-`sidebar::sections`, the same walk that draws them. The existing
-`sidebar::hit_test` and `section_at` stay as the source of the sidebar's
-entries, and gain the chevron/rest split for project rows.
+`Button` names every dialog button in §6. The sidebar is one region in the
+map (`Target::Sidebar`). A press inside it is resolved further by the existing
+`sidebar::hit_test` and `section_at`, which walk `sidebar::sections` — the same
+walk that draws the rows — and which gain the chevron/rest split for project
+rows. Dialog and menu entries come from each widget's own `layout(area)`, the
+function its `render` also uses, so what is clickable is what is drawn.
 
 **Generation.** The map records which overlay was open when it was drawn: its
 kind, or none. When an event arrives and the open overlay's kind differs from
@@ -247,7 +249,7 @@ Nothing reaches a child while a dialog is open: no clicks, pastes or keys.
 |---|---|---|---|
 | Pickers (Harness, Project, Register, Machine, Attention, Help) | select the row | choose it | **[Open]** (Help: **[Run]**), **[Cancel]** |
 | Browser | select the entry | enter it (as Enter) | **[Open]**, **[Cancel]** |
-| Settings form | focus the row; ‹ or › step its value as ←/→ | | **[Open pane]**, **[Cancel]** |
+| Settings form | focus the row; ‹ or › step its value as ←/→ | | **[Open pane]**, **[Save as default]** (s), **[Cancel]** |
 | Approval | | | **[Approve]** (a), **[Deny]** (d), **[Always]** (A), **[Later]** (Esc) |
 | Rename tab / Open on / Add machine prompts | | | **[OK]**, **[Cancel]** |
 | Close tab | | | **[Close]**, **[Cancel]** |
