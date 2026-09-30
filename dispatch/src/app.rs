@@ -1168,6 +1168,18 @@ impl App {
         if self.state.is_project_collapsed(project) {
             self.state.toggle_project_collapsed(project);
         }
+        // A folded machine hides its projects' rows as surely as a folded
+        // project does.
+        if let Some(device) = self
+            .state
+            .projects()
+            .iter()
+            .find(|candidate| candidate.id == project)
+            .map(|candidate| candidate.device)
+            && self.state.is_device_collapsed(device)
+        {
+            self.state.toggle_device_collapsed(device);
+        }
         if let Some(parent) = parent
             && self.state.is_pane_collapsed(parent)
         {
@@ -7925,6 +7937,65 @@ mod tests {
             row.contains("1 waiting on you") && !row.contains("waiting on you —"),
             "{row}"
         );
+    }
+
+    #[test]
+    fn alt_a_switches_to_the_tab_the_waiting_pane_is_on() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        block(&mut app, panes[1]);
+        app.focus_pane(panes[0]);
+        assert_eq!(app.current_tab_id(), Some(tabs[0]));
+
+        press_alt(&mut app, 'a');
+
+        assert_eq!(app.state.focused_pane(), Some(panes[1]));
+        assert_eq!(app.current_tab_id(), Some(tabs[1]), "its tab is on screen");
+    }
+
+    #[test]
+    fn alt_a_expands_a_folded_parent_to_reach_a_waiting_subagent() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "claude");
+        block(&mut app, child);
+        app.state.toggle_pane_collapsed(parent);
+        assert!(app.state.is_pane_collapsed(parent));
+
+        press_alt(&mut app, 'a');
+
+        assert!(!app.state.is_pane_collapsed(parent));
+        assert_eq!(app.state.focused_pane(), Some(child));
+    }
+
+    #[test]
+    fn alt_a_unfolds_a_folded_machine() {
+        let mut app = App::new(HarnessRegistry::default());
+        let device = app.state.add_device(Device::new("laptop"));
+        let here = app
+            .state
+            .add_project(Project::new("/tmp/here", ProjectSource::LocalDir));
+        let there = app
+            .state
+            .add_project(Project::new("/tmp/there", ProjectSource::LocalDir).with_device(device));
+        let ours = app
+            .state
+            .spawn_pane(here, HarnessId::new("shell"))
+            .expect("the project exists");
+        let theirs = app
+            .state
+            .spawn_pane(there, HarnessId::new("shell"))
+            .expect("the project exists");
+        block(&mut app, theirs);
+        app.state.toggle_device_collapsed(device);
+        let _ = app.state.focus(ours);
+        assert!(app.state.is_device_collapsed(device));
+
+        press_alt(&mut app, 'a');
+
+        assert!(!app.state.is_device_collapsed(device));
+        assert_eq!(app.state.focused_pane(), Some(theirs));
     }
 
     fn press(app: &mut App, code: KeyCode) {
