@@ -428,7 +428,7 @@ fn each_mode_spells_out_its_keys() {
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Session),
-        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting  b sidebar  < narrower  > wider"
+        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting  b sidebar  < narrower  > wider  ? help"
     );
     assert_eq!(
         keymap.normal_help(),
@@ -789,4 +789,24 @@ fn alt_a_goes_to_the_next_waiting_pane() {
         Command::AttentionPicker.action(),
         Some(Action::AttentionPicker)
     );
+}
+
+#[test]
+fn every_command_says_what_it_does_and_no_two_say_the_same() {
+    let mut seen: Vec<(&str, Command)> = Vec::new();
+    for (command, name) in Command::NAMED {
+        let said = command.describe();
+        assert!(!said.is_empty(), "{name} has no description");
+        if command.action().is_none() {
+            continue;
+        }
+        if let Some((_, other)) = seen.iter().find(|(text, _)| *text == said) {
+            let pair = (*other, *command);
+            assert!(
+                pair == (Command::ScrollBottom, Command::LeaveScroll),
+                "{said:?} describes two commands: {pair:?}"
+            );
+        }
+        seen.push((said, *command));
+    }
 }

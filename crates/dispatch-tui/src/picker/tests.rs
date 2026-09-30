@@ -277,3 +277,52 @@ fn the_picker_draws_only_in_its_chrome() {
     let cell = buf.cell((buf.area.width / 2, y)).expect("on screen");
     assert_eq!(cell.bg, chrome.selection.bg.expect("a background"));
 }
+
+#[test]
+fn a_filter_narrows_the_rows_and_the_selection_follows() {
+    let mut picker = picker().with_filter();
+    for c in "codex".chars() {
+        picker.push_filter(c);
+    }
+    assert_eq!(picker.filter(), Some("codex"));
+    assert_eq!(
+        picker.selected().map(|item| item.id.as_str()),
+        Some("codex")
+    );
+    picker.next();
+    assert_eq!(
+        picker.selected().map(|item| item.id.as_str()),
+        Some("codex"),
+        "one row left"
+    );
+
+    picker.pop_filter();
+    picker.pop_filter();
+    picker.pop_filter();
+    assert_eq!(
+        picker.selected().map(|item| item.id.as_str()),
+        Some("claude")
+    );
+}
+
+#[test]
+fn a_filter_matching_nothing_says_so_and_chooses_nothing() {
+    let mut picker = picker().with_filter();
+    picker.push_filter('z');
+    assert!(picker.selected().is_none());
+    assert!(text(&render(&picker, 40, 8)).contains("nothing to choose"));
+}
+
+#[test]
+fn a_filter_is_drawn_above_the_rows() {
+    let mut picker = picker().with_filter();
+    picker.push_filter('a');
+    let drawn = text(&render(&picker, 40, 8));
+    let lines: Vec<&str> = drawn.lines().collect();
+    let filter = lines
+        .iter()
+        .position(|l| l.contains("> a"))
+        .expect("the filter line");
+    let row = lines.iter().position(|l| l.contains("agy")).expect("a row");
+    assert!(filter < row);
+}

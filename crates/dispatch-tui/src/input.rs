@@ -131,6 +131,8 @@ pub enum Action {
     ToggleSidebar,
     /// Make the sidebar this many columns wider; negative narrows it.
     ResizeSidebar(i16),
+    /// Open the searchable list of every command.
+    Help,
     /// Quit.
     Quit,
 }

@@ -52,6 +52,8 @@ pub struct Picker {
     chrome: Chrome,
     /// What the keys do, drawn on the bottom border.
     hint: Option<String>,
+    /// What has been typed to narrow the rows, for a picker that takes typing.
+    filter: Option<String>,
 }
 
 impl Picker {
@@ -64,6 +66,7 @@ impl Picker {
             selected: 0,
             chrome: Chrome::default(),
             hint: None,
+            filter: None,
         }
     }
 
@@ -85,9 +88,59 @@ impl Picker {
         self.hint.as_deref()
     }
 
+    /// The same picker, narrowed by what is typed into it.
+    #[must_use]
+    pub fn with_filter(mut self) -> Self {
+        self.filter = Some(String::new());
+        self
+    }
+
+    /// What has been typed, for a picker that takes typing.
+    #[must_use]
+    pub fn filter(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// Types `c` into the filter. The highlight goes back to the first row
+    /// left, which is the one most likely meant.
+    pub fn push_filter(&mut self, c: char) {
+        if let Some(filter) = &mut self.filter {
+            filter.push(c);
+            self.selected = 0;
+        }
+    }
+
+    /// Deletes the filter's last character.
+    pub fn pop_filter(&mut self) {
+        if let Some(filter) = &mut self.filter {
+            filter.pop();
+            self.selected = 0;
+        }
+    }
+
+    /// The rows the filter leaves, in order: every row when there is none.
+    /// Matched on the id, the label and the detail, ignoring case.
+    fn shown(&self) -> Vec<&Item> {
+        let needle = match &self.filter {
+            Some(filter) if !filter.is_empty() => filter.to_lowercase(),
+            _ => return self.items.iter().collect(),
+        };
+        self.items
+            .iter()
+            .filter(|item| {
+                item.id.to_lowercase().contains(&needle)
+                    || item.label.to_lowercase().contains(&needle)
+                    || item
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
     /// Moves the highlight to the row whose id is `id`, if there is one.
     pub fn select(&mut self, id: &str) {
-        if let Some(index) = self.items.iter().position(|item| item.id == id) {
+        if let Some(index) = self.shown().iter().position(|item| item.id == id) {
             self.selected = index;
         }
     }
@@ -101,7 +154,7 @@ impl Picker {
     /// Whether there is nothing to choose.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.shown().is_empty()
     }
 
     /// Index of the highlighted row.
@@ -113,7 +166,7 @@ impl Picker {
     /// The highlighted row.
     #[must_use]
     pub fn selected(&self) -> Option<&Item> {
-        self.items.get(self.selected)
+        self.shown().get(self.selected).copied()
     }
 
     /// Moves the highlight down, wrapping at the end.
@@ -121,18 +174,20 @@ impl Picker {
     /// Wrapping matters because these lists are short; walking off the bottom
     /// of a four-item list and stopping is more annoying than useful.
     pub fn next(&mut self) {
-        if self.items.is_empty() {
+        let len = self.shown().len();
+        if len == 0 {
             return;
         }
-        self.selected = (self.selected + 1) % self.items.len();
+        self.selected = (self.selected + 1) % len;
     }
 
     /// Moves the highlight up, wrapping at the start.
     pub fn previous(&mut self) {
-        if self.items.is_empty() {
+        let len = self.shown().len();
+        if len == 0 {
             return;
         }
-        self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
+        self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
     }
 }
 
@@ -164,6 +219,11 @@ impl Picker {
             .unwrap_or(0);
 
         let hint_width = self.hint.as_ref().map_or(0, |hint| hint.chars().count());
+        let filter_width = self
+            .filter
+            .as_ref()
+            .map_or(0, |filter| filter.chars().count() + 3);
+        let widest = widest.max(filter_width);
         u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
             .unwrap_or(u16::MAX)
             .max(20)
@@ -177,7 +237,9 @@ impl Widget for &Picker {
         }
 
         let width = self.desired_width().clamp(20.min(area.width), area.width);
-        let height = u16::try_from(self.items.len() + 2)
+        let shown = self.shown();
+        let filter_rows = usize::from(self.filter.is_some());
+        let height = u16::try_from(shown.len().max(1) + filter_rows + 2)
             .unwrap_or(u16::MAX)
             .clamp(3, area.height);
 
@@ -196,10 +258,23 @@ impl Widget for &Picker {
                 Line::styled(format!(" {hint} "), self.chrome.border).right_aligned(),
             );
         }
-        let inner = block.inner(rect);
+        let mut inner = block.inner(rect);
         block.render(rect, buf);
 
-        if self.items.is_empty() {
+        if let Some(filter) = &self.filter {
+            write(
+                buf,
+                inner,
+                inner.x + 1,
+                inner.y,
+                &format!("> {filter}▏"),
+                self.chrome.accent,
+            );
+            inner.y += 1;
+            inner.height = inner.height.saturating_sub(1);
+        }
+
+        if shown.is_empty() {
             write(
                 buf,
                 inner,
@@ -215,7 +290,7 @@ impl Widget for &Picker {
         let rows = inner.height as usize;
         let first = self.selected.saturating_sub(rows.saturating_sub(1));
 
-        for (offset, item) in self.items.iter().skip(first).take(rows).enumerate() {
+        for (offset, item) in shown.iter().skip(first).take(rows).enumerate() {
             let index = first + offset;
             let y = inner.y + u16::try_from(offset).unwrap_or(0);
             let chosen = index == self.selected;

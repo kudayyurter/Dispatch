@@ -396,6 +396,8 @@ pub enum Command {
     ToggleSidebar,
     SidebarNarrower,
     SidebarWider,
+    /// Open the searchable list of every command.
+    Help,
     Quit,
 }
 
@@ -453,6 +455,7 @@ impl Command {
         (Command::ToggleSidebar, "toggle_sidebar"),
         (Command::SidebarNarrower, "sidebar_narrower"),
         (Command::SidebarWider, "sidebar_wider"),
+        (Command::Help, "help"),
         (Command::Quit, "quit"),
     ];
 
@@ -533,7 +536,69 @@ impl Command {
             Command::ToggleSidebar => "sidebar",
             Command::SidebarNarrower => "narrower",
             Command::SidebarWider => "wider",
+            Command::Help => "help",
             Command::Quit => "quit",
+        }
+    }
+
+    /// What it does, for the command help: a few words that stand alone,
+    /// where [`Command::label`] leans on the mode row around it.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Command::PaneMode => "Pane mode",
+            Command::TabMode => "Tab mode",
+            Command::ScrollMode => "Scroll mode",
+            Command::SessionMode => "Session mode",
+            Command::Lock => "Lock the keyboard",
+            Command::Unlock => "Unlock the keyboard",
+            Command::Prefix => "Prefix",
+            Command::LeaveMode => "Leave the mode",
+            Command::None => "Nothing",
+            Command::NewPane => "Start an agent or a shell",
+            Command::ClosePane => "Close the focused pane",
+            Command::Zoom => "Zoom the focused pane",
+            Command::FocusLeft => "Focus the pane to the left",
+            Command::FocusRight => "Focus the pane to the right",
+            Command::FocusUp => "Focus the pane above",
+            Command::FocusDown => "Focus the pane below",
+            Command::FocusLeftOrTab => "Focus left, or the previous tab",
+            Command::FocusRightOrTab => "Focus right, or the next tab",
+            Command::FocusNext => "Focus the next pane",
+            Command::ExpandChild => "Open a subagent's pane",
+            Command::CollapseChild => "Close a subagent's pane",
+            Command::NewTab => "New tab",
+            Command::RenameTab => "Rename the tab",
+            Command::CloseTab => "Close the tab",
+            Command::PreviousTab => "Previous tab",
+            Command::NextTab => "Next tab",
+            Command::LastTab => "The tab before this one",
+            Command::MovePaneLeft => "Move the pane to the previous tab",
+            Command::MovePaneRight => "Move the pane to the next tab",
+            Command::MoveTabLeft => "Move the tab left",
+            Command::MoveTabRight => "Move the tab right",
+            Command::GoToTab(_) => "Go to tab 1–9",
+            Command::ScrollDown => "Scroll down a line",
+            Command::ScrollUp => "Scroll up a line",
+            Command::ScrollHalfDown => "Scroll down half a page",
+            Command::ScrollHalfUp => "Scroll up half a page",
+            Command::ScrollPageDown => "Scroll down a page",
+            Command::ScrollPageUp => "Scroll up a page",
+            Command::ScrollTop => "Scroll to the oldest output",
+            Command::ScrollBottom | Command::LeaveScroll => "Back to live output",
+            Command::ProjectPicker => "Switch project",
+            Command::OpenProject => "Open a project",
+            Command::AddMachine => "Add a machine",
+            Command::HarnessManager => "Register a harness",
+            Command::Approvals => "Answer delegation requests",
+            Command::Fold => "Fold or unfold",
+            Command::NextAttention => "Go to the next agent waiting on you",
+            Command::AttentionPicker => "List the agents waiting on you",
+            Command::ToggleSidebar => "Show or hide the sidebar",
+            Command::SidebarNarrower => "Make the sidebar narrower",
+            Command::SidebarWider => "Make the sidebar wider",
+            Command::Help => "Command help",
+            Command::Quit => "Quit",
         }
     }
 
@@ -642,6 +707,7 @@ impl Command {
             Command::ToggleSidebar => Action::ToggleSidebar,
             Command::SidebarNarrower => Action::ResizeSidebar(-2),
             Command::SidebarWider => Action::ResizeSidebar(2),
+            Command::Help => Action::Help,
             Command::Quit => Action::Quit,
         })
     }
@@ -690,6 +756,7 @@ impl Keymap {
             (Chord::alt('j'), Command::FocusDown),
             (Chord::alt('a'), Command::NextAttention),
             (Chord::alt('s'), Command::ToggleSidebar),
+            (Chord::alt('/'), Command::Help),
         ];
 
         let mut prefix = vec![
@@ -711,6 +778,7 @@ impl Keymap {
             (Chord::char('['), Command::ScrollMode),
             (Chord::char('w'), Command::NextAttention),
             (Chord::char('b'), Command::ToggleSidebar),
+            (Chord::char('?'), Command::Help),
         ];
         prefix.extend(digits(Command::GoToTab));
         prefix.push((Chord::key(Tab), Command::NextTab));
@@ -792,6 +860,7 @@ impl Keymap {
             (Chord::char('b'), Command::ToggleSidebar),
             (Chord::char('<'), Command::SidebarNarrower),
             (Chord::char('>'), Command::SidebarWider),
+            (Chord::char('?'), Command::Help),
             (Chord::key(Esc), Command::LeaveMode),
             (Chord::key(Enter), Command::LeaveMode),
         ];

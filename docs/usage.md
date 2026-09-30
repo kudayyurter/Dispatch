@@ -56,17 +56,23 @@ other key goes to the pane.
 | `Ctrl p` | pane: `n` new, `x` close, `f`/`z` zoom, `h` `j` `k` `l` or arrows to move focus, `p` next pane, `s` open a subagent, `c` collapse it |
 | `Ctrl t` | tab: see [Tabs](#tabs) above |
 | `Ctrl s` | scroll: `j` `k` a line, `d` `u` half a page, `PageDown` `PageUp` (or `Ctrl f` `Ctrl b`, `l` `h`) a page, `g` `G` the oldest and newest output; `Esc` returns to live output |
-| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you, `b` fold the sidebar, `<` `>` narrow or widen it |
+| `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you, `b` fold the sidebar, `<` `>` narrow or widen it, `?` command help |
 | `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
-| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you, `^a b` folds the sidebar |
+| `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you, `^a b` folds the sidebar, `^a ?` opens command help |
 
 Some keys work without a mode: `Alt n` opens a new pane on this tab,
 `Alt a` goes to the next agent waiting on you, in any project,
 `Alt s` folds the sidebar away and back,
+`Alt /` opens command help: every command with the keys that reach it. Type
+to search, `Enter` runs the one highlighted and `Esc` closes it.
 `Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
 moves focus, going on to the next tab at the grid's edge. As in zellij, a
 quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
 that letter.
+
+A project with nothing open shows how to start: the keys for a new agent, for a
+shell and for command help, as you have them bound. The status row always ends
+with the help key, whatever else it is saying.
 
 Four of these keys are newly taken from panes: `Ctrl p` is a shell's
 previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is

@@ -334,6 +334,8 @@ enum Overlay {
     Machine(Picker),
     /// The panes waiting on the user, to go to one.
     Attention(Picker),
+    /// Every command, to find one and run it.
+    Help(Picker),
     /// A machine being registered.
     AddMachine(AddMachine),
     /// A path to open on a machine this client cannot browse.
@@ -372,7 +374,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
-            | Overlay::Attention(picker) => Some(picker),
+            | Overlay::Attention(picker)
+            | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
@@ -390,7 +393,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
-            | Overlay::Attention(picker) => Some(picker),
+            | Overlay::Attention(picker)
+            | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
@@ -410,7 +414,9 @@ impl Overlay {
             Overlay::Register(_) => Some(OverlayKind::Register),
             Overlay::Machine(_) => Some(OverlayKind::Machine),
             Overlay::Attention(_) => Some(OverlayKind::Attention),
-            Overlay::Settings { .. }
+            // Help has its own key handling and runs a command, not a choice.
+            Overlay::Help(_)
+            | Overlay::Settings { .. }
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
@@ -427,7 +433,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
-            | Overlay::Attention(picker) => picker.desired_width(),
+            | Overlay::Attention(picker)
+            | Overlay::Help(picker) => picker.desired_width(),
             Overlay::Settings { form, .. } => form.desired_width(),
             Overlay::OpenOn { prompt, .. }
             | Overlay::RenameTab { prompt, .. }
@@ -447,7 +454,8 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
-            | Overlay::Attention(picker) => picker.set_chrome(chrome),
+            | Overlay::Attention(picker)
+            | Overlay::Help(picker) => picker.set_chrome(chrome),
             Overlay::Settings { form, .. } => form.set_chrome(chrome),
             Overlay::Browse(browser) => browser.set_chrome(chrome),
             Overlay::OpenOn { prompt, .. } => prompt.set_chrome(chrome),
@@ -1250,6 +1258,32 @@ impl App {
             Some(id) => self.go_to_pane(id),
             None => self.status = NOTHING_WAITING.to_string(),
         }
+    }
+
+    /// Opens the searchable list of every command, each with the keys that
+    /// reach it.
+    fn open_help(&mut self) {
+        let keymap = self.router.keymap();
+        let items: Vec<Item> = Command::NAMED
+            .iter()
+            .map(|(command, name)| (*command, (*name).to_string()))
+            .chain(std::iter::once((
+                Command::GoToTab(1),
+                Command::GoToTab(1).name(),
+            )))
+            .filter(|(command, _)| command.action().is_some() && *command != Command::Help)
+            .map(|(command, name)| {
+                let keys = keymap
+                    .path_to(command)
+                    .unwrap_or_else(|| "no key".to_string());
+                Item::new(name, command.describe()).with_detail(keys)
+            })
+            .collect();
+        self.overlay = Some(Overlay::Help(
+            Picker::new("Commands", items)
+                .with_filter()
+                .with_hint("type to search  Enter run  Esc close"),
+        ));
     }
 
     /// Opens the list of every pane waiting on the user.
@@ -2988,6 +3022,14 @@ impl App {
             self.status.clear();
         }
 
+        self.perform(action);
+
+        Ok(())
+    }
+
+    /// Does what an action says, whether a key or a choice in the command
+    /// help asked for it.
+    fn perform(&mut self, action: Action) {
         match action {
             Action::None => {}
             Action::Quit => self.quit = true,
@@ -3036,9 +3078,8 @@ impl App {
                     self.scroll_to_bottom(id);
                 }
             }
+            Action::Help => self.open_help(),
         }
-
-        Ok(())
     }
 
     /// Shows a tab by focusing a pane on it: the one this client last used
@@ -3216,6 +3257,39 @@ impl App {
 
         if matches!(self.overlay, Some(Overlay::AddMachine(_))) {
             self.handle_add_machine_key(key);
+            return Ok(());
+        }
+
+        // Letters are the search, so only arrows, Enter, Backspace and Esc
+        // act here.
+        if let Some(Overlay::Help(picker)) = &mut self.overlay {
+            match key.code {
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Down => picker.next(),
+                KeyCode::Up => picker.previous(),
+                KeyCode::Backspace => picker.pop_filter(),
+                KeyCode::Enter => {
+                    let action = picker
+                        .selected()
+                        .and_then(|item| Command::from_name(&item.id))
+                        .and_then(Command::action);
+                    if let Some(action) = action {
+                        self.overlay = None;
+                        self.perform(action);
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    picker.push_filter(c);
+                }
+                _ => {}
+            }
+            if self.overlay.is_none() {
+                self.open_next_approval();
+            }
             return Ok(());
         }
 
@@ -4524,6 +4598,13 @@ impl App {
             .map(|(id, frame)| (*id, Self::interior(*frame)))
             .collect();
         self.draw_panes(frame, now);
+        if self.state.selected_project().is_some()
+            && self.frames.is_empty()
+            && self.closing.is_empty()
+            && self.overlay.is_none()
+        {
+            self.draw_empty(frame, panes_area);
+        }
         if docked == 0 {
             if self.drawer_open {
                 Clear.render(sidebar_area, frame.buffer_mut());
@@ -5485,6 +5566,58 @@ impl App {
         }
     }
 
+    /// Says how to start, in a project with nothing open: the keys as bound,
+    /// and a line left out when no key reaches it.
+    fn draw_empty(&self, frame: &mut Frame<'_>, area: Rect) {
+        let keymap = self.router.keymap();
+        let new_pane = keymap.path_to(Command::NewPane);
+        let lines: Vec<(&str, String)> = [
+            ("Start an agent", new_pane.clone()),
+            (
+                "Open a shell",
+                new_pane.map(|keys| format!("{keys}, then shell")),
+            ),
+            ("Command help", keymap.path_to(Command::Help)),
+        ]
+        .into_iter()
+        .filter_map(|(label, keys)| keys.map(|keys| (label, keys)))
+        .collect();
+
+        let label_width = lines
+            .iter()
+            .map(|(label, _)| Span::raw(*label).width())
+            .max()
+            .unwrap_or(0);
+        let width = lines
+            .iter()
+            .map(|(_, keys)| label_width + 4 + Span::raw(keys.as_str()).width())
+            .max()
+            .unwrap_or(0);
+        let width = u16::try_from(width).unwrap_or(u16::MAX).min(area.width);
+        let height = u16::try_from(lines.len()).unwrap_or(0).min(area.height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let rect = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+
+        let chrome = self.theme.chrome();
+        let text: Vec<Line<'_>> = lines
+            .into_iter()
+            .map(|(label, keys)| {
+                Line::from(vec![
+                    Span::styled(format!("{label:<label_width$}    "), chrome.secondary),
+                    Span::styled(keys, chrome.accent),
+                ])
+            })
+            .collect();
+        Paragraph::new(text).render(rect, frame.buffer_mut());
+    }
+
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.height == 0 {
             return;
@@ -5634,9 +5767,35 @@ impl App {
             Style::default().fg(self.theme.faded)
         };
 
-        Paragraph::new(text)
-            .style(style)
-            .render(row, frame.buffer_mut());
+        // The way into the command help, pinned to the end of the row and
+        // reserved first, so no message can push it off. A mode's row lists
+        // its own keys instead, and locked, help is not reachable anyway.
+        let chip = (mode == KeyMode::Normal)
+            .then(|| keymap.path_to(Command::Help))
+            .flatten()
+            .map(|keys| format!("{keys} help"));
+        let reserved = chip
+            .as_ref()
+            .map_or(0, |chip| {
+                u16::try_from(Span::raw(chip.as_str()).width() + 2).unwrap_or(u16::MAX)
+            })
+            .min(row.width);
+
+        Paragraph::new(text).style(style).render(
+            Rect::new(row.x, row.y, row.width - reserved, 1),
+            frame.buffer_mut(),
+        );
+        if let Some(chip) = chip
+            && reserved > 2
+        {
+            Paragraph::new(chip)
+                .style(Style::default().fg(self.theme.faded))
+                .alignment(ratatui::layout::Alignment::Right)
+                .render(
+                    Rect::new(row.x + row.width - reserved, row.y, reserved, 1),
+                    frame.buffer_mut(),
+                );
+        }
     }
 
     /// Fits every visible pane to the rectangle it now occupies, and
@@ -8611,8 +8770,8 @@ mod tests {
             "{row:?}"
         );
         assert!(
-            row.find("waiting on you") < row.find("pane(s)"),
-            "the key help follows, where being cut costs least: {row:?}"
+            row.find("waiting on you") < row.find("pane"),
+            "the key help follows, where being cut costs least (the help chip keeps the end): {row:?}"
         );
     }
 
@@ -13698,6 +13857,99 @@ args = ["--effort", "{value}"]
         assert!(
             !top_of(panes[1]).contains(" Working "),
             "only the focused one says"
+        );
+    }
+
+    #[test]
+    fn an_empty_project_says_how_to_start() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let screen = rendered_text(&terminal);
+        assert!(
+            screen.contains("Start an agent") && screen.contains("Alt n"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Open a shell") && screen.contains("Alt n, then shell"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Command help") && screen.contains("Alt /"),
+            "{screen}"
+        );
+
+        rebind(
+            &mut app,
+            &[
+                ("normal", "Alt n", "none"),
+                ("prefix", "n", "none"),
+                ("pane", "n", "none"),
+            ],
+        );
+        drawn(&mut app, &mut terminal);
+        let screen = rendered_text(&terminal);
+        assert!(
+            !screen.contains("Start an agent"),
+            "no key reaches it, so it is left out"
+        );
+    }
+
+    #[test]
+    fn help_lists_commands_filters_them_and_runs_the_one_chosen() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        press_alt(&mut app, '/');
+        let Some(Overlay::Help(picker)) = &app.overlay else {
+            panic!("help is open");
+        };
+        assert!(
+            picker
+                .items()
+                .iter()
+                .any(|item| item.label == "Show or hide the sidebar")
+        );
+
+        for c in "sidebar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.overlay.is_none());
+        assert!(app.sidebar_collapsed, "the command ran");
+    }
+
+    #[test]
+    fn help_with_no_match_keeps_the_list_open() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        press_alt(&mut app, '/');
+        for c in "zzzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help(_))),
+            "nothing to run, so it stays"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn the_help_chip_survives_a_long_status_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.set_status("x".repeat(200));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        assert!(
+            bottom_row(&terminal).trim_end().ends_with("Alt / help"),
+            "{}",
+            bottom_row(&terminal)
         );
     }
 }
