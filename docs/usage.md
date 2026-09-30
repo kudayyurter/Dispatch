@@ -41,8 +41,6 @@ it. When there are more tabs than fit, the row scrolls to keep yours in view.
 | `Esc` / `Enter` | leave tab mode |
 | `Ctrl t` | send `Ctrl t` itself to the pane (Claude Code and fzf use it) |
 
-Some keys work without a mode: see [Keys](#keys) below.
-
 A daemon keeps its projects' tabs, so they survive detaching and look the
 same from every client. A daemon older than tabs still works: its panes are
 grouped four at a time, as before.

@@ -23,7 +23,8 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 ```
 
 CI builds with exactly Rust 1.89, so a change that needs a newer compiler fails
-there first. Before sending a change, run what CI runs:
+there first. Before sending a change, run what
+[CI](../.github/workflows/ci.yml) runs:
 
 ```sh
 cargo fmt --all --check

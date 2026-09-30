@@ -9,8 +9,8 @@ dispatch delegate "write the tests for the http client"
 Dispatch asks you first, every time — unless you have approved that pane
 wholesale with `A`, which lasts until the daemon stops. The subagent runs as a
 pane under the one that asked, and the caller gets its output and exit code when
-it finishes. Focus stays where it was: open the subagent with `Ctrl p s` (or
-`^a s`) to watch it.
+it finishes. Focus stays where it was: `Ctrl p s` (or `^a s`) brings the
+subagent into the grid to watch it, and `Ctrl p c` (or `^a c`) puts it back.
 
 Delegation needs two things. The daemon must own the panes (`--attach`), because
 it is what starts the subagent; and the harness must declare a non-interactive
@@ -52,9 +52,6 @@ The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
 from that pane for this daemon's lifetime, and `Esc` to defer. The status line
 reports how many are waiting and which key reopens them — that key is `^a a`,
 or wherever `[keys]` has moved it.
-
-There are also keyboard bindings to open and close a subagent pane: `^a s` expands
-the focused pane's next child into the tiled grid, and `^a c` collapses it back out.
 
 The subagent's output goes to stdout and every status line to stderr, so
 `dispatch delegate "…" > result.md` captures the work and nothing else. Fan-out

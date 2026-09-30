@@ -44,20 +44,14 @@ A harness's own `env` still wins.
 
 ## Harness settings
 
-Every agent Dispatch ships starts **without its permission prompts**: Claude
-Code in `bypassPermissions` mode, Codex with
-`--dangerously-bypass-approvals-and-sandbox` (which also drops its sandbox),
-agy with `--dangerously-skip-permissions`, and opencode with `--auto`. Read
-[security-model.md](security-model.md) before running an agent you
-do not trust this way.
-
-Claude Code refuses to start in bypass mode when it runs as root: on a
-machine where Dispatch's daemon runs as root — a container, many remote
-machines — every Claude pane and every delegated `claude -p` exits at once.
-Save another **Permissions** mode for Claude on that machine (`e`, then
-`s`), or, only when the machine really is a sandbox such as a container,
-set `IS_SANDBOX = "1"` in that machine's `claude.toml` under `[env]`, which
-Claude reads as permission to bypass.
+Every agent Dispatch ships starts **without its permission prompts**;
+[security-model.md](security-model.md#agents-start-without-permission-prompts)
+lists each agent's flag and what it lets the agent do. Claude Code refuses
+that mode when it runs as root, so on such a machine save another
+**Permissions** mode for Claude (`e`, then `s`), or, only when the machine
+really is a sandbox such as a container, set `IS_SANDBOX = "1"` in that
+machine's `claude.toml` under `[env]`, which Claude reads as permission to
+bypass.
 
 In the new-pane picker, `e` opens the highlighted harness's settings:
 
@@ -90,10 +84,8 @@ permissions = ""   # agent default: Claude asks, as it does outside Dispatch
 bypass = false     # Codex's prompts and sandbox are back
 ```
 
-These are per machine: a subagent is started by the daemon on its own
-machine, so it follows that machine's saved defaults, not the file of the
-machine you are typing on, and not a one-off choice made in the pane that
-asked for it.
+These are per machine: a subagent follows the saved defaults of the machine
+its daemon runs on, as [delegation.md](delegation.md) explains.
 
 A harness file says what its settings are, and how each becomes a flag, so a
 harness you add can have them as well:
