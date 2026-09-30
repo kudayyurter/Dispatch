@@ -105,11 +105,46 @@ pub struct SidebarMotion {
     pub glide: Option<Glide>,
 }
 
-/// The focus tint moving from one row to the focused one.
+/// Where a glide of the focus tint starts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Origin {
+    /// At rest on a row.
+    Row(Anchor),
+    /// Part-way from one row to another: where a glide had got to when a new
+    /// one replaced it, so rapid moves read as one continuous motion.
+    Between {
+        /// The row the replaced glide came from.
+        from: Anchor,
+        /// The row it was heading to.
+        to: Anchor,
+        /// How far it had got, eased, 0.0–1.0.
+        t: f32,
+    },
+}
+
+impl Origin {
+    /// The row it is nearer, for a glide that starts from it and is replaced
+    /// in turn: one level of `Between` is all there ever is.
+    #[must_use]
+    pub fn nearest(self) -> Anchor {
+        match self {
+            Origin::Row(anchor) => anchor,
+            Origin::Between { from, to, t } => {
+                if t < 0.5 {
+                    from
+                } else {
+                    to
+                }
+            }
+        }
+    }
+}
+
+/// The focus tint moving to the focused row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Glide {
     /// Where it started.
-    pub from: Anchor,
+    pub from: Origin,
     /// How far it has got, eased, 0.0–1.0.
     pub t: f32,
 }
@@ -936,22 +971,40 @@ impl Sidebar<'_> {
         };
         let text = self.theme.text;
 
-        match (find(glide.from), find(to)) {
-            (Some((a, from_y, body)), Some((b, to_y, _))) if a == b => {
-                let span = f32::from(to_y) - f32::from(from_y);
-                let y = (f32::from(from_y) + span * glide.t).round() as u16;
+        // Where the tint starts, in rows, and the section it starts in:
+        // resolved against this frame's rows, so a scroll under a glide
+        // moves its start with it.
+        let start = match glide.from {
+            Origin::Row(from) => find(from).map(|(index, y, _)| (index, f32::from(y))),
+            Origin::Between {
+                from,
+                to: towards,
+                t,
+            } => match (find(from), find(towards)) {
+                (Some((a, from_y, _)), Some((b, to_y, _))) if a == b => {
+                    let (from_y, to_y) = (f32::from(from_y), f32::from(to_y));
+                    Some((a, from_y + (to_y - from_y) * t))
+                }
+                _ => find(glide.from.nearest()).map(|(index, y, _)| (index, f32::from(y))),
+            },
+        };
+
+        match (start, find(to)) {
+            (Some((a, from_y)), Some((b, to_y, body))) if a == b => {
+                let y = (from_y + (f32::from(to_y) - from_y) * glide.t).round() as u16;
                 fill(buf, body, body.x, y, self.tinted());
             }
-            (from, to) => {
+            (_, to_at) => {
                 // A row the tint has wholly left, or not yet reached, is left
                 // unpainted rather than painted the palette's background.
+                let from_at = find(glide.from.nearest());
                 let row = |at: Option<(usize, u16, Rect)>, t: f32| {
                     at.zip(self.theme.from_background(Role::Tint, t))
                 };
-                if let Some(((_, y, body), colour)) = row(from, 1.0 - glide.t) {
+                if let Some(((_, y, body), colour)) = row(from_at, 1.0 - glide.t) {
                     fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
                 }
-                if let Some(((_, y, body), colour)) = row(to, glide.t) {
+                if let Some(((_, y, body), colour)) = row(to_at, glide.t) {
                     fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
                 }
             }

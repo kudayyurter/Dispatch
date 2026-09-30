@@ -1686,7 +1686,7 @@ fn the_focus_tint_glides_through_the_rows_between() {
     let motion = SidebarMotion {
         pulses: Vec::new(),
         glide: Some(Glide {
-            from: Anchor::Pane(first),
+            from: Origin::Row(Anchor::Pane(first)),
             t: 0.5,
         }),
     };
@@ -1701,6 +1701,36 @@ fn the_focus_tint_glides_through_the_rows_between() {
         "not arrived yet"
     );
     let _ = last;
+}
+
+#[test]
+fn a_glide_from_between_two_rows_starts_half_way() {
+    let (mut state, alpha, _) = state();
+    let first = spawn(&mut state, alpha, "claude");
+    spawn(&mut state, alpha, "codex");
+    spawn(&mut state, alpha, "opencode");
+    spawn(&mut state, alpha, "gemini");
+    let fifth = spawn(&mut state, alpha, "aider"); // focused
+    let tint = Theme::fallback().tint;
+    let motion = SidebarMotion {
+        pulses: Vec::new(),
+        glide: Some(Glide {
+            from: Origin::Between {
+                from: Anchor::Pane(first),
+                to: Anchor::Pane(fifth),
+                t: 0.5,
+            },
+            t: 0.0,
+        }),
+    };
+
+    let buf = render_moving(&state, &motion, 10);
+
+    // First at TOP+1, fifth at TOP+5: half way is the third, TOP+3.
+    assert_eq!(buf.cell((LEFT + 8, TOP + 3)).expect("cell").bg, tint);
+    for y in [TOP + 1, TOP + 2, TOP + 4, TOP + 5] {
+        assert_ne!(buf.cell((LEFT + 8, y)).expect("cell").bg, tint, "row {y}");
+    }
 }
 
 #[test]
@@ -1725,7 +1755,7 @@ fn a_glide_between_sections_fades_instead() {
     let motion = SidebarMotion {
         pulses: Vec::new(),
         glide: Some(Glide {
-            from: Anchor::Pane(from),
+            from: Origin::Row(Anchor::Pane(from)),
             t: 0.5,
         }),
     };
@@ -1771,7 +1801,7 @@ fn a_fade_between_sections_paints_nothing_on_the_row_it_has_left() {
         let motion = SidebarMotion {
             pulses: Vec::new(),
             glide: Some(Glide {
-                from: Anchor::Pane(from),
+                from: Origin::Row(Anchor::Pane(from)),
                 t,
             }),
         };

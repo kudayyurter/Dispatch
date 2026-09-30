@@ -660,7 +660,10 @@ pub struct App {
     /// The row the sidebar's focus tint stood on in the last frame.
     last_anchor: Option<sidebar::Anchor>,
     /// Where the sidebar's focus tint is gliding from, while it glides.
-    glide_from: Option<sidebar::Anchor>,
+    glide_from: Option<sidebar::Origin>,
+    /// The row the running glide is heading to, so a glide that replaces it
+    /// can start from where it has got to.
+    glide_to: Option<sidebar::Anchor>,
     /// The grid as it was when a pane began leaving it, and the area it was
     /// laid out for, kept until every leaving tile has retracted.
     held: Option<(Rect, Vec<(PaneId, Rect)>)>,
@@ -758,6 +761,7 @@ impl App {
             last_focus: None,
             last_anchor: None,
             glide_from: None,
+            glide_to: None,
             held: None,
             closing: Vec::new(),
             last_tab: 0,
@@ -1451,9 +1455,22 @@ impl App {
         }
 
         if anchor != self.last_anchor {
-            // A glide replaced mid-way starts from the row the old one was
-            // heading to: within 150 ms that reads as continuous.
-            self.glide_from = self.last_anchor;
+            // A glide replaced mid-way starts from where its tint is on
+            // screen: from the row it was heading to, a burst of presses
+            // makes the tint jump ahead before it moves.
+            let running = self
+                .glide_from
+                .zip(self.animations.value(Target::Glide, now))
+                .zip(self.glide_to);
+            self.glide_from = match running {
+                Some(((origin, t), to)) => Some(sidebar::Origin::Between {
+                    from: origin.nearest(),
+                    to,
+                    t,
+                }),
+                None => self.last_anchor.map(sidebar::Origin::Row),
+            };
+            self.glide_to = anchor;
             if self.glide_from.is_some() {
                 self.animations.start(Target::Glide, now, EASE, 0.0);
             }
@@ -8129,6 +8146,72 @@ mod tests {
         terminal
             .draw(|frame| app.draw(frame))
             .expect("the frame is drawn");
+    }
+
+    /// The sidebar row the focus tint is painted on, as last drawn.
+    fn tinted_row(
+        app: &App,
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> Option<u16> {
+        let buf = terminal.backend().buffer();
+        // Past the frame, the twisty and the icon: every row's fill covers it.
+        let x = app.sidebar_area.x + 8;
+        let is_pane = |y: u16| {
+            let row: String = (app.sidebar_area.x..app.sidebar_area.right())
+                .filter_map(|x| buf.cell((x, y)))
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            row.contains("shell")
+        };
+        // The project's own row is tinted too, so only pane rows count.
+        (app.sidebar_area.y..app.sidebar_area.bottom()).find(|&y| {
+            is_pane(y)
+                && buf
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.bg == app.theme.tint)
+        })
+    }
+
+    #[test]
+    fn a_glide_replaced_mid_way_starts_where_the_tint_is() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 8);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let first = tinted_row(&app, &terminal).expect("the tint is on the first pane");
+
+        // Off towards the last pane, seven rows down, and 40 ms in...
+        app.focus_pane(panes[7]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(40));
+        drawn(&mut app, &mut terminal);
+        let under_way = tinted_row(&app, &terminal).expect("the tint is moving");
+        assert!(under_way > first, "it has left the first row");
+        let last = first + 7;
+        assert!(under_way < last, "and not reached the last");
+
+        // ...then back to the second. The new glide starts where the tint is,
+        // not at the last pane's row it was heading to.
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        let restarted = tinted_row(&app, &terminal).expect("the tint is moving");
+        assert!(
+            restarted.abs_diff(under_way) <= 1,
+            "restarted at {restarted}, the tint was at {under_way}"
+        );
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            tinted_row(&app, &terminal),
+            Some(first + 1),
+            "it lands on the second pane"
+        );
     }
 
     #[test]
