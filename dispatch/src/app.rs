@@ -22,13 +22,14 @@ use dispatch_pty::{
 use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
+use crate::pointer;
 use crate::tabs::{self, TabHit, TabView};
 use dispatch_config::machines::{self, Machine};
 use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyMode, KeyModifiers,
-    MouseEventKind,
+    MouseEvent, MouseEventKind,
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::{Chrome, Role};
@@ -367,6 +368,25 @@ enum Overlay {
 }
 
 impl Overlay {
+    /// The overlay's kind, which a frame's hit map is stamped with.
+    fn tag(&self) -> &'static str {
+        match self {
+            Overlay::Harness(_) => "harness",
+            Overlay::Settings { .. } => "settings",
+            Overlay::Project(_) => "project",
+            Overlay::Register(_) => "register",
+            Overlay::Browse(_) => "browse",
+            Overlay::Machine(_) => "machine",
+            Overlay::Attention(_) => "attention",
+            Overlay::Help(_) => "help",
+            Overlay::AddMachine(_) => "add_machine",
+            Overlay::OpenOn { .. } => "open_on",
+            Overlay::RenameTab { .. } => "rename_tab",
+            Overlay::CloseTab { .. } => "close_tab",
+            Overlay::Approval { .. } => "approval",
+        }
+    }
+
     /// The picker inside, for the variants that have one.
     fn picker(&self) -> Option<&Picker> {
         match self {
@@ -627,6 +647,8 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// Where the last frame drew every clickable thing.
+    hits: pointer::HitMap,
     /// How wide the sidebar is when docked, and as wide as its drawer.
     sidebar_width: u16,
     /// Whether the sidebar is folded away while the window is wide enough to
@@ -819,6 +841,7 @@ impl App {
             frames_project: None,
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            hits: pointer::HitMap::default(),
             sidebar_width: sidebar::WIDTH,
             sidebar_collapsed: false,
             drawer_open: false,
@@ -2833,48 +2856,67 @@ impl App {
             return self.handle_overlay(event, area);
         }
 
-        // The drawer lies over the panes: Esc or a click beside it puts it
-        // away; a click on it is the sidebar's, below, and then puts it away.
-        if self.drawer_open {
-            match event {
-                // Only in normal mode: in a key mode Esc leaves the mode, and
-                // locked every key belongs to the pane.
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press
-                        && key.code == KeyCode::Esc
-                        && self.router.key_mode() == KeyMode::Normal =>
-                {
-                    self.drawer_open = false;
-                    return Ok(());
-                }
-                Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Down(_))
-                        && !self
-                            .sidebar_area
-                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row)) =>
-                {
-                    self.drawer_open = false;
-                    return Ok(());
-                }
-                _ => {}
-            }
+        // The drawer lies over the panes: Esc puts it away; a click beside it
+        // does too, and a click on it is the sidebar's, in `route_pointer`.
+        if self.drawer_open
+            && let Event::Key(key) = event
+            // Only in normal mode: in a key mode Esc leaves the mode, and
+            // locked every key belongs to the pane.
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && self.router.key_mode() == KeyMode::Normal
+        {
+            self.drawer_open = false;
+            return Ok(());
+        }
+
+        if let Event::Mouse(mouse) = event
+            && self.route_pointer(mouse)
+        {
+            return Ok(());
+        }
+
+        let layout = std::mem::take(&mut self.layout);
+        let mode = self.router.key_mode();
+        let action = self.router.handle(event, &layout);
+        self.layout = layout;
+
+        // Entering a mode wipes a stale message, so what the mode's row shows
+        // between its name and its keys is about this mode.
+        if !mode.is_modal() && self.router.key_mode().is_modal() {
+            self.status.clear();
+        }
+
+        self.perform(action);
+
+        Ok(())
+    }
+
+    /// Resolves a mouse event against what the last frame drew, and acts on
+    /// it when it belongs to the tab row or the sidebar. Returns whether the
+    /// event was consumed; when it was not, the router over `layout` handles
+    /// it.
+    fn route_pointer(&mut self, mouse: &MouseEvent) -> bool {
+        let target = self
+            .hits
+            .resolve(mouse.column, mouse.row, self.overlay_tag());
+
+        // The drawer lies over the panes: a click beside it puts it away.
+        if self.drawer_open
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+            && !self
+                .sidebar_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
+            self.drawer_open = false;
+            return true;
         }
 
         // The tab row is not part of input routing either: a click on it is
-        // resolved against what was drawn there last frame. Reversed, so an
-        // overlap (there should be none, but a narrow row leaves little
-        // room for error) favours whatever was drawn last, which is what is
-        // actually on top.
-        if let Event::Mouse(mouse) = event
-            && matches!(mouse.kind, MouseEventKind::Down(_))
-            && self.tab_row.height > 0
-            && mouse.row == self.tab_row.y
-            && let Some(hit) = self
-                .tab_hits
-                .iter()
-                .rev()
-                .find(|(x, width, _)| mouse.column >= *x && mouse.column < x.saturating_add(*width))
-                .map(|(_, _, hit)| *hit)
+        // resolved against what was drawn there last frame. The map keeps
+        // whatever was drawn last on top, which is what is actually on top.
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && let Some(pointer::Target::Tab(hit)) = target
         {
             match hit {
                 TabHit::Tab(index) => self.select_tab(index),
@@ -2882,47 +2924,40 @@ impl App {
                 TabHit::Previous => self.select_previous_tab(),
                 TabHit::Next => self.select_tab(self.current_tab() + 1),
             }
-            return Ok(());
+            return true;
         }
 
         // The sidebar's right edge is a handle: pressed, dragged, let go.
         // Only a docked sidebar has one; the drawer's width is the docked
         // width, changed from a window wide enough to dock it.
-        if let Event::Mouse(mouse) = event {
-            let area = self.sidebar_area;
-            let on_edge = !self.drawer_open
-                && area.width > 0
-                && mouse.column == area.x + area.width - 1
-                && mouse.row >= area.y
-                && mouse.row < area.y + area.height;
-            match mouse.kind {
-                MouseEventKind::Down(crossterm::event::MouseButton::Left) if on_edge => {
-                    self.dragging_sidebar = true;
-                    return Ok(());
-                }
-                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                    if self.dragging_sidebar =>
-                {
-                    use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
-                    self.sidebar_width = (mouse.column + 1)
-                        .saturating_sub(area.x)
-                        .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
-                    return Ok(());
-                }
-                MouseEventKind::Up(_) if self.dragging_sidebar => {
-                    self.dragging_sidebar = false;
-                    self.save_ui();
-                    return Ok(());
-                }
-                _ => {}
+        let area = self.sidebar_area;
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if !self.drawer_open && target == Some(pointer::Target::SidebarEdge) =>
+            {
+                self.dragging_sidebar = true;
+                return true;
             }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) if self.dragging_sidebar => {
+                use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
+                self.sidebar_width = (mouse.column + 1)
+                    .saturating_sub(area.x)
+                    .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+                return true;
+            }
+            MouseEventKind::Up(_) if self.dragging_sidebar => {
+                self.dragging_sidebar = false;
+                self.save_ui();
+                return true;
+            }
+            _ => {}
         }
 
-        // The sidebar is not otherwise part of input routing — `layout` below
-        // covers only the tiled grid — so a click on one of its rows is
-        // resolved here rather than through the router.
-        if let Event::Mouse(mouse) = event
-            && matches!(mouse.kind, MouseEventKind::Down(_))
+        // The sidebar is not otherwise part of input routing — `layout` covers
+        // only the tiled grid — so a click on one of its rows is resolved here
+        // rather than through the router.
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && target == Some(pointer::Target::Sidebar)
             && let Some(hit) = sidebar::hit_test(
                 &self.state,
                 self.sidebar_area,
@@ -2947,16 +2982,15 @@ impl App {
             if matches!(hit, sidebar::Hit::Project(_) | sidebar::Hit::Pane(_)) {
                 self.drawer_open = false;
             }
-            return Ok(());
+            return true;
         }
 
         // The wheel over the sidebar scrolls the section under it; the grid
         // never sees it, since no pane is under the pointer.
-        if let Event::Mouse(mouse) = event
-            && matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            )
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && target == Some(pointer::Target::Sidebar)
             && let Some(device) = sidebar::section_at(
                 &self.state,
                 self.sidebar_area,
@@ -2971,34 +3005,12 @@ impl App {
             } else {
                 offset.saturating_add(1)
             };
-            return Ok(());
+            return true;
         }
 
         // The drawer hides the panes beneath it, so a pointer event on its
         // blank space or border is nobody's: it must not reach them.
-        if self.drawer_open
-            && let Event::Mouse(mouse) = event
-            && self
-                .sidebar_area
-                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-        {
-            return Ok(());
-        }
-
-        let layout = std::mem::take(&mut self.layout);
-        let mode = self.router.key_mode();
-        let action = self.router.handle(event, &layout);
-        self.layout = layout;
-
-        // Entering a mode wipes a stale message, so what the mode's row shows
-        // between its name and its keys is about this mode.
-        if !mode.is_modal() && self.router.key_mode().is_modal() {
-            self.status.clear();
-        }
-
-        self.perform(action);
-
-        Ok(())
+        self.drawer_open && target == Some(pointer::Target::Sidebar)
     }
 
     /// Does what an action says, whether a key or a choice in the command
@@ -4477,6 +4489,11 @@ impl App {
         self.expanded.remove(&id);
     }
 
+    /// The open overlay's kind, if any.
+    fn overlay_tag(&self) -> Option<&'static str> {
+        self.overlay.as_ref().map(Overlay::tag)
+    }
+
     /// Draws one frame.
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         // The real clock, because this measures real cost.
@@ -4485,6 +4502,7 @@ impl App {
         let now = self.now();
         self.animations.sweep(now);
         self.notice_focus(now);
+        let mut hits = pointer::HitMap::new(self.overlay_tag());
 
         // Remembered once a frame rather than on each way focus can move:
         // there are many ways, and the frame sees the result of all of them.
@@ -4545,6 +4563,17 @@ impl App {
         let mut sidebar_spun = false;
         if docked > 0 {
             sidebar_spun = self.draw_sidebar(frame, sidebar_area, now);
+            hits.push(sidebar_area, pointer::Target::Sidebar);
+            // The right border column is the handle that drags to resize.
+            hits.push(
+                Rect::new(
+                    sidebar_area.x + sidebar_area.width - 1,
+                    sidebar_area.y,
+                    1,
+                    sidebar_area.height,
+                ),
+                pointer::Target::SidebarEdge,
+            );
         }
 
         self.draw_name(frame, Rect::new(top.x, top.y, docked, top.height));
@@ -4564,6 +4593,14 @@ impl App {
             Rect::new(panes_area.x, top.y, panes_area.width, top.height),
             now,
         );
+        if self.tab_row.height > 0 {
+            for &(x, width, hit) in &self.tab_hits {
+                hits.push(
+                    Rect::new(x, self.tab_row.y, width, 1),
+                    pointer::Target::Tab(hit),
+                );
+            }
+        }
 
         self.frames = self.lay_out(panes_area, now);
         self.layout = self
@@ -4572,6 +4609,13 @@ impl App {
             .map(|(id, frame)| (*id, Self::interior(*frame)))
             .collect();
         self.draw_panes(frame, now);
+        for &(id, tile) in &self.frames {
+            hits.push(
+                Rect::new(tile.x, tile.y, tile.width, 1),
+                pointer::Target::PaneHeader(id),
+            );
+            hits.push(Self::interior(tile), pointer::Target::PaneContent(id));
+        }
         if self.state.selected_project().is_some()
             && self.frames.is_empty()
             && self.closing.is_empty()
@@ -4583,6 +4627,8 @@ impl App {
             if self.drawer_open {
                 Clear.render(sidebar_area, frame.buffer_mut());
                 sidebar_spun = self.draw_sidebar(frame, sidebar_area, now);
+                // Pushed after the panes, so it sits above them.
+                hits.push(sidebar_area, pointer::Target::Sidebar);
             } else {
                 sidebar_spun = self.draw_sidebar(frame, Rect::default(), now);
             }
@@ -4590,6 +4636,8 @@ impl App {
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area, body);
+
+        self.hits = hits;
 
         // Combined once, here, so it does not matter which was drawn first.
         self.spinner_drawn = sidebar_spun || self.tabs_spun;
@@ -13196,6 +13244,78 @@ args = ["--effort", "{value}"]
     fn a_wide_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30))
             .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn a_frame_records_what_it_drew_where() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        let (_, tile) = *app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled");
+        let inner = App::interior(tile);
+        assert_eq!(
+            app.hits.at(inner.x, inner.y),
+            Some(pointer::Target::PaneContent(panes[0]))
+        );
+        assert_eq!(
+            app.hits.at(tile.x + 1, tile.y),
+            Some(pointer::Target::PaneHeader(panes[0]))
+        );
+        assert_eq!(app.hits.at(1, 3), Some(pointer::Target::Sidebar));
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        assert_eq!(app.hits.at(edge, 5), Some(pointer::Target::SidebarEdge));
+        assert!(matches!(
+            app.hits.at(app.tab_row.x + 1, 0),
+            Some(pointer::Target::Tab(_))
+        ));
+    }
+
+    #[test]
+    fn a_click_on_something_drawn_before_an_overlay_opened_does_nothing() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha-pane");
+        let mut terminal = a_wide_terminal();
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        let row = sidebar_row_of(&terminal, "alpha-pane");
+
+        // An overlay opens by key, and no frame is drawn before the click.
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Blocked)
+            .expect("exists");
+        app.open_attention_picker();
+        assert!(app.overlay.is_some());
+        click(&mut app, 8, row);
+
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[1]),
+            "the row drawn beneath did not act"
+        );
+        assert!(app.overlay.is_some(), "and the overlay is still open");
+    }
+
+    /// The screen row whose sidebar columns contain `name`.
+    fn sidebar_row_of(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        name: &str,
+    ) -> u16 {
+        let screen = rendered_text(terminal);
+        let index = screen
+            .lines()
+            .position(|line| sidebar_column(line).contains(name))
+            .unwrap_or_else(|| panic!("{name} is drawn in the sidebar"));
+        u16::try_from(index).expect("a screen row")
     }
 
     #[test]

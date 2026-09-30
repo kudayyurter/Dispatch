@@ -3,8 +3,9 @@
 //! Each frame records where it drew every clickable thing, in the order
 //! drawn, so a pointer event is resolved against exactly what is on screen:
 //! the last rectangle covering a cell is the one on top.
-//!
-//! Task 2 wires these types in and will remove the `allow(dead_code)` below.
+
+// Double-click detection, gestures, menus and dialog targets are used from
+// Task 3 onwards (the later tasks name them); until then they are only tested.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant};
@@ -112,9 +113,10 @@ impl HitMap {
 
     /// What a press at `(x, y)` may act on, with `overlay_now` open.
     ///
-    /// When the overlay has changed since this frame was drawn, only the
-    /// overlay's own targets count: a rectangle drawn under an overlay that
-    /// has since opened, or over one that has since closed, must not act.
+    /// When the overlay has changed since this frame was drawn, nothing
+    /// resolves: a stale map holds none of the current overlay's targets, and
+    /// a rectangle drawn under an overlay that has since opened, or over one
+    /// that has since closed, must not act.
     #[must_use]
     pub fn resolve(&self, x: u16, y: u16, overlay_now: Option<&'static str>) -> Option<Target> {
         let target = self.at(x, y)?;
