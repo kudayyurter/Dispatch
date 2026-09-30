@@ -116,8 +116,8 @@ logs it.
 
 - The status row's reminder names the key: `"2 waiting on you — Alt a"`, from
   `keymap.path_to(Command::NextAttention)`, and left bare when nothing reaches
-  it. It is shown while an overlay is open too; today it hides then. It is
-  also added to the lock and modal rows, as the delegation reminder is.
+  it. It is shown while an overlay is open too; today it hides then. The
+  lock row already carries it, and keeps it.
 - Tab chips need nothing new: `Rollup` already puts the `BLOCKED` glyph on a
   chip whose tab holds a blocked pane, and on a folded project's row.
 
@@ -165,8 +165,10 @@ panes take the whole body.
 **Narrow windows.** When the window is under 80 columns, the sidebar takes no
 columns. `ToggleSidebar` then opens it as a drawer: drawn at its width over
 the left of the panes, with a right border in the chrome's border colour.
-While the drawer is open, keys go to the sidebar the way a click on it does
-today. Choosing a row or pressing Esc closes the drawer. The collapsed flag
+The sidebar has no keys of its own today, and the drawer adds none: a click
+on a row acts as it does in the sidebar and closes the drawer, a click
+outside it closes it, and Esc or the toggle key closes it. Every other key
+goes where it goes now, with the drawer left open. The collapsed flag
 is left alone by the drawer, so widening the window back past 80 columns
 brings the sidebar back as it was. `sidebar_area` is empty while the sidebar
 takes no columns, so a click on the panes is never read as a sidebar click.
@@ -266,13 +268,12 @@ Starts from `App::next_frame` (`dispatch/src/app.rs`), which asks for a
 spinner frame whenever any pane anywhere is `Running`, even in a folded
 project or scrolled off the sidebar.
 
-**Change.** `Sidebar` records whether it drew a spinner glyph this frame. It
-already knows which rows are on screen. `SidebarMotion` gains
-`spun: Cell<bool>`, which the render sets when it draws a `Rollup::Working` or
-`Running` glyph. `draw_tabs` sets the same kind of flag when a chip it draws
-carries `Rollup::Working`. `App` keeps `spinner_drawn: bool`, the two flags
-ORed, from the last `draw`. `next_frame` asks for `SPIN_FRAME` only when it is
-set. A
+**Change.** A pure `sidebar::spins(state, area, scroll) -> bool` walks the
+same `sections` the render walks and says whether any row on screen draws a
+spinner: a live `Running` pane row, or a folded project whose rollup is
+`Working`. `draw_tabs` notes whether a chip it drew carries
+`Rollup::Working`. `App` keeps `spinner_drawn: bool`, the two ORed, from the
+last `draw`. `next_frame` asks for `SPIN_FRAME` only when it is set. A
 running pane nobody can see no longer keeps Dispatch redrawing. Its row starts
 spinning on the first frame that draws it, which any change of scroll, fold
 or tab already causes.
@@ -286,9 +287,12 @@ ring buffer. Every 10 s, if any frame was drawn, it logs
 buffer. Nothing is shown on screen. The animation rates do not change in this
 work: the numbers are there to decide that later.
 
-**Tests.** A running pane in a folded project gives `next_frame() == None`;
-unfold it, draw, and it gives `Some(SPIN_FRAME)`; the same for a pane
-scrolled out of the sidebar's view; motion off gives `None` in every case.
+**Tests.** A running subagent under a folded parent gives
+`next_frame() == None`; unfold the parent, draw, and it gives
+`Some(SPIN_FRAME)`; a running pane scrolled out of the sidebar's view gives
+`None`; a folded project whose pane runs still spins, because its row draws
+the rollup; motion off gives `None` in every case. (A folded project is not a
+hidden spinner: its row carries the `Working` rollup.)
 
 ## 7. Readable states and contrast
 
