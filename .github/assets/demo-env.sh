@@ -17,7 +17,7 @@
 set -euo pipefail
 
 bin=${DISPATCH_BIN:-$PWD/target/release/dispatch}
-repo=${DEMO_REPO:-https://github.com/namelessmonarch0/Dispatch.git}
+repo=${DEMO_REPO:-https://github.com/kudayyurter/Dispatch.git}
 claude_bin=$(readlink -f "$(command -v claude)")
 codex_bin=$(readlink -f "$(command -v codex)")
 
