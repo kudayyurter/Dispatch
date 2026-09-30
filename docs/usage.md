@@ -188,6 +188,30 @@ chosen now is dimmed and skipped.
 
 Right-clicking a pane's row or a tab changes nothing until an item is chosen.
 
+## Dialogs
+
+Every dialog takes the mouse, and while one is open nothing is sent to a pane:
+no click, paste or key. Click a row of a list to select it, and double-click it
+(or press its button) to act. Each dialog draws its buttons along its bottom
+edge, and a button does exactly what its key does; the one Enter presses is
+drawn in the accent colour. Press a button and slide off it before letting go
+to call the press back. A box too small for its buttons leaves them out, and
+the keys still work.
+
+| Dialog | Click | Double-click | Buttons |
+|---|---|---|---|
+| New pane, Project, Add harness, Open on, Waiting on you | select the row | choose it | Open, Cancel |
+| Commands (command help) | select the row | run it | Run, Cancel |
+| Directory browser | select the entry | open it, as `Enter` | Open, Cancel |
+| Harness settings | focus the row; `‹` or `›` step its value | | Open pane, Save as default (`s`), Cancel |
+| Delegation request | | | Approve (`a`), Deny (`d`), Always (`A`), Later (`Esc`) |
+| Rename tab, Open on a path, Add a machine | | | OK, Cancel |
+| Close tab | | | Close, Cancel |
+
+The wheel over a list moves its selection one row a notch, and never scrolls a
+pane behind it. A click outside a dialog does nothing; a click outside a menu
+closes it.
+
 ## Keeping projects
 
 The sidebar is the list of projects you keep, not the one directory Dispatch

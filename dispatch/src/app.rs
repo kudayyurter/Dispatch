@@ -704,6 +704,12 @@ pub struct App {
     /// The whole window, as last drawn: what tells a toggle whether there is
     /// room to dock the sidebar.
     window: Rect,
+    /// Where the open dialog was last drawn, which its layout is worked out
+    /// over: the same box the click lands in.
+    overlay_area: Rect,
+    /// The approval's button held down. The other dialogs keep theirs in the
+    /// widget, but the approval is rebuilt from the queue each frame.
+    approval_pressed: Option<pointer::ButtonId>,
     /// How far each machine's section of the sidebar is scrolled.
     sidebar_scroll: sidebar::Scroll,
     /// The row the sidebar was last scrolled to follow, and the area it was
@@ -893,6 +899,8 @@ impl App {
             pressed_double: false,
             ui_dir: None,
             window: Rect::default(),
+            overlay_area: Rect::default(),
+            approval_pressed: None,
             sidebar_scroll: sidebar::Scroll::new(),
             anchored: (None, Rect::default()),
             expanded: HashSet::new(),
@@ -1328,7 +1336,8 @@ impl App {
         self.overlay = Some(Overlay::Help(
             Picker::new("Commands", items)
                 .with_filter()
-                .with_hint("type to search  Enter run  Esc close"),
+                .with_hint("type to search  Enter run  Esc close")
+                .with_buttons(pointer::buttons::run_cancel()),
         ));
     }
 
@@ -1366,7 +1375,9 @@ impl App {
             return;
         }
         self.overlay = Some(Overlay::Attention(
-            Picker::new("Waiting on you", items).with_hint("↑↓ choose  Enter go  Esc close"),
+            Picker::new("Waiting on you", items)
+                .with_hint("↑↓ choose  Enter go  Esc close")
+                .with_buttons(pointer::buttons::open_cancel()),
         ));
     }
 
@@ -2909,18 +2920,16 @@ impl App {
         }
 
         // An overlay takes the keyboard while it is open, so arrow keys choose
-        // and approval keys decide rather than either reaching an agent.
+        // and approval keys decide rather than either reaching an agent. It
+        // takes the pointer too, and nothing it does may reach what lies
+        // beneath.
         if self.overlay.is_some() {
             // The overlay eats whatever would have ended a press on the
             // frame beneath it, so none is still live once it closes. A press
             // on the overlay itself is its own, and waits for its release.
             self.end_gesture_beneath_overlay();
-            // A menu is the one overlay the pointer reaches so far, and
-            // nothing it does may reach what lies beneath.
-            if let Event::Mouse(mouse) = event
-                && matches!(self.overlay, Some(Overlay::Menu(_)))
-            {
-                self.route_pointer(mouse);
+            if let Event::Mouse(mouse) = event {
+                self.route_pointer(mouse, area)?;
                 return Ok(());
             }
             return self.handle_overlay(event, area);
@@ -2941,7 +2950,7 @@ impl App {
         }
 
         if let Event::Mouse(mouse) = event
-            && self.route_pointer(mouse)
+            && self.route_pointer(mouse, area)?
         {
             return Ok(());
         }
@@ -2966,7 +2975,7 @@ impl App {
     /// it when it belongs to the tab row or the sidebar. Returns whether the
     /// event was consumed; when it was not, the router over `layout` handles
     /// it.
-    fn route_pointer(&mut self, mouse: &MouseEvent) -> bool {
+    fn route_pointer(&mut self, mouse: &MouseEvent, area: Size) -> Result<bool> {
         use crossterm::event::MouseButton;
 
         // A press still held belongs to what it pressed, wherever the pointer
@@ -2979,24 +2988,24 @@ impl App {
                         ..gesture
                     });
                     self.drag_gesture(gesture, mouse);
-                    return true;
+                    return Ok(true);
                 }
                 MouseEventKind::Up(button) if button == gesture.button => {
                     self.gesture = None;
-                    self.release_gesture(gesture, mouse);
-                    return true;
+                    self.release_gesture(gesture, mouse, area)?;
+                    return Ok(true);
                 }
                 // Anything else mid-gesture is noise from a terminal that
                 // lost a release; the gesture ends as if it had arrived.
                 MouseEventKind::Down(_) => self.end_gesture(),
-                _ => return true,
+                _ => return Ok(true),
             }
         } else if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
             // Motion with a button held, or its release, whose press this
             // window never saw (an overlay took it, or the gesture ended
             // early): nothing owns it, and the pane under the pointer did not
             // receive the press.
-            return true;
+            return Ok(true);
         }
 
         let target = self
@@ -3005,7 +3014,11 @@ impl App {
 
         if matches!(self.overlay, Some(Overlay::Menu(_))) {
             self.route_menu_pointer(mouse, target);
-            return true;
+            return Ok(true);
+        }
+        if self.overlay.is_some() {
+            self.route_dialog_pointer(mouse, target, area)?;
+            return Ok(true);
         }
 
         // The drawer lies over the panes: a click beside it puts it away.
@@ -3016,7 +3029,7 @@ impl App {
                 .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
         {
             self.drawer_open = false;
-            return true;
+            return Ok(true);
         }
 
         if let MouseEventKind::Down(button) = mouse.kind
@@ -3049,7 +3062,7 @@ impl App {
                         mouse.column,
                         mouse.row,
                     );
-                    return true;
+                    return Ok(true);
                 }
                 // The child gets its press as it always did, after the pane
                 // has the keyboard; everything it is sent after is this
@@ -3058,9 +3071,9 @@ impl App {
                     if button == MouseButton::Left && self.state.focused_pane() != Some(id) {
                         self.focus_pane(id);
                     }
-                    return false;
+                    return Ok(false);
                 }
-                _ => return true,
+                _ => return Ok(true),
             }
         }
 
@@ -3091,12 +3104,12 @@ impl App {
             } else {
                 offset.saturating_add(1)
             };
-            return true;
+            return Ok(true);
         }
 
         // The drawer hides the panes beneath it, so a pointer event on its
         // blank space or border is nobody's: it must not reach them.
-        self.drawer_open && target == Some(pointer::Target::Sidebar)
+        Ok(self.drawer_open && target == Some(pointer::Target::Sidebar))
     }
 
     /// A pointer event while a menu is open: hover follows the pointer, a
@@ -3132,6 +3145,205 @@ impl App {
         }
     }
 
+    /// A pointer event while a dialog is open. It is the dialog's whatever
+    /// it lands on, and nothing is passed on to the frame beneath.
+    ///
+    /// A press on a row selects it at once, and a second one chooses it as
+    /// Enter would; a press on a button or an arrow is held until released.
+    /// A press outside the box, or on its frame, does nothing.
+    fn route_dialog_pointer(
+        &mut self,
+        mouse: &MouseEvent,
+        target: Option<pointer::Target>,
+        area: Size,
+    ) -> Result<()> {
+        use crossterm::event::MouseButton;
+
+        let hit = match target {
+            Some(pointer::Target::Dialog(hit)) => Some(hit),
+            _ => None,
+        };
+        match mouse.kind {
+            MouseEventKind::Moved => self.hover_dialog_row(match hit {
+                Some(pointer::DialogHit::Row(index)) => Some(index),
+                _ => None,
+            }),
+            MouseEventKind::Down(MouseButton::Left) => match (hit, target) {
+                (Some(pointer::DialogHit::Row(index)), Some(target)) => {
+                    let double = self.clicks.press(target, self.now());
+                    self.select_dialog_row(index);
+                    if double {
+                        self.choose_dialog_row(area)?;
+                    }
+                }
+                (
+                    Some(pointer::DialogHit::Button(_) | pointer::DialogHit::Step(..)),
+                    Some(owner),
+                ) => {
+                    self.gesture = Some(pointer::Gesture {
+                        owner,
+                        button: MouseButton::Left,
+                        last: (mouse.column, mouse.row),
+                        rect: None,
+                    });
+                    self.pressed_double = false;
+                    if let pointer::Target::Dialog(pointer::DialogHit::Button(id)) = owner {
+                        self.set_dialog_pressed(Some(id));
+                    }
+                }
+                _ => {}
+            },
+            // One notch is one row, inside the box; the panes never see it.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if hit.is_some() => {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                match &mut self.overlay {
+                    Some(Overlay::Browse(browser)) => {
+                        if down {
+                            browser.next();
+                        } else {
+                            browser.previous();
+                        }
+                    }
+                    Some(Overlay::Approval { .. }) => self.scroll_approval(down),
+                    Some(overlay) => {
+                        if let Some(picker) = overlay.picker_mut() {
+                            if down {
+                                picker.next();
+                            } else {
+                                picker.previous();
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Marks the row the pointer is over, or none.
+    fn hover_dialog_row(&mut self, row: Option<usize>) {
+        match &mut self.overlay {
+            Some(Overlay::Browse(browser)) => browser.set_hovered(row),
+            Some(Overlay::Settings { form, .. }) => form.set_hovered(row),
+            Some(overlay) => {
+                if let Some(picker) = overlay.picker_mut() {
+                    picker.set_hovered(row);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Moves the open dialog's selection to the row drawn at `index`.
+    fn select_dialog_row(&mut self, index: usize) {
+        match &mut self.overlay {
+            Some(Overlay::Browse(browser)) => browser.select_visible(index),
+            Some(Overlay::Settings { form, .. }) => form.select_row(index),
+            Some(overlay) => {
+                if let Some(picker) = overlay.picker_mut() {
+                    picker.select_shown(index);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// What a double-click on a row does: what Enter does on it. The
+    /// settings form has no such thing, and a second click there is one more
+    /// click.
+    fn choose_dialog_row(&mut self, area: Size) -> Result<()> {
+        match &self.overlay {
+            Some(Overlay::Browse(_)) => {
+                self.open_browser_selection();
+                Ok(())
+            }
+            Some(Overlay::Help(_)) => {
+                self.run_help_selection();
+                Ok(())
+            }
+            Some(overlay) if overlay.picker().is_some() => self.choose_selected(area),
+            _ => Ok(()),
+        }
+    }
+
+    /// Marks the button held down, or none, on whichever dialog is open.
+    fn set_dialog_pressed(&mut self, pressed: Option<pointer::ButtonId>) {
+        match &mut self.overlay {
+            Some(Overlay::Browse(browser)) => browser.set_pressed(pressed),
+            Some(Overlay::Settings { form, .. }) => form.set_pressed(pressed),
+            Some(
+                Overlay::OpenOn { prompt, .. }
+                | Overlay::RenameTab { prompt, .. }
+                | Overlay::CloseTab { prompt, .. },
+            ) => prompt.set_pressed(pressed),
+            Some(Overlay::AddMachine(add)) => add.prompt_mut().set_pressed(pressed),
+            Some(Overlay::Approval { .. }) => self.approval_pressed = pressed,
+            Some(overlay) => {
+                if let Some(picker) = overlay.picker_mut() {
+                    picker.set_pressed(pressed);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Where the open dialog drew its rows and buttons, as the last frame
+    /// left them: the layout its own render followed. A menu has its own.
+    fn dialog_layout(&self) -> Option<dispatch_tui::button::DialogLayout> {
+        let area = self.overlay_area;
+        match self.overlay.as_ref()? {
+            Overlay::Settings { form, .. } => Some(form.layout(area)),
+            Overlay::Browse(browser) => Some(browser.layout(area)),
+            Overlay::OpenOn { prompt, .. }
+            | Overlay::RenameTab { prompt, .. }
+            | Overlay::CloseTab { prompt, .. } => Some(prompt.layout(area)),
+            Overlay::AddMachine(add) => Some(add.prompt().layout(area)),
+            Overlay::Approval { scroll } => Some(self.approval_widget(*scroll)?.layout(area)),
+            Overlay::Menu(_) => None,
+            overlay => overlay.picker().map(|picker| picker.layout(area)),
+        }
+    }
+
+    /// Does what a dialog's button says: what its key does, by the same
+    /// function. A button the open dialog does not have does nothing.
+    fn press_button(&mut self, id: pointer::ButtonId, area: Size) -> Result<()> {
+        use pointer::ButtonId;
+
+        let Some(overlay) = &self.overlay else {
+            return Ok(());
+        };
+        match (overlay, id) {
+            // Every dialog's way out.
+            (_, ButtonId::Cancel) | (Overlay::Approval { .. }, ButtonId::Later) => {
+                self.cancel_dialog();
+            }
+            (Overlay::Help(_), ButtonId::Run) => self.run_help_selection(),
+            (Overlay::Browse(_), ButtonId::Open) => self.open_browser_selection(),
+            (Overlay::Settings { .. }, ButtonId::OpenPane) => {
+                self.settings_action(FormAction::Open, area)?;
+            }
+            (Overlay::Settings { .. }, ButtonId::SaveDefault) => {
+                self.settings_action(FormAction::Save, area)?;
+            }
+            (Overlay::Approval { .. }, ButtonId::Approve) => self.decide(true, false),
+            (Overlay::Approval { .. }, ButtonId::Deny) => self.decide(false, false),
+            (Overlay::Approval { .. }, ButtonId::Always) => self.decide(true, true),
+            (Overlay::OpenOn { .. }, ButtonId::Ok) => self.confirm_open_on(),
+            (Overlay::RenameTab { .. }, ButtonId::Ok) => self.confirm_rename_tab(),
+            (Overlay::AddMachine(_), ButtonId::Ok) => {
+                self.handle_add_machine_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            (Overlay::CloseTab { .. }, ButtonId::Close) => self.confirm_close_tab(),
+            (overlay, ButtonId::Open) if overlay.picker().is_some() => {
+                self.choose_selected(area)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Puts a menu away, and opens the approval that was waiting behind it.
     fn close_menu(&mut self) {
         self.overlay = None;
@@ -3159,13 +3371,32 @@ impl App {
                 mouse.kind,
                 mouse.modifiers,
             ),
+            // A button shows held only while the pointer is over it: sliding
+            // off is how a press is called back, and sliding on again holds
+            // it once more.
+            pointer::Target::Dialog(pointer::DialogHit::Button(id)) => {
+                let over = self
+                    .hits
+                    .resolve(mouse.column, mouse.row, self.overlay_tag())
+                    == Some(gesture.owner);
+                self.set_dialog_pressed(over.then_some(id));
+            }
             _ => {}
         }
     }
 
     /// A held press was let go: what its owner does with the release.
-    fn release_gesture(&mut self, gesture: pointer::Gesture, mouse: &MouseEvent) {
+    fn release_gesture(
+        &mut self,
+        gesture: pointer::Gesture,
+        mouse: &MouseEvent,
+        area: Size,
+    ) -> Result<()> {
         let owner = gesture.owner;
+        // A button held down is let go, whether or not it acts.
+        if matches!(owner, pointer::Target::Dialog(_)) {
+            self.set_dialog_pressed(None);
+        }
         match owner {
             pointer::Target::SidebarEdge => {
                 if gesture.button == crossterm::event::MouseButton::Left {
@@ -3200,7 +3431,7 @@ impl App {
                     == Some(owner);
                 if still_on && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 {
-                    self.activate(owner, mouse);
+                    self.activate(owner, mouse, area)?;
                 } else if still_on
                     && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Right)
                 {
@@ -3208,10 +3439,11 @@ impl App {
                 }
             }
         }
+        Ok(())
     }
 
     /// Does what a control does when it is clicked.
-    fn activate(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+    fn activate(&mut self, owner: pointer::Target, mouse: &MouseEvent, area: Size) -> Result<()> {
         match owner {
             pointer::Target::Tab(hit) => match hit {
                 TabHit::Tab(index) => self.select_tab(index),
@@ -3231,7 +3463,7 @@ impl App {
                     mouse.row,
                 );
                 let Some(hit) = hit.filter(|hit| Some(*hit) == self.pressed_sidebar) else {
-                    return;
+                    return Ok(());
                 };
                 match hit {
                     sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
@@ -3274,8 +3506,20 @@ impl App {
                     self.choose_menu(action);
                 }
             }
+            // A row acted when it was pressed. A button or an arrow acts on
+            // its release, through what its key runs.
+            pointer::Target::Dialog(pointer::DialogHit::Button(id)) => {
+                self.press_button(id, area)?;
+            }
+            pointer::Target::Dialog(pointer::DialogHit::Step(index, forward)) => {
+                if let Some(Overlay::Settings { form, .. }) = &mut self.overlay {
+                    let action = form.step_row(index, forward);
+                    self.settings_action(action, area)?;
+                }
+            }
             _ => {}
         }
+        Ok(())
     }
 
     /// Opens the menu a right-click on `owner` asks for, if it has one.
@@ -3535,6 +3779,9 @@ impl App {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
+        if matches!(gesture.owner, pointer::Target::Dialog(_)) {
+            self.set_dialog_pressed(None);
+        }
         // Any pane still alive is sent its release, in or out of the grid: the
         // rectangle it was pressed in stands in for one it no longer has.
         if let pointer::Target::PaneContent(id) = gesture.owner
@@ -3861,20 +4108,11 @@ impl App {
         // act here.
         if let Some(Overlay::Help(picker)) = &mut self.overlay {
             match key.code {
-                KeyCode::Esc => self.overlay = None,
+                KeyCode::Esc => self.cancel_dialog(),
                 KeyCode::Down => picker.next(),
                 KeyCode::Up => picker.previous(),
                 KeyCode::Backspace => picker.pop_filter(),
-                KeyCode::Enter => {
-                    let action = picker
-                        .selected()
-                        .and_then(|item| Command::from_name(&item.id))
-                        .and_then(Command::action);
-                    if let Some(action) = action {
-                        self.overlay = None;
-                        self.perform(action);
-                    }
-                }
+                KeyCode::Enter => self.run_help_selection(),
                 KeyCode::Char(c)
                     if !key
                         .modifiers
@@ -3891,9 +4129,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.overlay = None;
-            }
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_dialog(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(picker) = self.overlay.as_mut().and_then(Overlay::picker_mut) {
                     picker.next();
@@ -3913,19 +4149,7 @@ impl App {
             KeyCode::Char('e') if matches!(self.overlay, Some(Overlay::Harness(_))) => {
                 self.open_settings();
             }
-            KeyCode::Enter => {
-                let chosen = self.overlay.as_ref().and_then(|overlay| {
-                    let kind = overlay.kind()?;
-                    let item = overlay.picker()?.selected()?;
-                    Some((kind, item.id.clone()))
-                });
-
-                self.overlay = None;
-
-                if let Some((kind, id)) = chosen {
-                    self.choose(kind, &id, area)?;
-                }
-            }
+            KeyCode::Enter => self.choose_selected(area)?,
             _ => {}
         }
 
@@ -3937,6 +4161,68 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Chooses what the open picker is on: what Enter and `[Open]` do.
+    fn choose_selected(&mut self, area: Size) -> Result<()> {
+        let chosen = self.overlay.as_ref().and_then(|overlay| {
+            let kind = overlay.kind()?;
+            let item = overlay.picker()?.selected()?;
+            Some((kind, item.id.clone()))
+        });
+
+        self.overlay = None;
+
+        if let Some((kind, id)) = chosen {
+            self.choose(kind, &id, area)?;
+        }
+
+        // A request queued while the picker had the keyboard is shown once
+        // it is gone, whether a key or a button closed it.
+        if self.overlay.is_none() {
+            self.open_next_approval();
+        }
+        Ok(())
+    }
+
+    /// Runs the command the list is on: what Enter and `[Run]` do.
+    fn run_help_selection(&mut self) {
+        let Some(Overlay::Help(picker)) = &self.overlay else {
+            return;
+        };
+        let action = picker
+            .selected()
+            .and_then(|item| Command::from_name(&item.id))
+            .and_then(Command::action);
+        if let Some(action) = action {
+            self.overlay = None;
+            self.perform(action);
+        }
+        if self.overlay.is_none() {
+            self.open_next_approval();
+        }
+    }
+
+    /// Puts the open dialog away without acting: what Esc and `[Cancel]` do.
+    ///
+    /// The settings go back to the picker they came from, and a picker makes
+    /// way for a request that was queued behind it.
+    fn cancel_dialog(&mut self) {
+        match &self.overlay {
+            Some(Overlay::Settings { .. }) => self.back_to_picker(),
+            Some(
+                Overlay::Harness(_)
+                | Overlay::Project(_)
+                | Overlay::Register(_)
+                | Overlay::Machine(_)
+                | Overlay::Attention(_)
+                | Overlay::Help(_),
+            ) => {
+                self.overlay = None;
+                self.open_next_approval();
+            }
+            _ => self.overlay = None,
+        }
     }
 
     /// Acts on one key while the directory browser is open.
@@ -3951,7 +4237,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Esc => self.overlay = None,
+            KeyCode::Esc => self.cancel_dialog(),
             KeyCode::Down => browser.next(),
             KeyCode::Up => browser.previous(),
             KeyCode::Right => browser.descend(),
@@ -3967,53 +4253,66 @@ impl App {
             }
             KeyCode::Backspace => browser.backspace(),
             KeyCode::Char('g') if ctrl => browser.toggle_scan(),
-            KeyCode::Enter => {
-                // A typed path names the project directly; otherwise it is the
-                // row the user is sitting on.
-                let chosen = if browser.is_path() {
-                    let typed = browser.typed_dir();
-                    if typed.is_none() {
-                        self.status = format!("no such directory: {}", browser.input());
-                    }
-                    typed
-                } else {
-                    browser.selected().map(|entry| entry.path.clone())
-                };
-
-                if let Some(root) = chosen {
-                    self.open_browsed(root);
-                }
-            }
+            KeyCode::Enter => self.open_browser_selection(),
             KeyCode::Char(c) if !ctrl => browser.push(c),
             _ => {}
         }
     }
 
+    /// Opens what the browser is on as a project: what Enter and `[Open]` do.
+    fn open_browser_selection(&mut self) {
+        let Some(Overlay::Browse(browser)) = &self.overlay else {
+            return;
+        };
+
+        // A typed path names the project directly; otherwise it is the row
+        // the user is sitting on.
+        let chosen = if browser.is_path() {
+            let typed = browser.typed_dir();
+            if typed.is_none() {
+                self.status = format!("no such directory: {}", browser.input());
+            }
+            typed
+        } else {
+            browser.selected().map(|entry| entry.path.clone())
+        };
+
+        if let Some(root) = chosen {
+            self.open_browsed(root);
+        }
+    }
+
     /// Acts on one key while a remote path is being typed.
     fn handle_open_on_key(&mut self, key: &KeyEvent) {
-        let Some(Overlay::OpenOn { device, prompt }) = &mut self.overlay else {
+        let Some(Overlay::OpenOn { prompt, .. }) = &mut self.overlay else {
             return;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Esc => self.overlay = None,
+            KeyCode::Esc => self.cancel_dialog(),
             KeyCode::Backspace => prompt.backspace(),
-            KeyCode::Enter => {
-                let Some(answer) = prompt.answer() else {
-                    return;
-                };
-                let device = *device;
-                let root = PathBuf::from(answer);
-                let name = prompt.title().trim_start_matches("Open on ").to_string();
-
-                self.overlay = None;
-                self.add_project_on(device, root.clone());
-                self.status = format!("opening {} on {name}", root.display());
-            }
+            KeyCode::Enter => self.confirm_open_on(),
             KeyCode::Char(c) if !ctrl => prompt.push(c),
             _ => {}
         }
+    }
+
+    /// Opens the typed path on the machine: what Enter and `[OK]` do.
+    fn confirm_open_on(&mut self) {
+        let Some(Overlay::OpenOn { device, prompt }) = &self.overlay else {
+            return;
+        };
+        let Some(answer) = prompt.answer() else {
+            return;
+        };
+        let device = *device;
+        let root = PathBuf::from(answer);
+        let name = prompt.title().trim_start_matches("Open on ").to_string();
+
+        self.overlay = None;
+        self.add_project_on(device, root.clone());
+        self.status = format!("opening {} on {name}", root.display());
     }
 
     /// Acts on one key while a machine is being added.
@@ -4036,7 +4335,7 @@ impl App {
 
         match add.key(key, validate) {
             Step::Stay => {}
-            Step::Close => self.overlay = None,
+            Step::Close => self.cancel_dialog(),
             Step::Check(machine) => {
                 let answer = (self.checker)(&machine);
                 add.checking(machine, answer);
@@ -4132,7 +4431,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc => self.overlay = None,
+            KeyCode::Esc => self.cancel_dialog(),
             KeyCode::Char('a') => self.decide(true, false),
             KeyCode::Char('A') => self.decide(true, true),
             KeyCode::Char('d') | KeyCode::Char('D') => self.decide(false, false),
@@ -4248,8 +4547,8 @@ impl App {
             waiting: self.pending.len().saturating_sub(1),
             scroll,
             chrome: self.theme.chrome(),
-            buttons: Vec::new(),
-            pressed: None,
+            buttons: pointer::buttons::approval(),
+            pressed: self.approval_pressed,
         })
     }
 
@@ -4401,7 +4700,9 @@ impl App {
 
         self.placing = place;
         self.overlay = Some(Overlay::Harness(
-            Picker::new("New pane", items).with_hint("Enter open · e settings · Esc close"),
+            Picker::new("New pane", items)
+                .with_hint("Enter open · e settings · Esc close")
+                .with_buttons(pointer::buttons::open_cancel()),
         ));
     }
 
@@ -4545,7 +4846,8 @@ impl App {
             .and_then(|device| items.iter().position(|i| i.id == device.to_string()))
             .unwrap_or(0);
 
-        let mut picker = Picker::new("Open on", items);
+        let mut picker =
+            Picker::new("Open on", items).with_buttons(pointer::buttons::open_cancel());
         for _ in 0..start {
             picker.next();
         }
@@ -4583,7 +4885,8 @@ impl App {
             prompt: Prompt::new(
                 format!("Open on {name}"),
                 "a directory on that machine, such as ~/code/app",
-            ),
+            )
+            .with_buttons(pointer::buttons::ok_cancel()),
         });
     }
 
@@ -4597,7 +4900,9 @@ impl App {
             None => Browser::new(&self.browse_from),
         };
 
-        self.overlay = Some(Overlay::Browse(browser));
+        self.overlay = Some(Overlay::Browse(
+            browser.with_buttons(pointer::buttons::open_cancel()),
+        ));
     }
 
     /// Opens `root` as a project, from the browser.
@@ -4649,7 +4954,9 @@ impl App {
             })
             .collect();
 
-        self.overlay = Some(Overlay::Project(Picker::new("Project", items)));
+        self.overlay = Some(Overlay::Project(
+            Picker::new("Project", items).with_buttons(pointer::buttons::open_cancel()),
+        ));
     }
 
     /// Offers harnesses that are installed but not yet registered.
@@ -4673,7 +4980,9 @@ impl App {
             })
             .collect();
 
-        self.overlay = Some(Overlay::Register(Picker::new("Add harness", items)));
+        self.overlay = Some(Overlay::Register(
+            Picker::new("Add harness", items).with_buttons(pointer::buttons::open_cancel()),
+        ));
     }
 
     /// Opens the settings popup for the harness the picker is on.
@@ -4702,7 +5011,8 @@ impl App {
             format!("New {} pane", def.display_name),
             &def.settings,
             &values,
-        );
+        )
+        .with_buttons(pointer::buttons::settings());
         self.overlay = Some(Overlay::Settings { harness: id, form });
     }
 
@@ -4712,10 +5022,17 @@ impl App {
             return Ok(());
         };
 
-        match form.key(key) {
+        let action = form.key(key);
+        self.settings_action(action, area)
+    }
+
+    /// Acts on what the settings form asked for, whether a key or a click
+    /// on a button or an arrow made it ask.
+    fn settings_action(&mut self, action: FormAction, area: Size) -> Result<()> {
+        match action {
             FormAction::None => {}
             FormAction::Refused(why) => self.status = why,
-            FormAction::Back => self.back_to_picker(),
+            FormAction::Back => self.cancel_dialog(),
             FormAction::Save => self.save_settings(),
             FormAction::Open => {
                 if let Some(Overlay::Settings { harness, form }) = self.overlay.take() {
@@ -5290,6 +5607,30 @@ impl App {
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area, body);
+        if let Some(layout) = self.dialog_layout() {
+            hits.push(
+                layout.rect,
+                pointer::Target::Dialog(pointer::DialogHit::Area),
+            );
+            for (rect, index) in layout.rows {
+                hits.push(
+                    rect,
+                    pointer::Target::Dialog(pointer::DialogHit::Row(index)),
+                );
+            }
+            for (rect, index, forward) in layout.steps {
+                hits.push(
+                    rect,
+                    pointer::Target::Dialog(pointer::DialogHit::Step(index, forward)),
+                );
+            }
+            for (rect, id) in layout.buttons {
+                hits.push(
+                    rect,
+                    pointer::Target::Dialog(pointer::DialogHit::Button(id)),
+                );
+            }
+        }
         if let Some(Overlay::Menu(menu)) = &self.overlay {
             let layout = menu.layout(self.window);
             hits.push(layout.rect, pointer::Target::Menu(pointer::MenuHit::Area));
@@ -5372,6 +5713,7 @@ impl App {
     /// Draws whichever overlay is open, if any.
     fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect, body: Rect) {
         let chrome = self.theme.chrome();
+        self.overlay_area = Rect::default();
         if let Some(overlay) = &mut self.overlay {
             overlay.set_chrome(chrome);
         }
@@ -5389,6 +5731,7 @@ impl App {
             _ => panes_area,
         };
 
+        self.overlay_area = panes_area;
         let Some(overlay) = &self.overlay else {
             return;
         };
@@ -5427,6 +5770,7 @@ impl App {
         let scroll = *scroll;
 
         let rect = centred_approval(panes_area);
+        self.overlay_area = rect;
 
         // The queue can only be empty here for one frame, between the last
         // request being answered and `open_next_approval` closing the
@@ -5744,33 +6088,41 @@ impl App {
         self.overlay = Some(Overlay::RenameTab {
             tab,
             prompt: Prompt::new("Rename tab", "empty goes back to the first pane's title")
-                .with_input(current),
+                .with_input(current)
+                .with_buttons(pointer::buttons::ok_cancel()),
         });
     }
 
     /// Acts on one key while a tab's new name is being typed.
     fn handle_rename_tab_key(&mut self, key: &KeyEvent) {
-        let Some(Overlay::RenameTab { tab, prompt }) = &mut self.overlay else {
+        let Some(Overlay::RenameTab { prompt, .. }) = &mut self.overlay else {
             return;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Esc => self.overlay = None,
+            KeyCode::Esc => self.cancel_dialog(),
             KeyCode::Backspace => prompt.backspace(),
-            // Enter on nothing is a choice here, unlike a path: it clears the
-            // name, and the tab goes back to its first pane's title.
-            KeyCode::Enter => {
-                let change = ClientMessage::RenameTab {
-                    tab: *tab,
-                    name: prompt.input().to_string(),
-                };
-                self.overlay = None;
-                self.change_tabs(change);
-            }
+            KeyCode::Enter => self.confirm_rename_tab(),
             KeyCode::Char(c) if !ctrl => prompt.push(c),
             _ => {}
         }
+    }
+
+    /// Renames the tab to what was typed: what Enter and `[OK]` do.
+    ///
+    /// Enter on nothing is a choice here, unlike a path: it clears the name,
+    /// and the tab goes back to its first pane's title.
+    fn confirm_rename_tab(&mut self) {
+        let Some(Overlay::RenameTab { tab, prompt }) = &self.overlay else {
+            return;
+        };
+        let change = ClientMessage::RenameTab {
+            tab: *tab,
+            name: prompt.input().to_string(),
+        };
+        self.overlay = None;
+        self.change_tabs(change);
     }
 
     /// Asks before closing the tab on screen: it can stop running agents.
@@ -5799,25 +6151,28 @@ impl App {
             prompt: Prompt::new(
                 format!("Close \"{name}\" and its {count} {noun}? y/n"),
                 "y closes them, n keeps them",
-            ),
+            )
+            .with_buttons(pointer::buttons::close_cancel()),
         });
     }
 
     /// Acts on one key while closing a tab waits on an answer.
     fn handle_close_tab_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') => self.confirm_close_tab(),
+            KeyCode::Char('n') | KeyCode::Esc => self.cancel_dialog(),
+            _ => {}
+        }
+    }
+
+    /// Closes the tab the question was about: what `y` and `[Close]` do.
+    fn confirm_close_tab(&mut self) {
         let Some(Overlay::CloseTab { tab, .. }) = &self.overlay else {
             return;
         };
         let tab = *tab;
-
-        match key.code {
-            KeyCode::Char('y') => {
-                self.overlay = None;
-                self.change_tabs(ClientMessage::CloseTab { tab });
-            }
-            KeyCode::Char('n') | KeyCode::Esc => self.overlay = None,
-            _ => {}
-        }
+        self.overlay = None;
+        self.change_tabs(ClientMessage::CloseTab { tab });
     }
 
     /// Shows the tab to the left, wrapping to the last.
@@ -15633,5 +15988,699 @@ args = ["--effort", "{value}"]
         drawn(&mut app, &mut terminal);
         app.choose_menu(rename);
         assert!(app.overlay.is_none(), "no prompt opened for tab 0");
+    }
+
+    // ---- Clickable dialogs ----
+
+    /// The cell in the middle of `rect`.
+    fn middle(rect: Rect) -> (u16, u16) {
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    /// The open dialog's layout, as the last frame drew it.
+    fn dialog(app: &App) -> dispatch_tui::button::DialogLayout {
+        app.dialog_layout().expect("a dialog is open")
+    }
+
+    /// Where the open dialog drew `id`.
+    fn button_rect(app: &App, id: pointer::ButtonId) -> Rect {
+        dialog(app)
+            .buttons
+            .iter()
+            .find(|(_, button)| *button == id)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("the dialog drew no {id:?} button"))
+    }
+
+    /// Clicks the middle of the button `id`.
+    fn click_button(app: &mut App, id: pointer::ButtonId) {
+        let (column, row) = middle(button_rect(app, id));
+        click(app, column, row);
+    }
+
+    /// Clicks the middle of list row `index` of the open dialog.
+    fn click_row(app: &mut App, index: usize) {
+        let (rect, _) = dialog(app)
+            .rows
+            .iter()
+            .find(|(_, row)| *row == index)
+            .copied()
+            .unwrap_or_else(|| panic!("the dialog drew no row {index}"));
+        let (column, row) = middle(rect);
+        click(app, column, row);
+    }
+
+    /// An app, its panes, its daemon's ends, a hand clock and a terminal.
+    type WaitingList = (
+        App,
+        Vec<PaneId>,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+        Rc<Cell<Instant>>,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+    );
+
+    /// Three waiting panes and a fourth with the focus, with the waiting
+    /// list open and drawn.
+    fn waiting_list_of_three() -> WaitingList {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 4);
+        for pane in &panes[..3] {
+            block(&mut app, *pane);
+        }
+        app.focus_pane(panes[3]);
+        let mut terminal = a_wide_terminal();
+        app.open_attention_picker();
+        drawn(&mut app, &mut terminal);
+        (app, panes, daemon, sent, clock, terminal)
+    }
+
+    #[test]
+    fn a_picker_row_click_selects_and_a_double_click_chooses() {
+        let (mut app, panes, _daemon, _sent, clock, mut terminal) = waiting_list_of_three();
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("the waiting list is open");
+        };
+        assert_eq!(picker.selected_index(), 0);
+        let second = picker.items()[1].id.clone();
+
+        click_row(&mut app, 1);
+
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("a single click leaves the list open");
+        };
+        assert_eq!(picker.selected_index(), 1);
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[3]),
+            "nothing chosen yet"
+        );
+
+        // The second click, soon after, is a double-click.
+        advance(&clock, Duration::from_millis(100));
+        drawn(&mut app, &mut terminal);
+        click_row(&mut app, 1);
+
+        assert!(app.overlay.is_none(), "the double-click chose it");
+        let chosen = app.state.focused_pane().expect("a pane is focused");
+        assert_eq!(chosen.to_string(), second);
+    }
+
+    #[test]
+    fn a_slow_second_click_on_a_row_only_selects_it() {
+        let (mut app, panes, _daemon, _sent, clock, mut terminal) = waiting_list_of_three();
+
+        click_row(&mut app, 2);
+        advance(&clock, Duration::from_millis(500));
+        drawn(&mut app, &mut terminal);
+        click_row(&mut app, 2);
+
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("two slow clicks are two single ones");
+        };
+        assert_eq!(picker.selected_index(), 2);
+        assert_eq!(app.state.focused_pane(), Some(panes[3]));
+    }
+
+    /// One dialog to try a button on: how to open it, what its button is,
+    /// and the key that does the same.
+    struct Case {
+        name: &'static str,
+        open: fn() -> Scene,
+        button: pointer::ButtonId,
+        key: KeyCode,
+        /// Something the outcome must show, so that two dead paths do not
+        /// agree by doing nothing.
+        shows: &'static str,
+    }
+
+    /// An app with a dialog open, and what it will have asked of a daemon.
+    struct Scene {
+        app: App,
+        sent: Option<Receiver<ClientMessage>>,
+        _daemon: Option<Sender<ServerMessage>>,
+    }
+
+    impl Scene {
+        fn attached(
+            app: App,
+            daemon: Sender<ServerMessage>,
+            sent: Receiver<ClientMessage>,
+        ) -> Self {
+            Self {
+                app,
+                sent: Some(sent),
+                _daemon: Some(daemon),
+            }
+        }
+    }
+
+    /// A message without its ids, which differ from one scene to the next.
+    fn described(message: &ClientMessage) -> String {
+        match message {
+            ClientMessage::DelegateDecision {
+                approve, blanket, ..
+            } => format!("DelegateDecision approve={approve} blanket={blanket}"),
+            ClientMessage::SpawnPane {
+                harness, settings, ..
+            } => {
+                let mut settings: Vec<_> = settings.iter().collect();
+                settings.sort();
+                format!("SpawnPane {harness} {settings:?}")
+            }
+            ClientMessage::RenameTab { name, .. } => format!("RenameTab {name:?}"),
+            ClientMessage::CloseTab { .. } => "CloseTab".to_string(),
+            ClientMessage::OpenProject { .. } => "OpenProject".to_string(),
+            other => format!("{other:?}")
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    /// What a scene came to: the dialog left open, what was said, and what
+    /// was asked of a daemon.
+    fn outcome(scene: &mut Scene) -> String {
+        let mut asked: Vec<String> = scene.app.sent.iter().map(described).collect();
+        if let Some(sent) = &scene.sent {
+            asked.extend(
+                sent.try_iter()
+                    .filter(|message| {
+                        // Subscribing and resizing are the app keeping up, not the
+                        // dialog.
+                        !matches!(
+                            message,
+                            ClientMessage::Subscribe | ClientMessage::ResizePane { .. }
+                        )
+                    })
+                    .map(|message| described(&message)),
+            );
+        }
+        let machine = match &scene.app.overlay {
+            Some(Overlay::AddMachine(add)) => add.prompt().title().to_string(),
+            _ => String::new(),
+        };
+        format!(
+            "overlay={:?} {machine} status={:?} asked={asked:?}",
+            scene.app.overlay_tag(),
+            scene.app.status,
+        )
+    }
+
+    /// Opens a picker over an app with a project, and draws it.
+    fn picker_scene(open: fn(&mut App)) -> Scene {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        block(&mut app, panes[0]);
+        app.focus_pane(panes[1]);
+        open(&mut app);
+        drain(&sent);
+        Scene::attached(app, daemon, sent)
+    }
+
+    fn tab_scene(open: fn(&mut App)) -> Scene {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+        open(&mut app);
+        drain(&sent);
+        Scene::attached(app, daemon, sent)
+    }
+
+    fn new_pane_scene() -> Scene {
+        let (app, daemon, sent) = app_on_demo(None);
+        Scene::attached(app, daemon, sent)
+    }
+
+    fn settings_scene() -> Scene {
+        let dir = scratch("dialog-settings");
+        let (mut app, daemon, sent) = app_on_demo(Some(&dir));
+        press(&mut app, KeyCode::Char('e'));
+        drain(&sent);
+        Scene::attached(app, daemon, sent)
+    }
+
+    fn open_help_dialog(app: &mut App) {
+        app.open_help();
+    }
+
+    fn open_browse_dialog(app: &mut App) {
+        // The same directory for both halves of a comparison, so what the
+        // status says of it is the same too.
+        let dir =
+            std::env::temp_dir().join(format!("dispatch-dialog-browse-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("child")).expect("temp dir is writable");
+        app.browse_from(&dir);
+        app.open_browser();
+        press(app, KeyCode::Down);
+    }
+
+    fn cases() -> Vec<Case> {
+        use pointer::ButtonId::*;
+        vec![
+            Case {
+                name: "new pane: Open",
+                open: new_pane_scene,
+                button: Open,
+                key: KeyCode::Enter,
+                shows: "SpawnPane demo",
+            },
+            Case {
+                name: "new pane: Cancel",
+                open: new_pane_scene,
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "project: Open",
+                open: || picker_scene(App::open_project_picker),
+                button: Open,
+                key: KeyCode::Enter,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "project: Cancel",
+                open: || picker_scene(App::open_project_picker),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "waiting: Open",
+                open: || picker_scene(App::open_attention_picker),
+                button: Open,
+                key: KeyCode::Enter,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "waiting: Cancel",
+                open: || picker_scene(App::open_attention_picker),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "help: Run",
+                open: || picker_scene(open_help_dialog),
+                button: Run,
+                key: KeyCode::Enter,
+                shows: "overlay=",
+            },
+            Case {
+                name: "help: Cancel",
+                open: || picker_scene(open_help_dialog),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "browser: Open",
+                open: || picker_scene(open_browse_dialog),
+                button: Open,
+                key: KeyCode::Enter,
+                shows: "OpenProject",
+            },
+            Case {
+                name: "browser: Cancel",
+                open: || picker_scene(open_browse_dialog),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "settings: Open pane",
+                open: settings_scene,
+                button: OpenPane,
+                key: KeyCode::Enter,
+                shows: "SpawnPane demo",
+            },
+            Case {
+                name: "settings: Save as default",
+                open: settings_scene,
+                button: SaveDefault,
+                key: KeyCode::Char('s'),
+                shows: "saved as Demo's default",
+            },
+            Case {
+                name: "settings: Cancel",
+                open: settings_scene,
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=Some(\"harness\")",
+            },
+            Case {
+                name: "approval: Approve",
+                open: approval_scene,
+                button: Approve,
+                key: KeyCode::Char('a'),
+                shows: "DelegateDecision approve=true blanket=false",
+            },
+            Case {
+                name: "approval: Deny",
+                open: approval_scene,
+                button: Deny,
+                key: KeyCode::Char('d'),
+                shows: "DelegateDecision approve=false blanket=false",
+            },
+            Case {
+                name: "approval: Always",
+                open: approval_scene,
+                button: Always,
+                key: KeyCode::Char('A'),
+                shows: "DelegateDecision approve=true blanket=true",
+            },
+            Case {
+                name: "approval: Later",
+                open: approval_scene,
+                button: Later,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "rename tab: OK",
+                open: || tab_scene(App::open_rename_tab),
+                button: Ok,
+                key: KeyCode::Enter,
+                shows: "RenameTab",
+            },
+            Case {
+                name: "rename tab: Cancel",
+                open: || tab_scene(App::open_rename_tab),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "open on: OK",
+                open: open_on_scene,
+                button: Ok,
+                key: KeyCode::Enter,
+                shows: "OpenProject",
+            },
+            Case {
+                name: "open on: Cancel",
+                open: open_on_scene,
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "add machine: OK",
+                open: add_machine_scene,
+                button: Ok,
+                key: KeyCode::Enter,
+                shows: "Call it",
+            },
+            Case {
+                name: "add machine: Cancel",
+                open: add_machine_scene,
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+            Case {
+                name: "close tab: Close",
+                open: || tab_scene(App::open_close_tab),
+                button: Close,
+                key: KeyCode::Char('y'),
+                shows: "CloseTab",
+            },
+            Case {
+                name: "close tab: Cancel",
+                open: || tab_scene(App::open_close_tab),
+                button: Cancel,
+                key: KeyCode::Esc,
+                shows: "overlay=None",
+            },
+        ]
+    }
+
+    fn approval_scene() -> Scene {
+        let (mut app, _request) = app_with_one_pending();
+        // The request's project has no machine to answer to, so the decision
+        // is seen in `sent`, which a test build keeps.
+        app.open_next_approval();
+        Scene {
+            app,
+            sent: None,
+            _daemon: None,
+        }
+    }
+
+    fn open_on_scene() -> Scene {
+        let (mut app, _project, daemon, sent) = attached_app();
+        let device = app.state.devices()[0].id;
+        app.open_path_prompt(device);
+        type_text(&mut app, "/srv/app");
+        drain(&sent);
+        Scene::attached(app, daemon, sent)
+    }
+
+    fn add_machine_scene() -> Scene {
+        let dir = scratch("dialog-add-machine");
+        let (mut app, _project, daemon, sent) = attached_app();
+        app.keep_projects_in(&dir);
+        app.open_add_machine();
+        type_text(&mut app, "me@tower.lan");
+        drain(&sent);
+        Scene::attached(app, daemon, sent)
+    }
+
+    #[test]
+    fn every_dialog_button_does_what_its_key_does() {
+        for case in cases() {
+            let mut by_button = (case.open)();
+            let mut terminal = a_wide_terminal();
+            drawn(&mut by_button.app, &mut terminal);
+            click_button(&mut by_button.app, case.button);
+            let clicked = outcome(&mut by_button);
+
+            let mut by_key = (case.open)();
+            press(&mut by_key.app, case.key);
+            let pressed = outcome(&mut by_key);
+
+            assert_eq!(clicked, pressed, "{}", case.name);
+            assert!(
+                clicked.contains(case.shows),
+                "{}: expected {:?} in {clicked:?}",
+                case.name,
+                case.shows
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_a_child_while_a_dialog_is_open() {
+        let (mut app, daemon, sent) = app_on_demo(None);
+        let project = app.state.selected_project().expect("a project is open");
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        track_mouse(&mut app, &daemon, panes[0]);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        assert!(app.overlay.is_some(), "the new-pane picker is open");
+        drain(&sent);
+
+        let inside = dialog(&app).rect;
+        let (_, tile) = app.layout[0];
+        let interior = App::interior(tile);
+        let outside = (interior.x..interior.x + interior.width)
+            .flat_map(|x| (interior.y..interior.y + interior.height).map(move |y| (x, y)))
+            .find(|(x, y)| !inside.contains(ratatui::layout::Position::new(*x, *y)))
+            .expect("the pane has room beside the dialog");
+
+        // On the box's own frame, where no row or button is: a click there
+        // is the dialog's, and does nothing.
+        click(&mut app, inside.x + inside.width / 2, inside.y);
+        assert!(app.overlay.is_some(), "a click on its frame keeps it open");
+        click_row(&mut app, 0);
+        assert!(app.overlay.is_some(), "and a click on a row only selects");
+        click(&mut app, outside.0, outside.1);
+        mouse_at(&mut app, MouseEventKind::ScrollDown, outside.0, outside.1);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            outside.0,
+            outside.1,
+        );
+        app.handle(&Event::Paste("pasted".into()), Size::new(100, 30))
+            .expect("a paste is handled");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Down);
+
+        let writes = writes_by_pane(&sent);
+        assert!(
+            !writes.contains_key(&panes[0]),
+            "no click, paste or key reached the pane: {writes:?}"
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Harness(_))),
+            "the dialog is still open after a click beside it"
+        );
+    }
+
+    #[test]
+    fn a_click_beside_a_dialog_does_nothing_but_one_beside_a_menu_closes_it() {
+        let (mut app, daemon, _sent) = app_on_demo(None);
+        let project = app.state.selected_project().expect("a project is open");
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let (_, tile) = *app
+            .layout
+            .iter()
+            .find(|(id, _)| *id != panes[0])
+            .expect("a second tile");
+        let (x, y) = (tile.x + 2, tile.y + 2);
+        assert!(app.overlay.is_some(), "the new-pane picker is open");
+
+        click(&mut app, x, y);
+        assert!(app.overlay.is_some(), "a dialog ignores it");
+        assert_eq!(app.state.focused_pane(), Some(panes[0]), "and focus stays");
+
+        app.overlay = None;
+        app.open_pane_menu(panes[0], (x, y));
+        drawn(&mut app, &mut terminal);
+        click(&mut app, 0, 5);
+        assert!(app.overlay.is_none(), "a menu closes");
+    }
+
+    #[test]
+    fn the_wheel_over_a_dialog_moves_its_selection_and_nothing_behind_it() {
+        let (mut app, panes, _daemon, _sent, _clock, _terminal) = waiting_list_of_three();
+        let (column, row) = middle(dialog(&app).rect);
+
+        mouse_at(&mut app, MouseEventKind::ScrollDown, column, row);
+        mouse_at(&mut app, MouseEventKind::ScrollDown, column, row);
+
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("the list is open");
+        };
+        assert_eq!(picker.selected_index(), 2, "one row a notch");
+        assert!(
+            panes.iter().all(|pane| !app.panes[pane].scrolled_back),
+            "nothing behind it scrolled"
+        );
+
+        mouse_at(&mut app, MouseEventKind::ScrollUp, column, row);
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("the list is open");
+        };
+        assert_eq!(picker.selected_index(), 1);
+    }
+
+    #[test]
+    fn the_wheel_beside_a_dialog_does_nothing() {
+        let (mut app, panes, _daemon, _sent, _clock, _terminal) = waiting_list_of_three();
+        let rect = dialog(&app).rect;
+        let x = rect.x.saturating_sub(2);
+
+        mouse_at(&mut app, MouseEventKind::ScrollDown, x, rect.y + 1);
+
+        let Some(Overlay::Attention(picker)) = &app.overlay else {
+            panic!("the list is open");
+        };
+        assert_eq!(picker.selected_index(), 0);
+        assert!(panes.iter().all(|pane| !app.panes[pane].scrolled_back));
+    }
+
+    #[test]
+    fn a_settings_arrow_click_steps_its_value() {
+        let (mut clicked, _daemon, _sent) = app_on_demo(None);
+        press(&mut clicked, KeyCode::Char('e'));
+        let mut terminal = a_wide_terminal();
+        drawn(&mut clicked, &mut terminal);
+        let (rect, _, _) = dialog(&clicked)
+            .steps
+            .iter()
+            .find(|(_, row, forward)| *row == 1 && *forward)
+            .copied()
+            .expect("the effort row has a next arrow");
+        let (column, line) = middle(rect);
+
+        click(&mut clicked, column, line);
+
+        // What the keys make of the same: to the row, then →.
+        let (mut keyed, _daemon, _sent) = app_on_demo(None);
+        press(&mut keyed, KeyCode::Char('e'));
+        press(&mut keyed, KeyCode::Down);
+        press(&mut keyed, KeyCode::Right);
+        assert_ne!(form_values(&keyed)["effort"], "", "the keys changed it");
+        assert_eq!(form_values(&clicked), form_values(&keyed));
+        let Some(Overlay::Settings { form, .. }) = &clicked.overlay else {
+            panic!("the settings are open");
+        };
+        assert_eq!(form.selected_index(), 1, "the row has the focus");
+    }
+
+    #[test]
+    fn a_button_pressed_survives_the_frame_drawn_before_its_release() {
+        use crossterm::event::MouseButton::Left;
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let (column, row) = middle(button_rect(&app, pointer::ButtonId::Cancel));
+
+        mouse_at(&mut app, MouseEventKind::Down(Left), column, row);
+        drawn(&mut app, &mut terminal);
+        assert!(app.gesture.is_some(), "the press outlived the frame");
+        mouse_at(&mut app, MouseEventKind::Up(Left), column, row);
+
+        assert!(app.overlay.is_none(), "the release acted");
+    }
+
+    #[test]
+    fn sliding_off_a_button_calls_the_press_back() {
+        use crossterm::event::MouseButton::Left;
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let (column, row) = middle(button_rect(&app, pointer::ButtonId::Cancel));
+        let rect = dialog(&app).rect;
+
+        mouse_at(&mut app, MouseEventKind::Down(Left), column, row);
+        mouse_at(&mut app, MouseEventKind::Drag(Left), rect.x, rect.y);
+        mouse_at(&mut app, MouseEventKind::Up(Left), rect.x, rect.y);
+
+        assert!(
+            app.overlay.is_some(),
+            "released elsewhere: nothing happened"
+        );
+        assert!(app.gesture.is_none());
+    }
+
+    #[test]
+    fn a_right_click_on_a_button_does_nothing() {
+        use crossterm::event::MouseButton::Right;
+        let (mut app, _daemon, _sent) = app_on_demo(None);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let (column, row) = middle(button_rect(&app, pointer::ButtonId::Cancel));
+
+        mouse_at(&mut app, MouseEventKind::Down(Right), column, row);
+        mouse_at(&mut app, MouseEventKind::Up(Right), column, row);
+
+        assert!(app.overlay.is_some());
+    }
+
+    #[test]
+    fn hovering_a_row_marks_it_and_leaving_clears_it() {
+        let (mut app, _panes, _daemon, _sent, _clock, mut terminal) = waiting_list_of_three();
+        let (rect, _) = dialog(&app).rows[1];
+        let (column, row) = middle(rect);
+
+        mouse_at(&mut app, MouseEventKind::Moved, column, row);
+        drawn(&mut app, &mut terminal);
+        let hovered = terminal.backend().buffer()[(rect.x + 2, rect.y)].modifier;
+        assert!(hovered.contains(Modifier::UNDERLINED), "{hovered:?}");
+
+        mouse_at(&mut app, MouseEventKind::Moved, 0, 0);
+        drawn(&mut app, &mut terminal);
+        let left = terminal.backend().buffer()[(rect.x + 2, rect.y)].modifier;
+        assert!(!left.contains(Modifier::UNDERLINED), "{left:?}");
     }
 }

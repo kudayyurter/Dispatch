@@ -4,10 +4,6 @@
 //! drawn, so a pointer event is resolved against exactly what is on screen:
 //! the last rectangle covering a cell is the one on top.
 
-// Double-click detection, gestures, menus and dialog targets are used from
-// Task 3 onwards (the later tasks name them); until then they are only tested.
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 use crossterm::event::MouseButton;
@@ -20,6 +16,73 @@ use crate::tabs::TabHit;
 pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub use dispatch_tui::button::ButtonId;
+
+/// The buttons each kind of dialog carries, left to right. The default, which
+/// is the one Enter presses, is drawn in the accent.
+pub mod buttons {
+    use dispatch_tui::button::{Button, ButtonId};
+
+    fn button(id: ButtonId, label: &'static str, default: bool) -> Button {
+        Button { id, label, default }
+    }
+
+    /// A picker or the directory browser.
+    #[must_use]
+    pub fn open_cancel() -> Vec<Button> {
+        vec![
+            button(ButtonId::Cancel, "Cancel", false),
+            button(ButtonId::Open, "Open", true),
+        ]
+    }
+
+    /// The command list, where Enter runs what is chosen.
+    #[must_use]
+    pub fn run_cancel() -> Vec<Button> {
+        vec![
+            button(ButtonId::Cancel, "Cancel", false),
+            button(ButtonId::Run, "Run", true),
+        ]
+    }
+
+    /// A harness's settings before a pane is opened with them.
+    #[must_use]
+    pub fn settings() -> Vec<Button> {
+        vec![
+            button(ButtonId::Cancel, "Cancel", false),
+            button(ButtonId::SaveDefault, "Save as default", false),
+            button(ButtonId::OpenPane, "Open pane", true),
+        ]
+    }
+
+    /// A delegation request.
+    #[must_use]
+    pub fn approval() -> Vec<Button> {
+        vec![
+            button(ButtonId::Later, "Later", false),
+            button(ButtonId::Deny, "Deny", false),
+            button(ButtonId::Always, "Always", false),
+            button(ButtonId::Approve, "Approve", true),
+        ]
+    }
+
+    /// A prompt that takes typing.
+    #[must_use]
+    pub fn ok_cancel() -> Vec<Button> {
+        vec![
+            button(ButtonId::Cancel, "Cancel", false),
+            button(ButtonId::Ok, "OK", true),
+        ]
+    }
+
+    /// The question before a tab is closed.
+    #[must_use]
+    pub fn close_cancel() -> Vec<Button> {
+        vec![
+            button(ButtonId::Cancel, "Cancel", false),
+            button(ButtonId::Close, "Close", true),
+        ]
+    }
+}
 
 /// A row or button of the open dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,12 +185,6 @@ impl HitMap {
             return None;
         }
         Some(target)
-    }
-
-    /// The overlay open when it was drawn.
-    #[must_use]
-    pub fn overlay(&self) -> Option<&'static str> {
-        self.overlay
     }
 }
 

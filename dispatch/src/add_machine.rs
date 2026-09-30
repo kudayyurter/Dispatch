@@ -12,6 +12,8 @@ use dispatch_config::machines::{self, Machine};
 use dispatch_proto::Role;
 use dispatch_tui::{Note, Prompt};
 
+use crate::pointer;
+
 /// What a check hands back: a connected client, or why there is none.
 pub type Answer = Result<Client, String>;
 
@@ -72,11 +74,14 @@ fn target_prompt(target: &str) -> Prompt {
         "an ssh target: host, user@host, or an ssh alias",
     )
     .with_input(target)
+    .with_buttons(pointer::buttons::ok_cancel())
 }
 
 /// The second question.
 fn name_prompt(name: &str) -> Prompt {
-    Prompt::new("Call it", "letters, digits, - and _").with_input(name)
+    Prompt::new("Call it", "letters, digits, - and _")
+        .with_input(name)
+        .with_buttons(pointer::buttons::ok_cancel())
 }
 
 impl Default for AddMachine {
