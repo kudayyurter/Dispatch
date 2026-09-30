@@ -657,8 +657,13 @@ pub struct App {
     /// Whether the sidebar is open over the panes, in a window too narrow to
     /// dock it. Never set in a wide one.
     drawer_open: bool,
-    /// Whether the sidebar's right edge is held by the pointer.
-    dragging_sidebar: bool,
+    /// The press still held, and what it belongs to until it is let go.
+    gesture: Option<pointer::Gesture>,
+    /// The last left press, for telling a double-click.
+    clicks: pointer::Clicks,
+    /// What the sidebar's hit test said at the press that started a
+    /// sidebar gesture, so a release on another row does not act.
+    pressed_sidebar: Option<sidebar::Hit>,
     /// Where the sidebar's width and fold are kept, when this client keeps
     /// them.
     ui_dir: Option<PathBuf>,
@@ -845,7 +850,9 @@ impl App {
             sidebar_width: sidebar::WIDTH,
             sidebar_collapsed: false,
             drawer_open: false,
-            dragging_sidebar: false,
+            gesture: None,
+            clicks: pointer::Clicks::default(),
+            pressed_sidebar: None,
             ui_dir: None,
             window: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
@@ -2838,6 +2845,12 @@ impl App {
 
     /// [`App::handle`]'s work, before scroll mode is settled.
     fn act_on(&mut self, event: &Event, area: Size) -> Result<()> {
+        // A window that lost focus or changed size can miss the release of a
+        // press in flight, and the pane under it has moved besides.
+        if matches!(event, Event::FocusLost | Event::Resize(..)) {
+            self.end_gesture();
+        }
+
         // A click ends tab mode whatever it lands on. The sidebar and the tab
         // row are resolved here, before the router sees the event, so the
         // router cannot end it for them.
@@ -2850,9 +2863,9 @@ impl App {
         // An overlay takes the keyboard while it is open, so arrow keys choose
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
-            // The overlay eats whatever would have ended a drag, so none is
+            // The overlay eats whatever would have ended a press, so none is
             // still live once it closes.
-            self.dragging_sidebar = false;
+            self.end_gesture();
             return self.handle_overlay(event, area);
         }
 
@@ -2897,6 +2910,38 @@ impl App {
     /// event was consumed; when it was not, the router over `layout` handles
     /// it.
     fn route_pointer(&mut self, mouse: &MouseEvent) -> bool {
+        use crossterm::event::MouseButton;
+
+        // A press still held belongs to what it pressed, wherever the pointer
+        // has gone since.
+        if let Some(gesture) = self.gesture {
+            match mouse.kind {
+                MouseEventKind::Drag(button) if button == gesture.button => {
+                    self.gesture = Some(pointer::Gesture {
+                        last: (mouse.column, mouse.row),
+                        ..gesture
+                    });
+                    self.drag_gesture(gesture.owner, mouse);
+                    return true;
+                }
+                MouseEventKind::Up(button) if button == gesture.button => {
+                    self.gesture = None;
+                    self.release_gesture(gesture.owner, mouse);
+                    return true;
+                }
+                // Anything else mid-gesture is noise from a terminal that
+                // lost a release; the gesture ends as if it had arrived.
+                MouseEventKind::Down(_) => self.end_gesture(),
+                _ => return true,
+            }
+        } else if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+            // Motion with a button held, or its release, whose press this
+            // window never saw (an overlay took it, or the gesture ended
+            // early): nothing owns it, and the pane under the pointer did not
+            // receive the press.
+            return true;
+        }
+
         let target = self
             .hits
             .resolve(mouse.column, mouse.row, self.overlay_tag());
@@ -2912,77 +2957,35 @@ impl App {
             return true;
         }
 
-        // The tab row is not part of input routing either: a click on it is
-        // resolved against what was drawn there last frame. The map keeps
-        // whatever was drawn last on top, which is what is actually on top.
-        if matches!(mouse.kind, MouseEventKind::Down(_))
-            && let Some(pointer::Target::Tab(hit)) = target
+        if let MouseEventKind::Down(button) = mouse.kind
+            && let Some(target) = target
         {
-            match hit {
-                TabHit::Tab(index) => self.select_tab(index),
-                TabHit::New => self.open_new_tab_picker(),
-                TabHit::Previous => self.select_previous_tab(),
-                TabHit::Next => self.select_tab(self.current_tab() + 1),
+            self.gesture = Some(pointer::Gesture {
+                owner: target,
+                button,
+                last: (mouse.column, mouse.row),
+            });
+            self.pressed_sidebar = None;
+            if button == MouseButton::Left {
+                // Kept for what a double-click opens.
+                let _double = self.clicks.press(target, self.now());
             }
-            return true;
-        }
-
-        // The sidebar's right edge is a handle: pressed, dragged, let go.
-        // Only a docked sidebar has one; the drawer's width is the docked
-        // width, changed from a window wide enough to dock it.
-        let area = self.sidebar_area;
-        match mouse.kind {
-            MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                if !self.drawer_open && target == Some(pointer::Target::SidebarEdge) =>
-            {
-                self.dragging_sidebar = true;
-                return true;
-            }
-            MouseEventKind::Drag(crossterm::event::MouseButton::Left) if self.dragging_sidebar => {
-                use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
-                self.sidebar_width = (mouse.column + 1)
-                    .saturating_sub(area.x)
-                    .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
-                return true;
-            }
-            MouseEventKind::Up(_) if self.dragging_sidebar => {
-                self.dragging_sidebar = false;
-                self.save_ui();
-                return true;
-            }
-            _ => {}
-        }
-
-        // The sidebar is not otherwise part of input routing — `layout` covers
-        // only the tiled grid — so a click on one of its rows is resolved here
-        // rather than through the router.
-        if matches!(mouse.kind, MouseEventKind::Down(_))
-            && target == Some(pointer::Target::Sidebar)
-            && let Some(hit) = sidebar::hit_test(
-                &self.state,
-                self.sidebar_area,
-                &self.sidebar_scroll,
-                mouse.column,
-                mouse.row,
-            )
-        {
-            match hit {
-                sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
-                // A heading carries no pane, so the whole row is the
-                // project's: a click both moves the view there and folds the
-                // panes away.
-                sidebar::Hit::Project(id) => {
-                    self.select_project(id);
-                    self.state.toggle_project_collapsed(id);
+            match target {
+                pointer::Target::Sidebar => {
+                    self.pressed_sidebar = sidebar::hit_test(
+                        &self.state,
+                        self.sidebar_area,
+                        &self.sidebar_scroll,
+                        mouse.column,
+                        mouse.row,
+                    );
+                    return true;
                 }
-                sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
-                sidebar::Hit::Pane(id) => self.focus_pane(id),
+                // The child gets its press as it always did; everything it
+                // is sent after is this gesture's.
+                pointer::Target::PaneContent(_) => return false,
+                _ => return true,
             }
-            // Picking something is what the drawer was opened for.
-            if matches!(hit, sidebar::Hit::Project(_) | sidebar::Hit::Pane(_)) {
-                self.drawer_open = false;
-            }
-            return true;
         }
 
         // The wheel over the sidebar scrolls the section under it; the grid
@@ -2990,15 +2993,22 @@ impl App {
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        ) && target == Some(pointer::Target::Sidebar)
-            && let Some(device) = sidebar::section_at(
-                &self.state,
-                self.sidebar_area,
-                &self.sidebar_scroll,
-                mouse.column,
-                mouse.row,
-            )
-        {
+        ) && matches!(
+            target,
+            Some(pointer::Target::Sidebar | pointer::Target::SidebarEdge)
+        ) && let Some(device) = sidebar::section_at(
+            &self.state,
+            self.sidebar_area,
+            &self.sidebar_scroll,
+            // The edge is the frame's own column, which belongs to no
+            // section: its rows are the column beside it.
+            if target == Some(pointer::Target::SidebarEdge) {
+                mouse.column.saturating_sub(1)
+            } else {
+                mouse.column
+            },
+            mouse.row,
+        ) {
             let offset = self.sidebar_scroll.entry(device).or_insert(0);
             *offset = if mouse.kind == MouseEventKind::ScrollUp {
                 offset.saturating_sub(1)
@@ -3011,6 +3021,169 @@ impl App {
         // The drawer hides the panes beneath it, so a pointer event on its
         // blank space or border is nobody's: it must not reach them.
         self.drawer_open && target == Some(pointer::Target::Sidebar)
+    }
+
+    /// A held press moved: what its owner does with the motion.
+    fn drag_gesture(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+        match owner {
+            // The sidebar's right edge is a handle: pressed, dragged, let go.
+            pointer::Target::SidebarEdge => {
+                use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
+                self.sidebar_width = (mouse.column + 1)
+                    .saturating_sub(self.sidebar_area.x)
+                    .clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+            }
+            pointer::Target::PaneContent(id) => self.send_mouse_to(
+                id,
+                (mouse.column, mouse.row),
+                dispatch_pty::MouseAction::Motion,
+                mouse.kind,
+                mouse.modifiers,
+            ),
+            _ => {}
+        }
+    }
+
+    /// A held press was let go: what its owner does with the release.
+    fn release_gesture(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+        match owner {
+            pointer::Target::SidebarEdge => self.save_ui(),
+            pointer::Target::PaneContent(id) => self.send_mouse_to(
+                id,
+                (mouse.column, mouse.row),
+                dispatch_pty::MouseAction::Release,
+                mouse.kind,
+                mouse.modifiers,
+            ),
+            // A control acts on a release that is still inside it, and only
+            // for the left button: sliding off is how a press is cancelled.
+            pointer::Target::Sidebar
+            | pointer::Target::Tab(_)
+            | pointer::Target::PaneHeader(_)
+            | pointer::Target::PaneMenu(_)
+            | pointer::Target::Menu(_)
+            | pointer::Target::Dialog(_) => {
+                let still_on = self
+                    .hits
+                    .resolve(mouse.column, mouse.row, self.overlay_tag())
+                    == Some(owner);
+                if still_on && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                {
+                    self.activate(owner, mouse);
+                }
+            }
+        }
+    }
+
+    /// Does what a control does when it is clicked.
+    fn activate(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+        match owner {
+            pointer::Target::Tab(hit) => match hit {
+                TabHit::Tab(index) => self.select_tab(index),
+                TabHit::New => self.open_new_tab_picker(),
+                TabHit::Previous => self.select_previous_tab(),
+                TabHit::Next => self.select_tab(self.current_tab() + 1),
+            },
+            // The sidebar is not part of input routing — `layout` covers only
+            // the tiled grid — so a click on one of its rows is resolved here
+            // rather than through the router.
+            pointer::Target::Sidebar => {
+                let hit = sidebar::hit_test(
+                    &self.state,
+                    self.sidebar_area,
+                    &self.sidebar_scroll,
+                    mouse.column,
+                    mouse.row,
+                );
+                let Some(hit) = hit.filter(|hit| Some(*hit) == self.pressed_sidebar) else {
+                    return;
+                };
+                match hit {
+                    sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
+                    // A heading carries no pane, so the whole row is the
+                    // project's: a click both moves the view there and folds
+                    // the panes away.
+                    sidebar::Hit::Project(id) => {
+                        self.select_project(id);
+                        self.state.toggle_project_collapsed(id);
+                    }
+                    sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
+                    sidebar::Hit::Pane(id) => self.focus_pane(id),
+                }
+                // Picking something is what the drawer was opened for.
+                if matches!(hit, sidebar::Hit::Project(_) | sidebar::Hit::Pane(_)) {
+                    self.drawer_open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ends a press whose owner can no longer take its release, sending that
+    /// release first to a pane that can, so no child keeps a stuck button.
+    fn end_gesture(&mut self) {
+        let Some(gesture) = self.gesture.take() else {
+            return;
+        };
+        if let pointer::Target::PaneContent(id) = gesture.owner
+            && self.panes.contains_key(&id)
+            && self.layout.iter().any(|(pane, _)| *pane == id)
+        {
+            self.send_mouse_to(
+                id,
+                gesture.last,
+                dispatch_pty::MouseAction::Release,
+                MouseEventKind::Up(gesture.button),
+                KeyModifiers::NONE,
+            );
+        }
+        if gesture.owner == pointer::Target::SidebarEdge {
+            self.save_ui();
+        }
+    }
+
+    /// Forwards a pointer event at window cell `at` to `id`, relative to that
+    /// pane's interior however far outside it the pointer has gone.
+    fn send_mouse_to(
+        &mut self,
+        id: PaneId,
+        at: (u16, u16),
+        action: dispatch_pty::MouseAction,
+        kind: MouseEventKind,
+        modifiers: KeyModifiers,
+    ) {
+        use crossterm::event::MouseButton as Pressed;
+        use dispatch_pty::MouseButton;
+
+        let (MouseEventKind::Down(button)
+        | MouseEventKind::Up(button)
+        | MouseEventKind::Drag(button)) = kind
+        else {
+            return;
+        };
+        let Some(&(_, rect)) = self.layout.iter().find(|(pane, _)| *pane == id) else {
+            return;
+        };
+        let button = match button {
+            Pressed::Left => MouseButton::Left,
+            Pressed::Middle => MouseButton::Middle,
+            Pressed::Right => MouseButton::Right,
+        };
+        self.send_mouse(
+            id,
+            MouseInput {
+                action,
+                button,
+                col: at.0.saturating_sub(rect.x),
+                row: at.1.saturating_sub(rect.y),
+                modifiers: dispatch_pty::Modifiers {
+                    shift: modifiers.contains(KeyModifiers::SHIFT),
+                    ctrl: modifiers.contains(KeyModifiers::CONTROL),
+                    alt: modifiers.contains(KeyModifiers::ALT),
+                    super_: modifiers.contains(KeyModifiers::SUPER),
+                },
+            },
+        );
     }
 
     /// Does what an action says, whether a key or a choice in the command
@@ -4484,6 +4657,12 @@ impl App {
         }
 
         let _ = self.state.close_pane(id);
+        if self
+            .gesture
+            .is_some_and(|gesture| gesture.owner == pointer::Target::PaneContent(id))
+        {
+            self.end_gesture();
+        }
         // A closed pane cannot be brought into the grid, so it has nothing
         // left to be expanded into.
         self.expanded.remove(&id);
@@ -4503,6 +4682,16 @@ impl App {
         self.animations.sweep(now);
         self.notice_focus(now);
         let mut hits = pointer::HitMap::new(self.overlay_tag());
+
+        // A press whose owner is gone from the last frame, or that an overlay
+        // has taken the pointer from, is over.
+        if self.gesture.is_some_and(|gesture| {
+            self.overlay.is_some()
+                || matches!(gesture.owner, pointer::Target::PaneContent(id)
+                    if !self.frames.iter().any(|(pane, _)| *pane == id))
+        }) {
+            self.end_gesture();
+        }
 
         // Remembered once a frame rather than on each way focus can move:
         // there are many ways, and the frame sees the result of all of them.
@@ -8610,15 +8799,182 @@ mod tests {
 
     /// A left-button press at `(column, row)`, as the terminal reports one.
     fn click(app: &mut App, column: u16, row: u16) {
+        use crossterm::event::MouseButton::Left;
+        mouse_at(app, MouseEventKind::Down(Left), column, row);
+        mouse_at(app, MouseEventKind::Up(Left), column, row);
+    }
+
+    fn mouse_at(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
         let event = Event::Mouse(dispatch_tui::input::MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            kind,
             column,
             row,
             modifiers: KeyModifiers::NONE,
         });
+        app.handle(&event, Size::new(120, 30))
+            .expect("the pointer is handled");
+    }
 
-        app.handle(&event, Size::new(100, 30))
-            .expect("a click is handled");
+    /// Turns on SGR mouse reporting in `pane`, as a mouse-aware program does.
+    fn track_mouse(app: &mut App, daemon: &Sender<ServerMessage>, pane: PaneId) {
+        print(app, daemon, pane, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    }
+
+    /// Empties the outbox.
+    fn drain(sent: &Receiver<ClientMessage>) {
+        while sent.try_recv().is_ok() {}
+    }
+
+    /// What was written to each pane since the outbox was last drained, one
+    /// entry per write.
+    fn writes_by_pane(
+        sent: &Receiver<ClientMessage>,
+    ) -> std::collections::HashMap<PaneId, Vec<Vec<u8>>> {
+        let mut writes: std::collections::HashMap<PaneId, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        while let Ok(message) = sent.try_recv() {
+            if let ClientMessage::WritePane { pane, bytes } = message {
+                writes.entry(pane).or_default().push(bytes);
+            }
+        }
+        writes
+    }
+
+    #[test]
+    fn a_drag_belongs_to_the_pane_it_started_in() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        track_mouse(&mut app, &daemon, panes[0]);
+        track_mouse(&mut app, &daemon, panes[1]);
+        app.focus_pane(panes[0]);
+        drain(&sent);
+        let (ax, ay) = middle_of(&app, panes[0]);
+        let (bx, by) = middle_of(&app, panes[1]);
+
+        use crossterm::event::MouseButton::Left;
+        mouse_at(&mut app, MouseEventKind::Down(Left), ax, ay);
+        mouse_at(&mut app, MouseEventKind::Drag(Left), bx, by);
+        mouse_at(&mut app, MouseEventKind::Drag(Left), 2, 5); // over the sidebar
+        mouse_at(&mut app, MouseEventKind::Up(Left), bx, by);
+
+        let writes = writes_by_pane(&sent);
+        assert_eq!(
+            writes.get(&panes[0]).map(Vec::len),
+            Some(4),
+            "press, two drags, release"
+        );
+        assert!(
+            !writes.contains_key(&panes[1]),
+            "the other pane got nothing"
+        );
+    }
+
+    #[test]
+    fn a_drag_whose_owner_goes_away_ends_with_one_release() {
+        // One case per trigger: a dialog opening, FocusLost, a resize, the pane closing.
+        for trigger in ["dialog", "focus", "resize", "close"] {
+            let (mut app, project, daemon, sent) = attached_app();
+            let clock = hand_clock(&mut app);
+            let panes = spawn_several(&mut app, &daemon, project, 2);
+            let mut terminal = a_wide_terminal();
+            drawn(&mut app, &mut terminal);
+            advance(&clock, Duration::from_secs(1));
+            drawn(&mut app, &mut terminal);
+            track_mouse(&mut app, &daemon, panes[0]);
+            app.focus_pane(panes[0]);
+            let (ax, ay) = middle_of(&app, panes[0]);
+            use crossterm::event::MouseButton::Left;
+            mouse_at(&mut app, MouseEventKind::Down(Left), ax, ay);
+            drain(&sent);
+
+            match trigger {
+                "dialog" => {
+                    app.state
+                        .set_pane_status(panes[1], PaneStatus::Blocked)
+                        .expect("exists");
+                    app.open_attention_picker();
+                    drawn(&mut app, &mut terminal);
+                }
+                "focus" => app
+                    .handle(&Event::FocusLost, Size::new(120, 30))
+                    .expect("handled"),
+                "resize" => app
+                    .handle(&Event::Resize(100, 30), Size::new(100, 30))
+                    .expect("handled"),
+                _ => app.close_pane(panes[0]),
+            }
+            let after = writes_by_pane(&sent).get(&panes[0]).map_or(0, Vec::len);
+            let expected = usize::from(trigger != "close");
+            assert_eq!(
+                after, expected,
+                "{trigger}: exactly one release when the pane can still be reached"
+            );
+            assert!(app.gesture.is_none(), "{trigger}: the gesture is over");
+
+            app.overlay = None;
+            mouse_at(&mut app, MouseEventKind::Drag(Left), ax, ay);
+            assert_eq!(
+                writes_by_pane(&sent).get(&panes[0]).map_or(0, Vec::len),
+                0,
+                "{trigger}: nothing after"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_acts_on_release_inside_it_and_not_when_the_pointer_slides_off() {
+        let (mut app, terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+        let second = app.state.projects()[1].id;
+        use crossterm::event::MouseButton::Left;
+
+        mouse_at(&mut app, MouseEventKind::Down(Left), 8, 2);
+        mouse_at(&mut app, MouseEventKind::Up(Left), 8, 20);
+        assert_eq!(
+            app.state.selected_project(),
+            Some(first),
+            "slid off: nothing happened"
+        );
+
+        let row = sidebar_row_of(&terminal, "second");
+        click(&mut app, 8, row);
+        assert_eq!(app.state.selected_project(), Some(second));
+    }
+
+    #[test]
+    fn a_right_click_never_does_what_a_left_click_does() {
+        let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+        use crossterm::event::MouseButton::Right;
+        let before = (
+            app.state.selected_project(),
+            app.state.focused_pane(),
+            app.state.is_project_collapsed(first),
+        );
+        for (x, y) in [(1, 2), (5, 3), (8, 3), (app.tab_row.x + 1, 0)] {
+            mouse_at(&mut app, MouseEventKind::Down(Right), x, y);
+            mouse_at(&mut app, MouseEventKind::Up(Right), x, y);
+        }
+        assert_eq!(
+            before,
+            (
+                app.state.selected_project(),
+                app.state.focused_pane(),
+                app.state.is_project_collapsed(first)
+            )
+        );
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_edge_scrolls_the_sidebar() {
+        let (mut app, _terminal, _first, _parent, _child) = app_with_a_drawn_sidebar();
+        let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+        let before = app.sidebar_scroll.clone();
+        mouse_at(&mut app, MouseEventKind::ScrollDown, edge, 3);
+        assert_ne!(before, app.sidebar_scroll);
     }
 
     /// An app with two projects, a pane in the first, and a subagent under

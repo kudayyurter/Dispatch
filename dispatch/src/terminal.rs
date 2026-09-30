@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -53,6 +54,8 @@ impl TerminalGuard {
             out,
             EnterAlternateScreen,
             EnableMouseCapture,
+            // So a window that loses focus mid-press can end it.
+            EnableFocusChange,
             // Without this a paste arrives as individual keystrokes, and an
             // agent acts on each line as it lands.
             EnableBracketedPaste,
@@ -85,6 +88,7 @@ impl TerminalGuard {
         let _ = execute!(
             out,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
