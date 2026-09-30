@@ -31,6 +31,7 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyMode, KeyModifiers,
     MouseEvent, MouseEventKind,
 };
+use dispatch_tui::menu::{Menu, MenuItem};
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::{Chrome, Role};
 use dispatch_tui::{
@@ -43,6 +44,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
+
+/// How wide a tile must be to have a `…` on its top border.
+const ELLIPSIS_MIN_WIDTH: u16 = 12;
 
 /// The program's name as the top-left corner spells it, letter-spaced the
 /// way a label rather than a heading is.
@@ -313,6 +317,21 @@ struct Pane {
     dirty: bool,
 }
 
+/// What a menu item does. Most are a key's action on the menu's target, so
+/// choosing one runs the same code that key runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    ZoomPane(PaneId),
+    MovePane(PaneId, isize),
+    ClosePane(PaneId),
+    NewPaneIn(ProjectId),
+    FoldProject(ProjectId),
+    RemoveProject(ProjectId),
+    RenameTab(usize),
+    MoveTab(usize, isize),
+    CloseTab(usize),
+}
+
 /// What has the keyboard, so a keystroke meant for an agent — or an approval
 /// meant for one request — can never land on the wrong thing.
 enum Overlay {
@@ -365,6 +384,9 @@ enum Overlay {
         /// First line of the task text on screen, for a long one.
         scroll: u16,
     },
+    /// A few actions on a pane, a project or a tab, opened where it was
+    /// clicked.
+    Menu(Menu<MenuAction>),
 }
 
 impl Overlay {
@@ -384,6 +406,7 @@ impl Overlay {
             Overlay::RenameTab { .. } => "rename_tab",
             Overlay::CloseTab { .. } => "close_tab",
             Overlay::Approval { .. } => "approval",
+            Overlay::Menu(_) => "menu",
         }
     }
 
@@ -402,7 +425,8 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
-            | Overlay::Approval { .. } => None,
+            | Overlay::Approval { .. }
+            | Overlay::Menu(_) => None,
         }
     }
 
@@ -421,7 +445,8 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
-            | Overlay::Approval { .. } => None,
+            | Overlay::Approval { .. }
+            | Overlay::Menu(_) => None,
         }
     }
 
@@ -442,7 +467,8 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
-            | Overlay::Approval { .. } => None,
+            | Overlay::Approval { .. }
+            | Overlay::Menu(_) => None,
         }
     }
 
@@ -464,6 +490,8 @@ impl Overlay {
             Overlay::Browse(_) => 30,
             // Its fields and its task wrap to whatever width it is given.
             Overlay::Approval { .. } => 44,
+            // It places itself, over the whole window.
+            Overlay::Menu(_) => 0,
         }
     }
 
@@ -483,6 +511,7 @@ impl Overlay {
                 prompt.set_chrome(chrome)
             }
             Overlay::AddMachine(add) => add.prompt_mut().set_chrome(chrome),
+            Overlay::Menu(menu) => menu.set_chrome(chrome),
             // Built fresh each frame, with the theme's border already on it.
             Overlay::Approval { .. } => {}
         }
@@ -2880,9 +2909,18 @@ impl App {
         // An overlay takes the keyboard while it is open, so arrow keys choose
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
-            // The overlay eats whatever would have ended a press, so none is
-            // still live once it closes.
-            self.end_gesture();
+            // The overlay eats whatever would have ended a press on the
+            // frame beneath it, so none is still live once it closes. A press
+            // on the overlay itself is its own, and waits for its release.
+            self.end_gesture_beneath_overlay();
+            // A menu is the one overlay the pointer reaches so far, and
+            // nothing it does may reach what lies beneath.
+            if let Event::Mouse(mouse) = event
+                && matches!(self.overlay, Some(Overlay::Menu(_)))
+            {
+                self.route_pointer(mouse);
+                return Ok(());
+            }
             return self.handle_overlay(event, area);
         }
 
@@ -2962,6 +3000,11 @@ impl App {
         let target = self
             .hits
             .resolve(mouse.column, mouse.row, self.overlay_tag());
+
+        if matches!(self.overlay, Some(Overlay::Menu(_))) {
+            self.route_menu_pointer(mouse, target);
+            return true;
+        }
 
         // The drawer lies over the panes: a click beside it puts it away.
         if self.drawer_open
@@ -3054,6 +3097,45 @@ impl App {
         self.drawer_open && target == Some(pointer::Target::Sidebar)
     }
 
+    /// A pointer event while a menu is open: hover follows the pointer, a
+    /// press on an item is that item's until released, and a press anywhere
+    /// else closes the menu and goes no further.
+    fn route_menu_pointer(&mut self, mouse: &MouseEvent, target: Option<pointer::Target>) {
+        let item = match target {
+            Some(pointer::Target::Menu(pointer::MenuHit::Item(index))) => Some(index),
+            _ => None,
+        };
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                if let Some(Overlay::Menu(menu)) = &mut self.overlay {
+                    menu.hover(item);
+                }
+            }
+            MouseEventKind::Down(button) => match target {
+                Some(owner @ pointer::Target::Menu(pointer::MenuHit::Item(_))) => {
+                    self.gesture = Some(pointer::Gesture {
+                        owner,
+                        button,
+                        last: (mouse.column, mouse.row),
+                        rect: None,
+                    });
+                    self.pressed_double = false;
+                }
+                // The box's frame: the press is the menu's, and does nothing.
+                Some(pointer::Target::Menu(pointer::MenuHit::Area)) => {}
+                // Outside it, or over a frame drawn before it opened.
+                _ => self.close_menu(),
+            },
+            _ => {}
+        }
+    }
+
+    /// Puts a menu away, and opens the approval that was waiting behind it.
+    fn close_menu(&mut self) {
+        self.overlay = None;
+        self.open_next_approval();
+    }
+
     /// A held press moved: what its owner does with the motion.
     fn drag_gesture(&mut self, gesture: pointer::Gesture, mouse: &MouseEvent) {
         match gesture.owner {
@@ -3117,6 +3199,10 @@ impl App {
                 if still_on && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 {
                     self.activate(owner, mouse);
+                } else if still_on
+                    && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Right)
+                {
+                    self.open_menu_on(owner, mouse);
                 }
             }
         }
@@ -3162,13 +3248,251 @@ impl App {
             // The header is Dispatch's own: the click gives the pane the
             // keyboard and nothing reaches the child. The second click of a
             // double zooms it, once it has the keyboard.
-            pointer::Target::PaneHeader(id) | pointer::Target::PaneMenu(id) => {
+            pointer::Target::PaneHeader(id) => {
                 self.focus_pane(id);
-                if self.pressed_double && matches!(owner, pointer::Target::PaneHeader(_)) {
+                if self.pressed_double {
                     self.state.toggle_zoom();
                 }
             }
+            // Under the `…`, where the menu hangs.
+            pointer::Target::PaneMenu(id) => {
+                self.open_pane_menu(id, (mouse.column, mouse.row.saturating_add(1)));
+            }
+            // An item acts on its release, like any control.
+            pointer::Target::Menu(pointer::MenuHit::Item(index)) => {
+                let action = match &self.overlay {
+                    Some(Overlay::Menu(menu)) => menu
+                        .items()
+                        .get(index)
+                        .filter(|item| item.enabled)
+                        .map(|item| item.action),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    self.choose_menu(action);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Opens the menu a right-click on `owner` asks for, if it has one.
+    ///
+    /// The row that was pressed is the one the release is still on, as for a
+    /// click, so sliding off it cancels.
+    fn open_menu_on(&mut self, owner: pointer::Target, mouse: &MouseEvent) {
+        let at = (mouse.column, mouse.row);
+        match owner {
+            pointer::Target::Sidebar => {
+                let hit = sidebar::hit_test(
+                    &self.state,
+                    self.sidebar_area,
+                    &self.sidebar_scroll,
+                    mouse.column,
+                    mouse.row,
+                );
+                match hit.filter(|hit| Some(*hit) == self.pressed_sidebar) {
+                    Some(sidebar::Hit::Pane(id) | sidebar::Hit::Twisty(id)) => {
+                        self.open_pane_menu(id, at);
+                    }
+                    Some(sidebar::Hit::Project(id) | sidebar::Hit::ProjectChevron(id)) => {
+                        self.open_project_menu(id, at);
+                    }
+                    Some(sidebar::Hit::Device(_)) | None => {}
+                }
+            }
+            pointer::Target::Tab(TabHit::Tab(index)) => {
+                self.open_tab_menu(index, (mouse.column, mouse.row.saturating_add(1)));
+            }
+            pointer::Target::PaneHeader(id) => self.open_pane_menu(id, at),
+            _ => {}
+        }
+    }
+
+    /// The items of a menu, each with the keys that do the same.
+    fn menu_item(
+        &self,
+        label: impl Into<String>,
+        command: Option<Command>,
+        action: MenuAction,
+        enabled: bool,
+    ) -> MenuItem<MenuAction> {
+        MenuItem {
+            label: label.into(),
+            keys: command.and_then(|command| self.router.keymap().path_to(command)),
+            action,
+            enabled,
+        }
+    }
+
+    /// Opens the menu for a pane at `anchor`, changing nothing else.
+    fn open_pane_menu(&mut self, id: PaneId, anchor: (u16, u16)) {
+        let Some(pane) = self.state.pane(id) else {
+            return;
+        };
+        let (project, shell) = (pane.project, pane.harness.as_str() == SHELL);
+        // Moving left from the first tab has nowhere to go. Moving right from
+        // the last makes a tab, so it is always open.
+        let on_first = tabs::views(&self.state, Some(project), &self.tileable())
+            .first()
+            .is_some_and(|view| view.panes.contains(&id));
+        let zoomed = self.state.zoomed_pane() == Some(id);
+        let items = vec![
+            self.menu_item(
+                if zoomed { "Restore" } else { "Zoom" },
+                Some(Command::Zoom),
+                MenuAction::ZoomPane(id),
+                true,
+            ),
+            self.menu_item(
+                "Move to previous tab",
+                Some(Command::MovePaneLeft),
+                MenuAction::MovePane(id, -1),
+                !on_first,
+            ),
+            self.menu_item(
+                "Move to next tab",
+                Some(Command::MovePaneRight),
+                MenuAction::MovePane(id, 1),
+                true,
+            ),
+            self.menu_item(
+                if shell {
+                    "Close pane and end shell"
+                } else {
+                    "Close pane and stop agent"
+                },
+                Some(Command::ClosePane),
+                MenuAction::ClosePane(id),
+                true,
+            ),
+        ];
+        self.overlay = Some(Overlay::Menu(Menu::new(items, anchor)));
+    }
+
+    /// Opens the menu for a project at `anchor`, changing nothing else.
+    fn open_project_menu(&mut self, id: ProjectId, anchor: (u16, u16)) {
+        if !self.state.projects().iter().any(|project| project.id == id) {
+            return;
+        }
+        let items = vec![
+            self.menu_item(
+                "New pane here",
+                Some(Command::NewPane),
+                MenuAction::NewPaneIn(id),
+                true,
+            ),
+            self.menu_item(
+                if self.state.is_project_collapsed(id) {
+                    "Unfold"
+                } else {
+                    "Fold"
+                },
+                Some(Command::Fold),
+                MenuAction::FoldProject(id),
+                true,
+            ),
+            // Dropping a project with panes is refused, so it is not offered.
+            self.menu_item(
+                "Remove from list",
+                None,
+                MenuAction::RemoveProject(id),
+                self.state.panes_for(id).is_empty(),
+            ),
+        ];
+        self.overlay = Some(Overlay::Menu(Menu::new(items, anchor)));
+    }
+
+    /// Opens the menu for the tab at `index` at `anchor`, changing nothing
+    /// else.
+    fn open_tab_menu(&mut self, index: usize, anchor: (u16, u16)) {
+        let count = self.tab_count();
+        if index >= count {
+            return;
+        }
+        let items = vec![
+            self.menu_item(
+                "Rename",
+                Some(Command::RenameTab),
+                MenuAction::RenameTab(index),
+                true,
+            ),
+            self.menu_item(
+                "Move left",
+                Some(Command::MoveTabLeft),
+                MenuAction::MoveTab(index, -1),
+                index > 0,
+            ),
+            self.menu_item(
+                "Move right",
+                Some(Command::MoveTabRight),
+                MenuAction::MoveTab(index, 1),
+                index + 1 < count,
+            ),
+            self.menu_item(
+                "Close tab",
+                Some(Command::CloseTab),
+                MenuAction::CloseTab(index),
+                true,
+            ),
+        ];
+        self.overlay = Some(Overlay::Menu(Menu::new(items, anchor)));
+    }
+
+    /// Closes the menu and does what its chosen item says, by giving its
+    /// target the focus or selection and running what its key runs.
+    fn choose_menu(&mut self, action: MenuAction) {
+        self.overlay = None;
+        match action {
+            MenuAction::ZoomPane(id) => {
+                self.focus_pane(id);
+                // Another pane being zoomed would be restored by the toggle
+                // instead of this one being zoomed.
+                if self.state.zoomed_pane().is_some_and(|zoomed| zoomed != id) {
+                    self.state.toggle_zoom();
+                }
+                self.state.toggle_zoom();
+            }
+            MenuAction::MovePane(id, by) => {
+                self.focus_pane(id);
+                self.move_focused_pane(by);
+            }
+            MenuAction::ClosePane(id) => self.close_pane(id),
+            MenuAction::NewPaneIn(project) => {
+                self.select_project(project);
+                self.open_harness_picker();
+            }
+            MenuAction::FoldProject(project) => {
+                self.select_project(project);
+                self.state.toggle_project_collapsed(project);
+            }
+            MenuAction::RemoveProject(project) => self.drop_project(project),
+            MenuAction::RenameTab(index) => {
+                self.select_tab(index);
+                self.open_rename_tab();
+            }
+            MenuAction::MoveTab(index, by) => {
+                self.select_tab(index);
+                self.move_current_tab(by);
+            }
+            MenuAction::CloseTab(index) => {
+                self.select_tab(index);
+                self.open_close_tab();
+            }
+        }
+        if self.overlay.is_none() {
+            self.open_next_approval();
+        }
+    }
+
+    /// Ends a press on the frame, which an open overlay has taken the pointer
+    /// from. One on the overlay itself is left for its release.
+    fn end_gesture_beneath_overlay(&mut self) {
+        if self
+            .gesture
+            .is_some_and(|gesture| !gesture.owner.is_overlay())
+        {
+            self.end_gesture();
         }
     }
 
@@ -3442,6 +3766,23 @@ impl App {
             return Ok(());
         };
         if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        // Its own keys, and no others: anything else is nothing to a menu,
+        // and must not go on to a pane.
+        if let Some(Overlay::Menu(menu)) = &mut self.overlay {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => menu.previous(),
+                KeyCode::Down | KeyCode::Char('j') => menu.next(),
+                KeyCode::Enter => {
+                    if let Some(action) = menu.selected().map(|item| item.action) {
+                        self.choose_menu(action);
+                    }
+                }
+                KeyCode::Esc => self.close_menu(),
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -4051,11 +4392,25 @@ impl App {
             .projects()
             .iter()
             .find(|p| p.id.to_string() == id)
-            .map(|p| (p.id, p.root.clone()))
+            .map(|p| p.id)
         else {
             return;
         };
-        let (project, root) = project;
+        self.drop_project(project);
+    }
+
+    /// Drops `project` from the kept list, on the same terms as the picker's
+    /// `d`: refused while it has panes, and asked of its daemon when attached.
+    fn drop_project(&mut self, project: ProjectId) {
+        let Some(root) = self
+            .state
+            .projects()
+            .iter()
+            .find(|p| p.id == project)
+            .map(|p| p.root.clone())
+        else {
+            return;
+        };
 
         if !self.state.panes_for(project).is_empty() {
             self.status = "close its panes first".into();
@@ -4094,7 +4449,10 @@ impl App {
             self.status = format!("dropped {}", root.display());
         }
 
-        self.reopen_project_picker();
+        // Only a picker has a list to redraw; a menu closed itself.
+        if matches!(self.overlay, Some(Overlay::Project(_))) {
+            self.reopen_project_picker();
+        }
     }
 
     /// Redraws the project picker over the list as it now is, or closes it
@@ -4750,7 +5108,7 @@ impl App {
         // A press whose owner is gone from the last frame, or that an overlay
         // has taken the pointer from, is over.
         if self.gesture.is_some_and(|gesture| {
-            self.overlay.is_some()
+            (self.overlay.is_some() && !gesture.owner.is_overlay())
                 || matches!(gesture.owner, pointer::Target::PaneContent(id)
                     if !self.frames.iter().any(|(pane, _)| *pane == id))
         }) {
@@ -4867,6 +5225,14 @@ impl App {
                 Rect::new(tile.x, tile.y, tile.width, 1),
                 pointer::Target::PaneHeader(id),
             );
+            // After the header, so it sits on top: the `…` and a blank either
+            // side, which is easier to hit than one cell.
+            if tile.width >= ELLIPSIS_MIN_WIDTH {
+                hits.push(
+                    Rect::new(tile.x + tile.width - 4, tile.y, 3, 1),
+                    pointer::Target::PaneMenu(id),
+                );
+            }
             hits.push(Self::interior(tile), pointer::Target::PaneContent(id));
         }
         if self.state.selected_project().is_some()
@@ -4889,6 +5255,13 @@ impl App {
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area, body);
+        if let Some(Overlay::Menu(menu)) = &self.overlay {
+            let layout = menu.layout(self.window);
+            hits.push(layout.rect, pointer::Target::Menu(pointer::MenuHit::Area));
+            for (rect, index) in layout.items {
+                hits.push(rect, pointer::Target::Menu(pointer::MenuHit::Item(index)));
+            }
+        }
 
         self.hits = hits;
 
@@ -4966,6 +5339,12 @@ impl App {
         let chrome = self.theme.chrome();
         if let Some(overlay) = &mut self.overlay {
             overlay.set_chrome(chrome);
+        }
+
+        // A menu hangs where it was opened, which may be over the sidebar.
+        if let Some(Overlay::Menu(menu)) = &self.overlay {
+            frame.render_widget(menu, self.window);
+            return;
         }
 
         // Over the panes when they have the room, so the sidebar stays in
@@ -5567,6 +5946,7 @@ impl App {
             } else {
                 self.theme.faded
             };
+            let menu_button = outer.width >= ELLIPSIS_MIN_WIDTH;
             let mut block = pane_block(colour, is_focused).title(pane_title(&self.state, *id));
             // The focused pane says what it is doing in words, on the right
             // of its top border; the others leave it to their glyphs, or the
@@ -5581,8 +5961,16 @@ impl App {
                 // the bold the block gives its titles.
                 let needed = Span::raw(pane_title(&self.state, *id)).width()
                     + Span::raw(words.as_str()).width()
-                    + 4;
+                    + 4
+                    + if menu_button { 3 } else { 0 };
                 if needed <= usize::from(outer.width) {
+                    // Kept clear of the `…`, which is drawn over the border
+                    // two cells from the corner.
+                    let words = if menu_button {
+                        format!("{words}  ")
+                    } else {
+                        words
+                    };
                     block = block.title_top(
                         Line::styled(
                             words,
@@ -5595,6 +5983,15 @@ impl App {
                 }
             }
             frame.render_widget(block, *outer);
+            // The pane's menu button, in the border's colour. Before the
+            // reveal below, so a tile being drawn in does not show it early.
+            if menu_button
+                && let Some(cell) = frame
+                    .buffer_mut()
+                    .cell_mut((outer.x + outer.width - 3, outer.y))
+            {
+                cell.set_symbol("…").set_fg(colour);
+            }
             if let Some(t) = self.animations.value(Target::Open(*id), now) {
                 mask_border(frame.buffer_mut(), *outer, t);
             }
@@ -14835,5 +15232,316 @@ args = ["--effort", "{value}"]
         drawn(&mut app, &mut at_79);
         assert_eq!(app.frames.iter().map(|(_, r)| r.x).min(), Some(0));
         assert!(app.sidebar_area.is_empty());
+    }
+
+    fn menu_labels(app: &App) -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Menu(menu)) => {
+                menu.items().iter().map(|item| item.label.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A cell on the row of the open menu's item named `label`, as drawn.
+    fn menu_item_cell(app: &App, label: &str) -> (u16, u16) {
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("a menu is open");
+        };
+        let index = menu
+            .items()
+            .iter()
+            .position(|item| item.label == label)
+            .unwrap_or_else(|| panic!("the menu has {label}"));
+        let layout = menu.layout(app.window);
+        let (rect, _) = layout
+            .items
+            .iter()
+            .find(|(_, at)| *at == index)
+            .unwrap_or_else(|| panic!("{label} can be chosen"));
+        (rect.x + 1, rect.y)
+    }
+
+    #[test]
+    fn a_right_click_on_a_pane_row_opens_its_menu_and_changes_nothing_else() {
+        let (mut app, _terminal, first, parent, _child) = app_with_a_drawn_sidebar();
+        let before = app.state.focused_pane();
+        use crossterm::event::MouseButton::Right;
+        mouse_at(&mut app, MouseEventKind::Down(Right), 8, 3);
+        mouse_at(&mut app, MouseEventKind::Up(Right), 8, 3);
+
+        assert_eq!(
+            menu_labels(&app),
+            vec![
+                "Zoom",
+                "Move to previous tab",
+                "Move to next tab",
+                "Close pane and end shell"
+            ]
+        );
+        assert_eq!(app.state.focused_pane(), before);
+        let _ = (first, parent);
+    }
+
+    #[test]
+    fn choosing_close_from_a_pane_menu_closes_that_pane() {
+        let (mut app, mut terminal, _first, parent, child) = app_with_a_drawn_sidebar();
+        app.focus_pane(parent);
+        drawn(&mut app, &mut terminal);
+        assert_ne!(app.state.focused_pane(), Some(child));
+
+        app.open_pane_menu(child, (8, 5));
+        drawn(&mut app, &mut terminal);
+        for _ in 0..4 {
+            let at_close = matches!(
+                &app.overlay,
+                Some(Overlay::Menu(menu)) if menu.selected().map(|item| item.action)
+                    == Some(MenuAction::ClosePane(child))
+            );
+            if at_close {
+                break;
+            }
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.overlay.is_none(), "choosing closes the menu");
+        assert!(
+            app.state.pane(child).is_none(),
+            "the pane it was opened on is closed"
+        );
+        assert!(
+            app.state.pane(parent).is_some(),
+            "and the focused one is not"
+        );
+    }
+
+    #[test]
+    fn a_click_outside_a_menu_closes_it_and_does_nothing_else() {
+        let (mut app, mut terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+        let second = app.state.projects()[1].id;
+        // Read before the menu is drawn over it.
+        let row = sidebar_row_of(&terminal, "second");
+        use crossterm::event::MouseButton::Right;
+        mouse_at(&mut app, MouseEventKind::Down(Right), 8, 2);
+        mouse_at(&mut app, MouseEventKind::Up(Right), 8, 2);
+        drawn(&mut app, &mut terminal);
+        assert!(matches!(app.overlay, Some(Overlay::Menu(_))));
+
+        // Left of the menu, which hangs from column 8 over the rows below its
+        // anchor, but still on the second project's row.
+        let column = 4;
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("a menu is open");
+        };
+        assert!(
+            !menu
+                .layout(app.window)
+                .rect
+                .contains(ratatui::layout::Position::new(column, row)),
+            "the row is not under the menu"
+        );
+        click(&mut app, column, row);
+        assert!(app.overlay.is_none(), "the click closed the menu");
+        assert_eq!(
+            app.state.selected_project(),
+            Some(first),
+            "and did not reach the row beneath"
+        );
+        let _ = second;
+    }
+
+    /// An attached app with two tabs, drawn wide, and its tab chips' columns.
+    fn app_with_two_tabs() -> (
+        App,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+        Vec<PaneId>,
+    ) {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&[panes[0]], &[panes[1]]]);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        (app, terminal, panes)
+    }
+
+    /// The column of the first chip of the tab row that is tab `index`.
+    fn tab_chip_column(app: &App, index: usize) -> u16 {
+        app.tab_hits
+            .iter()
+            .find(|(_, _, hit)| *hit == TabHit::Tab(index))
+            .map(|(x, _, _)| *x + 1)
+            .expect("the tab is drawn")
+    }
+
+    #[test]
+    fn a_menu_item_acts_on_release_inside_it() {
+        let (mut app, mut terminal, _panes) = app_with_two_tabs();
+        use crossterm::event::MouseButton::{Left, Right};
+        let chip = tab_chip_column(&app, 0);
+
+        mouse_at(&mut app, MouseEventKind::Down(Right), chip, 0);
+        mouse_at(&mut app, MouseEventKind::Up(Right), chip, 0);
+        drawn(&mut app, &mut terminal);
+        assert!(matches!(app.overlay, Some(Overlay::Menu(_))));
+
+        let (x, y) = menu_item_cell(&app, "Rename");
+        mouse_at(&mut app, MouseEventKind::Down(Left), x, y);
+        mouse_at(&mut app, MouseEventKind::Up(Left), x, y);
+        assert!(
+            matches!(app.overlay, Some(Overlay::RenameTab { .. })),
+            "released on Rename: the rename prompt opens"
+        );
+
+        // Pressed on one item and let go on another, nothing is chosen.
+        app.overlay = None;
+        drawn(&mut app, &mut terminal);
+        mouse_at(&mut app, MouseEventKind::Down(Right), chip, 0);
+        mouse_at(&mut app, MouseEventKind::Up(Right), chip, 0);
+        drawn(&mut app, &mut terminal);
+        let (from_x, from_y) = menu_item_cell(&app, "Rename");
+        let (to_x, to_y) = menu_item_cell(&app, "Close tab");
+        mouse_at(&mut app, MouseEventKind::Down(Left), from_x, from_y);
+        mouse_at(&mut app, MouseEventKind::Up(Left), to_x, to_y);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Menu(_))),
+            "sliding off Rename chose nothing and the menu stays"
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_menu_item_survives_the_frames_drawn_before_its_release() {
+        let (mut app, mut terminal, _first, parent, _child) = app_with_a_drawn_sidebar();
+        app.open_pane_menu(parent, (8, 5));
+        drawn(&mut app, &mut terminal);
+
+        use crossterm::event::MouseButton::Left;
+        let (x, y) = menu_item_cell(&app, "Zoom");
+        mouse_at(&mut app, MouseEventKind::Down(Left), x, y);
+        drawn(&mut app, &mut terminal);
+        mouse_at(&mut app, MouseEventKind::Up(Left), x, y);
+
+        assert!(app.overlay.is_none(), "the release chose the item");
+        assert_eq!(app.state.zoomed_pane(), Some(parent));
+    }
+
+    #[test]
+    fn nothing_reaches_a_child_while_a_menu_is_open() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        track_mouse(&mut app, &daemon, pane);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        app.open_pane_menu(pane, (2, 2));
+        drawn(&mut app, &mut terminal);
+        drain(&sent);
+
+        let (x, y) = middle_of(&app, pane);
+        click(&mut app, x, y);
+        assert!(app.overlay.is_none(), "a click outside closed the menu");
+        assert!(writes_by_pane(&sent).is_empty(), "and no byte was sent");
+
+        app.open_pane_menu(pane, (2, 2));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            writes_by_pane(&sent).is_empty(),
+            "a key is the menu's alone"
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Menu(_))));
+    }
+
+    #[test]
+    fn the_ellipsis_opens_the_pane_menu_on_wide_tiles_only() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        // Past the new pane's border being drawn in, which hides the `…` too.
+        let mut wide = a_wide_terminal();
+        drawn(&mut app, &mut wide);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut wide);
+        let (_, tile) = *app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("tiled");
+        let at = (tile.x + tile.width - 3, tile.y);
+        let cell = wide.backend().buffer().cell(at).expect("on screen");
+        assert_eq!(cell.symbol(), "…");
+        click(&mut app, at.0, at.1);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Menu(_))),
+            "a click on the ellipsis opens the menu"
+        );
+        assert!(menu_labels(&app).contains(&"Zoom".to_string()));
+
+        // Exactly 12 columns still has one; 11 has none and is all header.
+        for (width, has) in [(12_u16, true), (11, false)] {
+            let mut app_at_width = attached_app();
+            let clock = hand_clock(&mut app_at_width.0);
+            let pane = spawn_several(&mut app_at_width.0, &app_at_width.2, app_at_width.1, 1)[0];
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+                    .expect("a test backend can be created");
+            drawn(&mut app_at_width.0, &mut terminal);
+            advance(&clock, Duration::from_secs(1));
+            drawn(&mut app_at_width.0, &mut terminal);
+            let (_, tile) = *app_at_width
+                .0
+                .frames
+                .iter()
+                .find(|(id, _)| *id == pane)
+                .expect("tiled");
+            assert_eq!(tile.width, width, "the tile fills the terminal");
+            let drawn_here = terminal
+                .backend()
+                .buffer()
+                .cell((tile.x + tile.width - 3, tile.y))
+                .expect("on screen")
+                .symbol()
+                == "…";
+            assert_eq!(drawn_here, has, "width {width}");
+            let on_top = app_at_width.0.hits.at(tile.x + tile.width - 3, tile.y);
+            if has {
+                assert_eq!(on_top, Some(pointer::Target::PaneMenu(pane)));
+            } else {
+                for x in tile.x..tile.x + tile.width {
+                    assert_eq!(
+                        app_at_width.0.hits.at(x, tile.y),
+                        Some(pointer::Target::PaneHeader(pane)),
+                        "column {x} of a narrow tile's top row"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_menu_folds_and_refuses_removal_while_it_has_panes() {
+        let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+        let second = app.state.projects()[1].id;
+        app.open_project_menu(first, (8, 2));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("a menu is open");
+        };
+        let remove = menu
+            .items()
+            .iter()
+            .find(|item| item.action == MenuAction::RemoveProject(first))
+            .expect("offered");
+        assert!(!remove.enabled, "it has panes");
+
+        app.open_project_menu(second, (8, 2));
+        app.choose_menu(MenuAction::FoldProject(second));
+        assert!(app.state.is_project_collapsed(second));
+        app.choose_menu(MenuAction::RemoveProject(second));
+        assert!(
+            app.state
+                .projects()
+                .iter()
+                .all(|project| project.id != second),
+            "an empty project is dropped, as the picker's d drops it"
+        );
     }
 }

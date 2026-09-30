@@ -170,6 +170,24 @@ panes too: `2 waiting on you`.
 Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
 terminal it runs in.
 
+## Menus
+
+Right-click a pane's row in the sidebar, a pane's top border, a project's row or
+a tab, or click the `…` near the right of a pane's top border (on panes at least
+12 columns wide), and a short menu opens there. Each item shows the keys that do
+the same, and choosing one runs exactly what those keys run. `Up`/`k` and
+`Down`/`j` move, `Enter` chooses, `Esc` closes, and so does a click anywhere
+outside it; nothing is sent to a pane while it is open. An item that cannot be
+chosen now is dimmed and skipped.
+
+| Menu | Items |
+|---|---|
+| Pane | Zoom (or Restore), Move to previous tab, Move to next tab, Close pane and stop agent (or end shell) |
+| Project | New pane here, Fold (or Unfold), Remove from list (only when it has no panes) |
+| Tab | Rename, Move left, Move right, Close tab (which still asks) |
+
+Right-clicking a pane's row or a tab changes nothing until an item is chosen.
+
 ## Keeping projects
 
 The sidebar is the list of projects you keep, not the one directory Dispatch
