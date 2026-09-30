@@ -560,6 +560,27 @@ fn section<'a>(
     }
 }
 
+/// Whether any row drawn at `area` carries a spinner: a live running pane,
+/// or a folded project whose most urgent state is working.
+///
+/// Walks the same sections the render does, so a row scrolled away or folded
+/// out of sight asks for no frames: a spinner nobody can see is only work.
+#[must_use]
+pub fn spins(state: &AppState, area: Rect, scroll: &Scroll) -> bool {
+    sections(state, area, scroll).iter().any(|section| {
+        section.visible().any(|(_, row)| match *row {
+            Row::Pane(id, _) => state
+                .pane(id)
+                .is_some_and(|pane| !pane.closed && pane.status == PaneStatus::Running),
+            Row::Project(id) => {
+                state.is_project_collapsed(id)
+                    && Rollup::of(state, state.panes_for(id)) == Some(Rollup::Working)
+            }
+            Row::Branch(..) => false,
+        })
+    })
+}
+
 /// Brings every section's scroll back inside its rows and, when `anchor` is
 /// given, scrolls the section holding that row just far enough to show it.
 ///

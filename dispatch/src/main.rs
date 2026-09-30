@@ -5,6 +5,7 @@ mod app;
 mod approval;
 mod backend;
 mod delegate;
+mod frame_stats;
 mod machine;
 mod tabs;
 mod terminal;

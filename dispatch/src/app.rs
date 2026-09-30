@@ -688,6 +688,15 @@ pub struct App {
     /// is, for a click to be matched against.
     tab_row: Rect,
     tab_hits: Vec<(u16, u16, TabHit)>,
+    /// Whether the last frame drew a spinner anywhere: the sidebar's or the
+    /// tab row's, ORed once at the end of `draw`. Only what is drawn asks for
+    /// spinner frames.
+    spinner_drawn: bool,
+    /// Whether the last tab row drew a spinner, kept apart from the
+    /// sidebar's so each is found where it is drawn.
+    tabs_spun: bool,
+    /// How long recent frames took to draw, summarised into the log.
+    frame_stats: crate::frame_stats::FrameStats,
     /// The panes this client last fitted to its screen, so one that leaves
     /// the screen can withdraw its size.
     fitted: HashSet<PaneId>,
@@ -772,6 +781,9 @@ impl App {
             tab_back: None,
             tab_row: Rect::default(),
             tab_hits: Vec::new(),
+            spinner_drawn: false,
+            tabs_spun: false,
+            frame_stats: crate::frame_stats::FrameStats::new(Instant::now()),
             fitted: HashSet::new(),
             active_sent: None,
             hover_claims_panes: false,
@@ -1481,7 +1493,7 @@ impl App {
     }
 
     /// How long until the next frame something on screen needs: a tween
-    /// running needs about thirty a second, a spinner ten, and nothing
+    /// running needs about thirty a second, a spinner on screen ten, and nothing
     /// moving needs none — a still Dispatch draws only when something
     /// changes.
     ///
@@ -1494,15 +1506,9 @@ impl App {
             return Some(TWEEN_FRAME);
         }
 
-        let spinning = self.motion
-            && self
-                .state
-                .projects()
-                .iter()
-                .flat_map(|project| self.state.panes_for(project.id))
-                .any(|pane| !pane.closed && pane.status == PaneStatus::Running);
-
-        spinning.then_some(SPIN_FRAME)
+        // Only what the last frame drew: a running pane folded away or
+        // scrolled out of the sidebar has no spinner to turn.
+        (self.motion && self.spinner_drawn).then_some(SPIN_FRAME)
     }
 
     /// Takes on a pane that now exists, wherever its process is.
@@ -4069,6 +4075,8 @@ impl App {
 
     /// Draws one frame.
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
+        // The real clock, because this measures real cost.
+        let drawing = Instant::now();
         let area = frame.area();
         let now = self.now();
         self.animations.sweep(now);
@@ -4150,6 +4158,8 @@ impl App {
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
+        let sidebar_spun =
+            self.motion && sidebar::spins(&self.state, sidebar_area, &self.sidebar_scroll);
 
         self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
         let tab = self.current_tab();
@@ -4179,6 +4189,19 @@ impl App {
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area);
+
+        // Combined once, here, so it does not matter which was drawn first.
+        self.spinner_drawn = sidebar_spun || self.tabs_spun;
+
+        if let Some(summary) = self.frame_stats.record(drawing.elapsed(), now) {
+            tracing::debug!(
+                p50 = ?summary.p50,
+                p95 = ?summary.p95,
+                max = ?summary.max,
+                frames = summary.frames,
+                "frame timing"
+            );
+        }
     }
 
     /// Draws whichever overlay is open, if any.
@@ -4843,6 +4866,7 @@ impl App {
     fn draw_tabs(&mut self, frame: &mut Frame<'_>, area: Rect, now: Instant) {
         self.tab_hits.clear();
         self.tab_row = area;
+        self.tabs_spun = false;
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -4883,6 +4907,7 @@ impl App {
                     &self.state,
                     view.panes.iter().filter_map(|id| self.state.pane(*id)),
                 ) {
+                    self.tabs_spun |= rollup == sidebar::Rollup::Working && spinner.is_some();
                     let (glyph, glyph_style) = rollup.glyph(spinner, &self.theme);
                     spans.push(Span::styled(" ", style));
                     spans.push(Span::styled(glyph, style.patch(glyph_style)));
@@ -8080,15 +8105,49 @@ mod tests {
         let (mut app, project, daemon, _sent) = attached_app();
         let pane = spawn_several(&mut app, &daemon, project, 1)[0];
         let later = app.now() + Duration::from_secs(10);
-        app.animations.sweep(later);
         app.state
             .set_pane_status(pane, PaneStatus::Running)
             .expect("exists");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        app.animations.sweep(later);
 
         assert_eq!(app.next_frame(later), Some(Duration::from_millis(100)));
 
         app.set_motion(false);
         assert_eq!(app.next_frame(later), None, "a still glyph needs no frames");
+    }
+
+    #[test]
+    fn a_spinner_nobody_can_see_asks_for_no_frames() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, "shell", Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.state
+            .set_pane_status(parent, PaneStatus::Idle)
+            .expect("exists");
+        app.state
+            .set_pane_status(child, PaneStatus::Running)
+            .expect("exists");
+        app.state.toggle_pane_collapsed(parent);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        advance(&clock, Duration::from_secs(10));
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(10));
+        app.animations.sweep(app.now());
+
+        assert_eq!(app.next_frame(app.now()), None, "its row is folded away");
+
+        app.state.toggle_pane_collapsed(parent);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.next_frame(app.now()), Some(SPIN_FRAME));
     }
 
     #[test]

@@ -3,7 +3,9 @@
 use super::*;
 
 use crate::theme::Theme;
-use dispatch_core::{Device, DeviceId, HarnessId, Pane, PaneId, Project, ProjectSource};
+use dispatch_core::{
+    Device, DeviceId, HarnessId, Pane, PaneId, PaneStatus, Project, ProjectSource,
+};
 
 /// State with two projects; the first is selected.
 fn state() -> (AppState, ProjectId, ProjectId) {
@@ -1820,4 +1822,42 @@ fn a_fade_between_sections_paints_nothing_on_the_row_it_has_left() {
         "it ends gone from the old"
     );
     assert_eq!(bg_at(1.0, "codex"), tint, "and on the new");
+}
+
+#[test]
+fn a_running_row_on_screen_spins_and_one_hidden_does_not() {
+    let (mut state, project, _) = state();
+    let parent = spawn(&mut state, project, "shell");
+    let mut child = Pane::new(project, HarnessId::new("shell"));
+    child.parent = Some(parent);
+    let child = state.adopt_pane(child).expect("the project exists");
+    state
+        .set_pane_status(parent, PaneStatus::Idle)
+        .expect("exists");
+    state
+        .set_pane_status(child, PaneStatus::Running)
+        .expect("exists");
+
+    // Unfolded: the child's row is drawn, so it spins.
+    assert!(spins(&state, Rect::new(0, 0, WIDTH, 20), &Scroll::new()));
+    // Parent folded: the child's row is gone and the parent is idle.
+    state.toggle_pane_collapsed(parent);
+    assert!(!spins(&state, Rect::new(0, 0, WIDTH, 20), &Scroll::new()));
+    // Project folded: its row carries the rollup, which spins.
+    state.toggle_pane_collapsed(parent);
+    state.toggle_project_collapsed(project);
+    assert!(spins(&state, Rect::new(0, 0, WIDTH, 20), &Scroll::new()));
+
+    // Unfolded, but scrolled out of a two-row sidebar: not on screen.
+    state.toggle_project_collapsed(project);
+    for _ in 0..6 {
+        spawn(&mut state, project, "shell");
+    }
+    let tiny = Rect::new(0, 0, WIDTH, 4);
+    let mut scroll = Scroll::new();
+    settle(&state, tiny, &mut scroll, None);
+    assert!(
+        !spins(&state, tiny, &scroll),
+        "the child's row is below the fold"
+    );
 }
