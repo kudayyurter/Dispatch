@@ -74,13 +74,10 @@ Settings live in `~/.config/dispatch` on Linux, `~/Library/Application Support/d
 
 ## How it works
 
-```mermaid
-flowchart LR
-  UI["dispatch<br/>grid, sidebar, status rules"] <-->|local socket| D["dispatchd"]
-  UI <-->|ssh| R["dispatchd on another machine"]
-  D --> A1["agents in PTYs"]
-  R --> A2["agents in PTYs"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/architecture-dark.svg">
+  <img src=".github/assets/architecture-light.svg" alt="The dispatch client talks to dispatchd on this machine over a local socket and to dispatchd on another machine over ssh; each daemon runs its agents in PTYs." width="512">
+</picture>
 
 Each pane is a real terminal, emulated with Ghostty's vendored `libghostty-vt`. The client reads every pane's screen and title with per-agent rules (adapted from [herdr](https://github.com/ogulcancelik/herdr)) to spot spinners and permission prompts. Crate-by-crate layout: [docs/building.md](docs/building.md).
 
