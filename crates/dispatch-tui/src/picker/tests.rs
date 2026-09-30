@@ -236,3 +236,15 @@ fn selecting_by_id_moves_the_highlight() {
         "an unknown id leaves it where it was"
     );
 }
+
+#[test]
+fn a_picker_draws_at_any_size_without_panicking() {
+    // `clamp(20, width)` panics when the width is under 20, and the early
+    // return only covered widths under 4.
+    let picker = picker().with_hint("↑↓ choose  Enter open");
+    for width in 1..=25 {
+        for height in 1..=6 {
+            render(&picker, width, height);
+        }
+    }
+}

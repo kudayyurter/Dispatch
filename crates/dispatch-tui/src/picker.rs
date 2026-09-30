@@ -166,7 +166,9 @@ impl Widget for &Picker {
         let hint_width = self.hint.as_ref().map_or(0, |hint| hint.chars().count());
         let width = u16::try_from(widest.max(self.title.chars().count()).max(hint_width) + 6)
             .unwrap_or(u16::MAX)
-            .clamp(20, area.width);
+            // The floor gives way to a narrower area, as the prompt's and the
+            // browser's do: `clamp` panics when its minimum is above its maximum.
+            .clamp(20.min(area.width), area.width);
         let height = u16::try_from(self.items.len() + 2)
             .unwrap_or(u16::MAX)
             .clamp(3, area.height);
