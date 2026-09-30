@@ -35,6 +35,13 @@ fn router() -> InputRouter {
     InputRouter::new()
 }
 
+/// A router whose focus follows the pointer, which it does not by default.
+fn following_router() -> InputRouter {
+    let mut router = router();
+    router.set_focus_follows_pointer(true);
+    router
+}
+
 #[test]
 fn an_ordinary_key_goes_to_the_pane() {
     let mut router = router();
@@ -170,6 +177,18 @@ fn a_release_does_not_consume_an_armed_prefix() {
 }
 
 #[test]
+fn moving_the_pointer_focuses_nothing_unless_asked_to() {
+    let pane = PaneId::new();
+    let panes = [(pane, Rect::new(0, 0, 10, 10))];
+
+    let mut router = router();
+    assert_eq!(router.handle(&moved(5, 5), &panes), Action::None);
+
+    router.set_focus_follows_pointer(true);
+    assert_eq!(router.handle(&moved(5, 5), &panes), Action::FocusPane(pane));
+}
+
+#[test]
 fn moving_the_pointer_focuses_the_pane_under_it() {
     let left = PaneId::new();
     let right = PaneId::new();
@@ -178,7 +197,7 @@ fn moving_the_pointer_focuses_the_pane_under_it() {
         (right, Rect::new(10, 0, 10, 10)),
     ];
 
-    let mut router = router();
+    let mut router = following_router();
 
     assert_eq!(router.handle(&moved(5, 5), &panes), Action::FocusPane(left));
     assert_eq!(
@@ -197,7 +216,7 @@ fn the_pane_boundary_is_exact() {
         (right, Rect::new(10, 0, 10, 10)),
     ];
 
-    let mut router = router();
+    let mut router = following_router();
 
     assert_eq!(router.handle(&moved(9, 0), &panes), Action::FocusPane(left));
     assert_eq!(
@@ -713,10 +732,18 @@ fn moving_the_pointer_in_scroll_mode_focuses_nothing() {
     // mouse must not hand them to another.
     let pane = PaneId::new();
     let panes = [(pane, Rect::new(0, 0, 10, 10))];
-    let mut router = in_mode(ctrl('s'));
+    let mut router = following_router();
+    router.handle(&ctrl('s'), &[]);
 
     assert_eq!(router.handle(&moved(5, 5), &panes), Action::None);
     assert_eq!(router.key_mode(), KeyMode::Scroll);
+
+    let mut idle = in_mode(ctrl('s'));
+    assert_eq!(
+        idle.handle(&moved(5, 5), &panes),
+        Action::None,
+        "either way"
+    );
 
     router.handle(&press(KeyCode::Esc), &panes);
     assert_eq!(

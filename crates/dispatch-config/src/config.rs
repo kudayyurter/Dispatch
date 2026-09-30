@@ -60,6 +60,10 @@ pub struct InterfaceConfig {
     /// Off by default: a pointer crossing a forgotten window would otherwise
     /// resize every agent to it.
     pub hover_claims_panes: bool,
+    /// Whether the pointer resting on a pane gives it the keyboard. Off by
+    /// default: a click focuses, and a pointer crossing the grid on its way
+    /// somewhere never redirects typing.
+    pub focus_follows_pointer: bool,
 }
 
 impl Default for InterfaceConfig {
@@ -67,6 +71,7 @@ impl Default for InterfaceConfig {
         Self {
             motion: true,
             hover_claims_panes: false,
+            focus_follows_pointer: false,
         }
     }
 }
@@ -312,6 +317,7 @@ impl Config {
 /// Dotted paths of keys Dispatch does not know.
 fn unknown_keys(raw: &toml::Table) -> Vec<String> {
     const DELEGATION: [&str; 3] = ["max_depth", "max_live_per_parent", "request_timeout_secs"];
+    const INTERFACE: [&str; 3] = ["motion", "hover_claims_panes", "focus_follows_pointer"];
     const SHELL: [&str; 3] = ["command", "args", "login"];
 
     let mut unknown = Vec::new();
@@ -327,7 +333,7 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
             }
             ("interface", toml::Value::Table(table)) => {
                 for key in table.keys() {
-                    if key != "motion" && key != "hover_claims_panes" {
+                    if !INTERFACE.contains(&key.as_str()) {
                         unknown.push(format!("interface.{key}"));
                     }
                 }

@@ -105,6 +105,19 @@ fn hovering_claims_panes_only_when_turned_on() {
 }
 
 #[test]
+fn focus_follows_the_pointer_only_when_turned_on() {
+    assert!(!Config::default().interface.focus_follows_pointer);
+
+    let config: Config =
+        toml::from_str("[interface]\nfocus_follows_pointer = true\n").expect("parses");
+    assert!(config.interface.focus_follows_pointer);
+
+    let raw: toml::Table =
+        toml::from_str("[interface]\nfocus_follows_pointer = true\n").expect("parses");
+    assert!(unknown_keys(&raw).is_empty(), "a key this build knows");
+}
+
+#[test]
 fn the_interface_section_is_not_reported_unknown() {
     let raw: toml::Table = toml::from_str("[interface]\nmotion = false\n").expect("parses");
     assert!(unknown_keys(&raw).is_empty());

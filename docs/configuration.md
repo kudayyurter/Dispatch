@@ -224,4 +224,23 @@ motion = false   # default true
 Every change then shows at once, a working pane shows a still play glyph, and
 nothing pulses; every state is still shown.
 
+## Pointer
+
+A click on a pane gives it the keyboard, and a click on its header does too
+without sending anything to the program inside; a double-click on the header
+zooms the pane. Resting the pointer on a pane does not move the keyboard, so
+a pointer crossing the grid never redirects typing. To have it follow the
+pointer instead:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+focus_follows_pointer = true   # default false
+```
+
+This is separate from `hover_claims_panes`, which only decides whether the
+window under the pointer sets the size of panes shared between windows (see
+[daemon.md](daemon.md)). Neither implies the other. Scroll mode ignores
+`focus_follows_pointer`, since its keys act on the pane it was entered on.
+
 [Back to the README](../README.md)

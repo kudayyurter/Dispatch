@@ -143,6 +143,8 @@ pub struct InputRouter {
     keymap: Keymap,
     /// Which keys it is reading.
     mode: KeyMode,
+    /// Whether moving the pointer over a pane focuses it.
+    focus_follows_pointer: bool,
 }
 
 impl InputRouter {
@@ -158,7 +160,13 @@ impl InputRouter {
         Self {
             keymap,
             mode: KeyMode::Normal,
+            focus_follows_pointer: false,
         }
+    }
+
+    /// Whether resting the pointer on a pane gives it the keyboard.
+    pub fn set_focus_follows_pointer(&mut self, on: bool) {
+        self.focus_follows_pointer = on;
     }
 
     /// The keys it reads, for the status row to spell out.
@@ -311,12 +319,14 @@ impl InputRouter {
         let modifiers = modifiers_of(event.modifiers);
 
         let (action, button) = match event.kind {
-            // Focus follows the pointer, so moving the mouse over a pane is
-            // enough to type into it. Not in scroll mode: its keys read the
-            // pane it was entered on, and a nudge of the mouse would hand
-            // them to another.
-            MouseEventKind::Moved if self.mode == KeyMode::Scroll => return Action::None,
-            MouseEventKind::Moved => return Action::FocusPane(*id),
+            // Only when asked for does moving the mouse over a pane give it
+            // the keyboard; otherwise a click does. Never in scroll mode: its
+            // keys read the pane it was entered on, and a nudge of the mouse
+            // would hand them to another.
+            MouseEventKind::Moved if self.focus_follows_pointer && self.mode != KeyMode::Scroll => {
+                return Action::FocusPane(*id);
+            }
+            MouseEventKind::Moved => return Action::None,
             MouseEventKind::Down(button) => (MouseAction::Press, translate_button(button)),
             MouseEventKind::Up(button) => (MouseAction::Release, translate_button(button)),
             MouseEventKind::Drag(button) => (MouseAction::Motion, translate_button(button)),

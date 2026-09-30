@@ -290,6 +290,7 @@ fn main() -> Result<ExitCode> {
 
     app.set_motion(loaded.config.interface.motion);
     app.set_hover_claims_panes(loaded.config.interface.hover_claims_panes);
+    app.set_focus_follows_pointer(loaded.config.interface.focus_follows_pointer);
 
     // Keys are the interface's alone; the daemon never reads `[keys]`. What
     // could not be used is logged by name, and the rest still applies.

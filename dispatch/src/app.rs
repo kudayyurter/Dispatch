@@ -664,6 +664,9 @@ pub struct App {
     /// What the sidebar's hit test said at the press that started a
     /// sidebar gesture, so a release on another row does not act.
     pressed_sidebar: Option<sidebar::Hit>,
+    /// Whether the press that started the current gesture was the second
+    /// click of a double.
+    pressed_double: bool,
     /// Where the sidebar's width and fold are kept, when this client keeps
     /// them.
     ui_dir: Option<PathBuf>,
@@ -804,6 +807,9 @@ pub struct App {
     /// Whether the pointer passing over this window counts as using it:
     /// `[interface] hover_claims_panes`.
     hover_claims_panes: bool,
+    /// `[interface] focus_follows_pointer`, kept to re-apply when the keymap
+    /// replaces the router.
+    focus_follows_pointer: bool,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -853,6 +859,7 @@ impl App {
             gesture: None,
             clicks: pointer::Clicks::default(),
             pressed_sidebar: None,
+            pressed_double: false,
             ui_dir: None,
             window: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
@@ -894,6 +901,7 @@ impl App {
             fitted: HashSet::new(),
             active_sent: None,
             hover_claims_panes: false,
+            focus_follows_pointer: false,
         }
     }
 
@@ -1007,6 +1015,15 @@ impl App {
     /// laid over them.
     pub fn set_keymap(&mut self, keymap: Keymap) {
         self.router = InputRouter::with_keymap(keymap);
+        self.router
+            .set_focus_follows_pointer(self.focus_follows_pointer);
+    }
+
+    /// `[interface] focus_follows_pointer`: whether the pointer resting on a
+    /// pane gives it the keyboard.
+    pub fn set_focus_follows_pointer(&mut self, on: bool) {
+        self.focus_follows_pointer = on;
+        self.router.set_focus_follows_pointer(on);
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -2974,10 +2991,10 @@ impl App {
                 },
             });
             self.pressed_sidebar = None;
-            if button == MouseButton::Left {
-                // Kept for what a double-click opens.
-                let _double = self.clicks.press(target, self.now());
-            }
+            // Whether this press made a double-click, for a header to zoom on
+            // the release that follows.
+            self.pressed_double =
+                button == MouseButton::Left && self.clicks.press(target, self.now());
             match target {
                 pointer::Target::Sidebar => {
                     self.pressed_sidebar = sidebar::hit_test(
@@ -2989,9 +3006,15 @@ impl App {
                     );
                     return true;
                 }
-                // The child gets its press as it always did; everything it
-                // is sent after is this gesture's.
-                pointer::Target::PaneContent(_) => return false,
+                // The child gets its press as it always did, after the pane
+                // has the keyboard; everything it is sent after is this
+                // gesture's. A child not tracking the mouse is sent nothing.
+                pointer::Target::PaneContent(id) => {
+                    if button == MouseButton::Left && self.state.focused_pane() != Some(id) {
+                        self.focus_pane(id);
+                    }
+                    return false;
+                }
                 _ => return true,
             }
         }
@@ -3131,6 +3154,15 @@ impl App {
                 // Picking something is what the drawer was opened for.
                 if matches!(hit, sidebar::Hit::Project(_) | sidebar::Hit::Pane(_)) {
                     self.drawer_open = false;
+                }
+            }
+            // The header is Dispatch's own: the click gives the pane the
+            // keyboard and nothing reaches the child. The second click of a
+            // double zooms it, once it has the keyboard.
+            pointer::Target::PaneHeader(id) | pointer::Target::PaneMenu(id) => {
+                self.focus_pane(id);
+                if self.pressed_double && matches!(owner, pointer::Target::PaneHeader(_)) {
+                    self.state.toggle_zoom();
                 }
             }
             _ => {}
@@ -14285,6 +14317,84 @@ args = ["--effort", "{value}"]
 
         assert_eq!(app.state.focused_pane(), Some(other));
         assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn hovering_over_a_pane_does_not_focus_it() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        app.focus_pane(panes[1]);
+        let (x, y) = middle_of(&app, panes[0]);
+        mouse_at(&mut app, MouseEventKind::Moved, x, y);
+        assert_eq!(app.state.focused_pane(), Some(panes[1]));
+
+        app.set_focus_follows_pointer(true);
+        mouse_at(&mut app, MouseEventKind::Moved, x, y);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]), "unless asked for");
+    }
+
+    #[test]
+    fn a_first_click_focuses_and_reaches_only_a_child_that_tracks_the_mouse() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        app.focus_pane(panes[1]);
+        drain(&sent);
+        let (x, y) = middle_of(&app, panes[0]);
+        click(&mut app, x, y);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+        assert!(
+            writes_by_pane(&sent).is_empty(),
+            "a child not tracking the mouse gets nothing"
+        );
+
+        app.focus_pane(panes[1]);
+        track_mouse(&mut app, &daemon, panes[0]);
+        drain(&sent);
+        click(&mut app, x, y);
+        assert_eq!(
+            writes_by_pane(&sent).get(&panes[0]).map(Vec::len),
+            Some(2),
+            "press and release"
+        );
+    }
+
+    #[test]
+    fn a_header_click_focuses_without_input_and_a_double_click_zooms() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        track_mouse(&mut app, &daemon, panes[0]);
+        app.focus_pane(panes[1]);
+        drain(&sent);
+        let (_, tile) = *app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled");
+
+        click(&mut app, tile.x + 2, tile.y);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+        assert!(
+            writes_by_pane(&sent).is_empty(),
+            "the header is Dispatch's, not the child's"
+        );
+        assert_eq!(app.state.zoomed_pane(), None);
+
+        advance(&clock, Duration::from_millis(200));
+        click(&mut app, tile.x + 2, tile.y);
+        assert_eq!(
+            app.state.zoomed_pane(),
+            Some(panes[0]),
+            "the second click of a double zooms"
+        );
     }
 
     #[test]
