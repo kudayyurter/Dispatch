@@ -4,7 +4,7 @@
 
 **Run several coding agents side by side, and see which one needs you.**
 
-[![CI](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat)](LICENSE)
+[![CI](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kudayyurter/Dispatch/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
 [Install](#install) · [Usage](#usage) · [Docs](docs/usage.md)
 
@@ -74,16 +74,13 @@ Settings live in `~/.config/dispatch` on Linux, `~/Library/Application Support/d
 
 ## How it works
 
-```mermaid
-flowchart LR
-  UI["dispatch<br/>grid, sidebar, status rules"] <-->|local socket| D["dispatchd"]
-  UI <-->|ssh| R["dispatchd on another machine"]
-  D --> A1["agents in PTYs"]
-  R --> A2["agents in PTYs"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/architecture-dark.svg">
+  <img src=".github/assets/architecture-light.svg" alt="The dispatch client talks to dispatchd on this machine over a local socket and to dispatchd on another machine over ssh; each daemon runs its agents in PTYs." width="541">
+</picture>
 
-Each pane is a real terminal, emulated with Ghostty's vendored `libghostty-vt`. The client reads every pane's screen and title with per-agent rules (adapted from [herdr](https://github.com/ogulcancelik/herdr)) to spot spinners and permission prompts. Crate-by-crate layout: [docs/building.md](docs/building.md).
+Each pane is a real terminal, emulated with Ghostty's vendored `libghostty-vt`. The client reads every pane's screen and title with per-agent rules (adapted from [herdr](https://github.com/herdrdev/herdr)) to spot spinners and permission prompts. Crate-by-crate layout: [docs/building.md](docs/building.md).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for vendored and derived code.
+MIT. Vendored and derived code keeps its own license (Apache-2.0 for the herdr-derived files); see [LICENSE](LICENSE) and [NOTICE](NOTICE).

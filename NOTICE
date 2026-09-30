@@ -17,7 +17,7 @@ text and the vendored VERSION file for the exact revision.
 --------------------------------------------------------------------------------
 herdr
 --------------------------------------------------------------------------------
-Portions of this product are derived from herdr (https://github.com/rksm/herdr),
+Portions of this product are derived from herdr (https://github.com/herdrdev/herdr),
 Copyright the herdr authors, licensed under the Apache License, Version 2.0.
 
 Derived files retain their original Apache-2.0 headers and are listed here as

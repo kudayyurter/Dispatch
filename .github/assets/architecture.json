@@ -1,0 +1,11 @@
+{
+  "alt": "The dispatch client talks to dispatchd on this machine over a local socket and to dispatchd on another machine over ssh; each daemon runs its agents in PTYs.",
+  "nodes": [
+    {"id": "ui", "title": "dispatch", "sub": "grid + sidebar", "icon": "lucide:square-terminal", "shape": "client"},
+    {"id": "local", "title": "dispatchd", "sub": "this machine", "icon": "lucide:server"},
+    {"id": "remote", "title": "dispatchd", "sub": "another machine", "icon": "lucide:server"},
+    {"id": "agents", "title": "Agents", "sub": "in PTYs", "icon": "lucide:bot", "shape": "external"},
+    {"id": "ragents", "title": "Agents", "sub": "in PTYs", "icon": "lucide:bot", "shape": "external"}
+  ],
+  "edges": [["ui", "local", "socket"], ["ui", "remote", "ssh"], ["local", "agents"], ["remote", "ragents"]]
+}
