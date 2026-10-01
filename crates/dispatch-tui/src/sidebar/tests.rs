@@ -1944,3 +1944,54 @@ fn pane_order_reaches_every_depth_and_ignores_folds() {
 
     assert_eq!(pane_order(&state), [top, child, grandchild, next]);
 }
+
+#[test]
+fn a_plain_sidebar_draws_no_private_use_glyphs() {
+    use crate::glyphs::Glyphs;
+
+    let (mut state, alpha, beta) = state();
+    state.add_project(Project::new(
+        "/tmp/gamma",
+        ProjectSource::GitRepo { remote: None },
+    ));
+
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.title = "tests".into();
+    state.adopt_pane(child).expect("the project exists");
+    for status in [
+        PaneStatus::Starting,
+        PaneStatus::Running,
+        PaneStatus::Blocked,
+        PaneStatus::Idle,
+        PaneStatus::Exited(0),
+        PaneStatus::Exited(1),
+    ] {
+        let pane = spawn(&mut state, alpha, "codex");
+        state.set_pane_status(pane, status).expect("it exists");
+    }
+    spawn(&mut state, beta, "claude");
+    let closed = spawn(&mut state, beta, "codex");
+    state.close_pane(closed).expect("it exists");
+    state.toggle_project_collapsed(beta);
+
+    let area = Rect::new(0, 0, WIDTH, 24);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_glyphs(&Glyphs::PLAIN)
+        .render(area, &mut buf);
+
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let symbol = buf.cell((x, y)).expect("inside").symbol();
+            assert!(
+                !symbol
+                    .chars()
+                    .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c)),
+                "({x}, {y}) draws {symbol:?}: {}",
+                all_text(&buf)
+            );
+        }
+    }
+}

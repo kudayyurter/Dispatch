@@ -6,9 +6,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::glyphs::Glyphs;
 use crate::theme::{Role, Theme};
 use dispatch_config::HarnessRegistry;
-use dispatch_config::harness::DEFAULT_ICON;
 use dispatch_core::{
     AppState, DeviceId, Pane, PaneId, PaneStatus, Project, ProjectId, ProjectSource,
 };
@@ -82,13 +82,13 @@ pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 /// Nerd Font carets rather than the geometric triangles: those are
 /// East-Asian-ambiguous, and a terminal that renders one two cells wide pushes
 /// the rest of the row out of line with every other row.
-const OPEN: &str = "\u{f0d7}";
+pub(crate) const OPEN: &str = "\u{f0d7}";
 
 /// The twisty of a node whose children are hidden.
-const SHUT: &str = "\u{f0da}";
+pub(crate) const SHUT: &str = "\u{f0da}";
 
 /// Drawn where a node has no children to hide.
-const LEAF: &str = " ";
+pub(crate) const LEAF: &str = " ";
 
 /// The mark of a project kept in a git repository.
 pub const REPOSITORY: &str = "\u{e725}";
@@ -184,6 +184,7 @@ pub struct Sidebar<'a> {
     scroll: Option<&'a Scroll>,
     spinner: Option<usize>,
     motion: Option<&'a SidebarMotion>,
+    glyphs: &'a Glyphs,
 }
 
 impl<'a> Sidebar<'a> {
@@ -197,7 +198,15 @@ impl<'a> Sidebar<'a> {
             scroll: None,
             spinner: None,
             motion: None,
+            glyphs: &Glyphs::NERD,
         }
+    }
+
+    /// Draws with `glyphs` rather than the Nerd Font set.
+    #[must_use]
+    pub fn with_glyphs(mut self, glyphs: &'a Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
     }
 
     /// Marks each pane with the icon of the harness running in it.
@@ -250,10 +259,14 @@ impl<'a> Sidebar<'a> {
     }
 
     /// The mark for the harness running in `pane`.
-    fn icon(&self, pane: &Pane) -> &str {
-        self.harnesses
-            .and_then(|harnesses| harnesses.get(pane.harness.as_str()))
-            .map_or(DEFAULT_ICON, dispatch_config::HarnessDef::icon)
+    fn icon(&self, pane: &Pane) -> String {
+        let def = self
+            .harnesses
+            .and_then(|harnesses| harnesses.get(pane.harness.as_str()));
+        // A harness the registry does not know is named by its id, which is
+        // all the plain set has to take a letter from.
+        let display = def.map_or(pane.harness.as_str(), |def| def.display_name.as_str());
+        self.glyphs.harness_icon(def, display)
     }
 }
 
@@ -268,11 +281,11 @@ impl<'a> Sidebar<'a> {
 /// the branch is found by walking up, so a directory inside a repository —
 /// or one `git init` reached after it was opened — has a branch line under
 /// it, and a folder above that line would contradict it.
-fn source_icon(project: &Project) -> &'static str {
+fn source_icon(project: &Project, glyphs: &Glyphs) -> &'static str {
     match project.source {
-        ProjectSource::GitRepo { .. } => REPOSITORY,
-        ProjectSource::LocalDir if project.branch.is_some() => REPOSITORY,
-        ProjectSource::LocalDir => SHUT_FOLDER,
+        ProjectSource::GitRepo { .. } => glyphs.repository,
+        ProjectSource::LocalDir if project.branch.is_some() => glyphs.repository,
+        ProjectSource::LocalDir => glyphs.folder,
     }
 }
 
@@ -333,11 +346,11 @@ pub fn truncate(text: &str, width: usize) -> String {
 ///
 /// A node with nothing under it gets a blank rather than a twisty: a control
 /// that toggles nothing invites a click that does nothing.
-fn twisty(has_children: bool, collapsed: bool) -> &'static str {
+fn twisty(has_children: bool, collapsed: bool, glyphs: &Glyphs) -> &'static str {
     match (has_children, collapsed) {
-        (false, _) => LEAF,
-        (true, true) => SHUT,
-        (true, false) => OPEN,
+        (false, _) => glyphs.leaf,
+        (true, true) => glyphs.shut,
+        (true, false) => glyphs.open,
     }
 }
 
@@ -351,21 +364,22 @@ fn state_glyph(
     unseen: bool,
     spinner: Option<usize>,
     theme: &Theme,
+    glyphs: &Glyphs,
 ) -> (&'static str, Style) {
     if pane.closed {
-        return (CLOSED, Style::default().fg(theme.faded));
+        return (glyphs.closed, Style::default().fg(theme.faded));
     }
 
     match pane.status {
-        PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
-        PaneStatus::Running => Rollup::Working.glyph(spinner, theme),
-        PaneStatus::Blocked => Rollup::Blocked.glyph(spinner, theme),
-        PaneStatus::Idle if unseen => Rollup::Done.glyph(spinner, theme),
-        PaneStatus::Idle => (IDLE, Style::default().fg(theme.faded)),
+        PaneStatus::Starting => (glyphs.starting, Style::default().fg(Color::Yellow)),
+        PaneStatus::Running => Rollup::Working.glyph_with(spinner, theme, glyphs),
+        PaneStatus::Blocked => Rollup::Blocked.glyph_with(spinner, theme, glyphs),
+        PaneStatus::Idle if unseen => Rollup::Done.glyph_with(spinner, theme, glyphs),
+        PaneStatus::Idle => (glyphs.idle, Style::default().fg(theme.faded)),
         // A pane that exited stays listed until it is closed, so it has to be
         // visibly different from one that is still working.
-        PaneStatus::Exited(0) => (DONE, Style::default().fg(theme.faded)),
-        PaneStatus::Exited(_) => (FAILED, Style::default().fg(Color::Red)),
+        PaneStatus::Exited(0) => (glyphs.done, Style::default().fg(theme.faded)),
+        PaneStatus::Exited(_) => (glyphs.failed, Style::default().fg(Color::Red)),
     }
 }
 
@@ -401,14 +415,25 @@ impl Rollup {
     /// Its glyph and colour.
     #[must_use]
     pub fn glyph(self, spinner: Option<usize>, theme: &Theme) -> (&'static str, Style) {
+        self.glyph_with(spinner, theme, &Glyphs::NERD)
+    }
+
+    /// Its glyph and colour, drawn from `glyphs`.
+    #[must_use]
+    pub fn glyph_with(
+        self,
+        spinner: Option<usize>,
+        theme: &Theme,
+        glyphs: &Glyphs,
+    ) -> (&'static str, Style) {
         match self {
             Rollup::Working => (
-                spinner.map_or(RUNNING, |frame| SPINNER[frame % SPINNER.len()]),
+                spinner.map_or(glyphs.running, |frame| SPINNER[frame % SPINNER.len()]),
                 Style::default().fg(Color::Green),
             ),
-            Rollup::Done => (UNSEEN, Style::default().fg(theme.accent)),
+            Rollup::Done => (glyphs.unseen, Style::default().fg(theme.accent)),
             Rollup::Blocked => (
-                BLOCKED,
+                glyphs.blocked,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1155,8 +1180,22 @@ impl Sidebar<'_> {
             .any(|pane| pane.parent.is_none());
         let collapsed = self.state.is_project_collapsed(id);
 
-        write(buf, area, x, y, twisty(has_panes, collapsed), style);
-        write(buf, area, x + 2, y, source_icon(project), style);
+        write(
+            buf,
+            area,
+            x,
+            y,
+            twisty(has_panes, collapsed, self.glyphs),
+            style,
+        );
+        write(
+            buf,
+            area,
+            x + 2,
+            y,
+            source_icon(project, self.glyphs),
+            style,
+        );
 
         // A folded project stands for its panes, so it carries the most
         // urgent of their states where a pane row carries its own; an open
@@ -1177,7 +1216,7 @@ impl Sidebar<'_> {
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
 
         if let Some(rollup) = rollup {
-            let (glyph, glyph_style) = rollup.glyph(self.spinner, &self.theme);
+            let (glyph, glyph_style) = rollup.glyph_with(self.spinner, &self.theme, self.glyphs);
             write(buf, area, state_x, y, glyph, glyph_style);
         }
     }
@@ -1318,10 +1357,14 @@ impl Sidebar<'_> {
         }
 
         let has_children = !self.state.children_of(pane.id).is_empty();
-        let twisty = twisty(has_children, self.state.is_pane_collapsed(pane.id));
+        let twisty = twisty(
+            has_children,
+            self.state.is_pane_collapsed(pane.id),
+            self.glyphs,
+        );
 
         write(buf, area, x, y, twisty, style);
-        write(buf, area, x + 2, y, self.icon(pane), style);
+        write(buf, area, x + 2, y, &self.icon(pane), style);
 
         // Two columns in from the frame, so the blank beside it keeps a glyph
         // drawn wider than its cell off the border. The title stops a blank
@@ -1331,6 +1374,7 @@ impl Sidebar<'_> {
             self.state.is_unseen(pane.id),
             self.spinner,
             &self.theme,
+            self.glyphs,
         );
         let state_x = (area.x + area.width).saturating_sub(2);
 

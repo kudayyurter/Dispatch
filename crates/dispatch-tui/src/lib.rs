@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod browser;
 pub mod button;
+pub mod glyphs;
 pub mod input;
 pub mod keymap;
 pub mod menu;

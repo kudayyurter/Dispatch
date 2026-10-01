@@ -725,6 +725,8 @@ pub struct App {
     state: AppState,
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
+    /// The glyph set the sidebar and the tab chips draw with.
+    glyphs: &'static dispatch_tui::glyphs::Glyphs,
     router: InputRouter,
     /// The pane scroll mode reads, while it is on: the one focused when it
     /// began.
@@ -1025,6 +1027,7 @@ impl App {
             #[cfg(test)]
             sent: Vec::new(),
             theme: Theme::fallback(),
+            glyphs: &dispatch_tui::glyphs::Glyphs::NERD,
             clock: Box::new(Instant::now),
             motion: true,
             started: Instant::now(),
@@ -1145,6 +1148,15 @@ impl App {
     /// Draws the interface in `theme` from the next frame on.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Draws the sidebar and the tab chips with `glyphs` from the next frame on.
+    #[allow(
+        dead_code,
+        reason = "Settings applies the icon set through it, in a later task"
+    )]
+    pub fn set_glyphs(&mut self, glyphs: &'static dispatch_tui::glyphs::Glyphs) {
+        self.glyphs = glyphs;
     }
 
     /// Turns motion on or off: spinners, pulses, easing and transitions.
@@ -5057,6 +5069,7 @@ impl App {
             Sidebar::new(&self.state)
                 .with_harnesses(&self.harnesses)
                 .with_theme(self.theme)
+                .with_glyphs(self.glyphs)
                 .with_scroll(&self.sidebar_scroll)
                 .with_spinner(self.spinner_frame())
                 .with_motion(&sidebar_motion),
@@ -5849,7 +5862,7 @@ impl App {
                     view.panes.iter().filter_map(|id| self.state.pane(*id)),
                 ) {
                     self.tabs_spun |= rollup == sidebar::Rollup::Working && spinner.is_some();
-                    let (glyph, glyph_style) = rollup.glyph(spinner, &self.theme);
+                    let (glyph, glyph_style) = rollup.glyph_with(spinner, &self.theme, self.glyphs);
                     spans.push(Span::styled(" ", style));
                     spans.push(Span::styled(glyph, style.patch(glyph_style)));
                 }
