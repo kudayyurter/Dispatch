@@ -54,6 +54,18 @@ fn cut_report(mut report: String) -> String {
 /// rest, and a person can open it.
 const TAIL_BYTES: usize = 8 * 1024;
 
+/// The output a subagent's caller is handed when its pane ends.
+///
+/// An interactive pane has none: a full-screen interface's bytes are drawing
+/// commands, not output a caller could read.
+fn caller_tail(pane: &DaemonPane) -> Vec<u8> {
+    if pane.interactive {
+        return Vec::new();
+    }
+    let start = pane.history.len().saturating_sub(TAIL_BYTES);
+    pane.history[start..].to_vec()
+}
+
 /// How long the loop waits for an event before checking panes again.
 ///
 /// Panes are polled rather than waited on, so this is the floor on how quickly
@@ -745,6 +757,14 @@ impl Daemon {
                                 status: pane.status,
                             },
                         });
+                    }
+                }
+
+                // A reported pane waiting on the user's decision is marked in
+                // every window, a late one included.
+                if self.limits.interactive_on_done == dispatch_config::OnDone::Ask {
+                    for pane in self.panes.values().filter(|p| p.interactive && p.reported) {
+                        existing.push(ServerMessage::SubagentReported { pane: pane.id });
                     }
                 }
 
@@ -1682,8 +1702,16 @@ impl Daemon {
         );
         self.send(client, answer(ReportOutcome::Delivered));
 
-        // What an interactive pane does next is Task 6.
-        let _ = interactive;
+        if interactive {
+            match self.limits.interactive_on_done {
+                // After the answer, never before: closing first would answer
+                // the caller as if the pane had been killed.
+                dispatch_config::OnDone::Close => self.end_pane(pane),
+                dispatch_config::OnDone::Ask => {
+                    self.broadcast(ServerMessage::SubagentReported { pane });
+                }
+            }
+        }
     }
 
     /// Starts an approved subagent and tells everyone.
@@ -1845,6 +1873,11 @@ impl Daemon {
             }
         };
 
+        // An interactive subagent is one the user may be watching or typing
+        // into: like a blanket-approved one, it is never ended because the
+        // call that asked for it went away.
+        let durable = durable || interactive;
+
         self.panes.insert(
             id,
             DaemonPane {
@@ -1915,8 +1948,7 @@ impl Daemon {
             return;
         };
 
-        let start = pane.history.len().saturating_sub(TAIL_BYTES);
-        let tail = pane.history[start..].to_vec();
+        let tail = caller_tail(pane);
 
         self.send(
             caller,
@@ -2006,6 +2038,15 @@ impl Daemon {
 
         let mut orphaned = Vec::new();
         for pane in self.panes.values_mut() {
+            // An interactive subagent stays, as a pane the user can go on
+            // using. It is detached from the caller that left, so a report
+            // it sends later is told nobody is waiting and nothing closes it.
+            if pane.interactive && pane.caller == Some(caller) {
+                pane.caller = None;
+                pane.request = None;
+                continue;
+            }
+
             if pane.caller != Some(caller) || pane.durable {
                 continue;
             }
@@ -2184,13 +2225,13 @@ impl Daemon {
             }
 
             if let (Some(request), Some(caller)) = (pane.request.take(), pane.caller) {
-                let start = pane.history.len().saturating_sub(TAIL_BYTES);
+                let tail = caller_tail(pane);
                 answers.push((
                     caller,
                     ServerMessage::DelegateFinished {
                         request,
                         exit: code,
-                        tail: pane.history[start..].to_vec(),
+                        tail,
                         report: None,
                     },
                 ));

@@ -6445,3 +6445,196 @@ fn the_cap_counts_requests_still_open_not_processes_still_running() {
         "a reported subagent no longer holds its parent's slot"
     );
 }
+
+/// Attaches a delegate caller and asks for an interactive subagent.
+fn ask_interactive(daemon: &mut Daemon, parent: PaneId, goal: &str) -> Inbox {
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(handoff_for(goal)),
+            interactive: true,
+        },
+    );
+    caller
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_closes_once_it_has_reported() {
+    let (mut daemon, project, _dir) = daemon("interactive-close");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let _ = report_from(&mut daemon, 20, child, "interactive findings");
+
+    let answer = drain(&caller).into_iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { report, .. } => report,
+        _ => None,
+    });
+    assert_eq!(answer.as_deref(), Some("interactive findings"));
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane } if *pane == child)),
+        "closed after the caller had its answer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn under_ask_a_reported_interactive_subagent_stays_and_is_marked() {
+    let limits = DelegationLimits {
+        interactive_on_done: dispatch_config::OnDone::Ask,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, _dir) = daemon_with_limits("interactive-ask", limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+    assert_eq!(daemon.pane_count(), 2, "kept for the user to close");
+
+    // A window attaching later is told too.
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    assert!(
+        drain(&late)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_outlives_a_caller_that_left_before_it_reported() {
+    let (mut daemon, project, _dir) = daemon("interactive-orphan");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.detach_for_test(9);
+    daemon.tick();
+    assert_eq!(daemon.pane_count(), 2, "never ended under the user");
+
+    let late = report_from(&mut daemon, 20, child, "nobody");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "and not closed by a report nobody wanted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_that_exits_without_reporting_answers_with_no_tail() {
+    let (mut daemon, project, _dir) = daemon("interactive-no-report");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "echo screen-noise");
+    let _child = approve_and_spawn(&mut daemon, &ui);
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let finished = seen.iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { tail, report, .. } => {
+            Some((tail.clone(), report.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some((Vec::new(), None)),
+        "a full-screen tail is not output"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_an_interactive_subagent_before_it_reports_answers_its_caller() {
+    let (mut daemon, project, _dir) = daemon("interactive-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: child });
+
+    assert!(
+        drain(&caller)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { exit: -1, .. }))
+    );
+}
+
+#[test]
+fn a_harness_without_an_interactive_form_refuses_interactive() {
+    let (mut daemon, project, _dir) = daemon("interactive-none");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "no-task-args".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(handoff_for("echo x")),
+            interactive: true,
+        },
+    );
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("[task.interactive]"), "{reason}");
+}
