@@ -198,12 +198,22 @@ pub fn run(args: Args) -> Result<ExitCode> {
                         return Ok(ExitCode::from(exit::TEMPFAIL));
                     }
 
-                    if interactive {
+                    // An interactive subagent's exit comes with no tail: a
+                    // full-screen interface's bytes are not output. A tail,
+                    // then, means a daemon too old to know `interactive`
+                    // ran it one-shot, and what it printed is the work, so
+                    // it is returned as any one-shot's is rather than lost.
+                    if interactive && tail.is_empty() {
                         eprintln!(
                             "[dispatch] the subagent finished without a report (exit {code}); \
                              its pane has what it did"
                         );
                         return Ok(ExitCode::from(exit::TEMPFAIL));
+                    }
+                    if interactive {
+                        eprintln!(
+                            "[dispatch] the daemon ran the subagent one-shot, not interactively"
+                        );
                     }
 
                     std::io::stdout()

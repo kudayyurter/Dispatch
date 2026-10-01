@@ -1569,3 +1569,26 @@ fn every_shipped_harness_has_an_interactive_form() {
         );
     }
 }
+
+#[test]
+fn an_interactive_form_does_not_give_agy_or_opencode_a_one_shot_form() {
+    // Both ship a `[task.interactive]`, which needs a `[task]` table to live
+    // in. That table must not turn into a one-shot form by accident: their
+    // one-shot flags are unknown, and a guess would run them with flags that
+    // mean something else.
+    let dir = TempDir::new("interactive-without-one-shot");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    for id in ["agy", "opencode"] {
+        let harness = registry.get(id).expect("the built-in exists");
+        assert!(
+            harness.interactive_launch_for("linux", "x").is_some(),
+            "{id} ships an interactive form"
+        );
+        assert!(
+            harness.task_launch_for("linux", "x").is_none(),
+            "{id} has no one-shot form"
+        );
+    }
+}
