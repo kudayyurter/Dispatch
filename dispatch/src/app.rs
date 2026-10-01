@@ -1179,7 +1179,10 @@ impl App {
             accent: accent_rgb(accent, base.accent),
             ..base
         };
-        self.theme = Theme::new(palette, self.theme.depth());
+        // Slot 5 only stands for the accent when both the palette and the
+        // accent are the terminal's own.
+        let terminal_accent = theme == ThemeChoice::Terminal && *accent == Accent::Terminal;
+        self.theme = Theme::with_accent(palette, self.theme.depth(), terminal_accent);
         self.set_glyphs(match icons {
             IconSet::Plain => &dispatch_tui::glyphs::Glyphs::PLAIN,
             IconSet::Nerd => &dispatch_tui::glyphs::Glyphs::NERD,
@@ -6276,6 +6279,23 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    #[test]
+    fn a_chosen_accent_reaches_the_border_in_256_colours() {
+        use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
+        use dispatch_tui::theme::{Depth, Palette};
+
+        let (mut app, ..) = attached_app();
+        app.set_theme(Theme::new(Palette::FALLBACK, Depth::Indexed));
+
+        app.apply_appearance(ThemeChoice::Terminal, &Accent::Blue, IconSet::Nerd);
+        let blue = dispatch_tui::theme::nearest_indexed(dispatch_tui::theme::Rgb(0x61, 0xaf, 0xef));
+        assert_eq!(app.theme.accent, Color::Indexed(blue));
+        assert_ne!(app.theme.accent, Color::Indexed(5));
+
+        app.apply_appearance(ThemeChoice::Terminal, &Accent::Terminal, IconSet::Nerd);
+        assert_eq!(app.theme.accent, Color::Indexed(5));
     }
 
     #[test]

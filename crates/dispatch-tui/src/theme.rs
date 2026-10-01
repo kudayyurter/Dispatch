@@ -178,14 +178,25 @@ impl Theme {
     /// Mixes a theme from `palette`, at the depth the terminal can show.
     #[must_use]
     pub fn new(palette: Palette, depth: Depth) -> Theme {
+        Theme::with_accent(palette, depth, true)
+    }
+
+    /// As [`Theme::new`], saying whether `palette.accent` is the terminal's
+    /// own slot 5.
+    ///
+    /// Only then is the accent named by its slot in 256 colours. A preset or
+    /// custom accent is not in the terminal's palette, so it is mapped through
+    /// `at_depth` like every other mixed colour.
+    #[must_use]
+    pub fn with_accent(palette: Palette, depth: Depth, terminal_accent: bool) -> Theme {
         let colour = |rgb: Rgb| at_depth(rgb, depth);
 
         // The accent is palette slot 5, so in 256 colours it is named by its
         // slot rather than approximated: the terminal draws its own colour
         // exactly, where the nearest cube entry is only close to it.
         let accent = match depth {
-            Depth::TrueColor => colour(palette.accent),
-            Depth::Indexed => Color::Indexed(5),
+            Depth::Indexed if terminal_accent => Color::Indexed(5),
+            _ => colour(palette.accent),
         };
 
         Theme {
