@@ -258,11 +258,15 @@ fn wrapped(index: usize, len: usize, forward: bool) -> usize {
 impl App {
     /// Opens Settings, on the category and field it was last left on.
     pub(super) fn open_settings_workspace(&mut self) {
-        let base = self
-            .preferences_dir
-            .as_deref()
-            .map(preferences::load_or_default)
-            .unwrap_or_default();
+        // A file that cannot be read still holds the user's settings, so what
+        // was last read stays committed rather than the defaults, as Discard
+        // keeps it.
+        let base = match self.preferences_dir.clone() {
+            Some(dir) => self
+                .read_preferences(&dir)
+                .unwrap_or_else(|| self.preferences.clone()),
+            None => Preferences::default(),
+        };
         let mut workspace = SettingsWorkspace {
             view: SettingsView::new(CATEGORIES.map(String::from).to_vec(), Vec::new()),
             draft: base.clone(),
@@ -277,6 +281,23 @@ impl App {
         workspace.view.select_category(category);
         workspace.view.select_field(field);
         self.overlay = Some(Overlay::Preferences(workspace));
+    }
+
+    /// Reads `preferences.toml` from `dir`, or none when it cannot be read.
+    /// That is said on the footer, naming the file: a hand edit that breaks
+    /// it would otherwise drop every setting in it without a word.
+    pub(super) fn read_preferences(&mut self, dir: &std::path::Path) -> Option<Preferences> {
+        match preferences::load(dir) {
+            Ok(prefs) => Some(prefs),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring preferences that cannot be read");
+                self.warn(format!(
+                    "{} can't be read, so its settings are not used; mend or remove it",
+                    dir.join(preferences::FILE).display()
+                ));
+                None
+            }
+        }
     }
 
     /// Where the open workspace drew what can be clicked, as the last frame
@@ -592,7 +613,11 @@ impl App {
                 "log_file",
                 "Log file",
                 "Where diagnostics go, since the screen is Dispatch's.",
-                shown_path(paths::log_file()),
+                // The one in use, which `--log-file` may have moved.
+                self.log_file.as_ref().map_or_else(
+                    || shown_path(paths::log_file()),
+                    |path| path.display().to_string(),
+                ),
             ),
             (
                 "version",

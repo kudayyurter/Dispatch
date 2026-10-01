@@ -798,6 +798,9 @@ pub struct App {
     ui_dir: Option<PathBuf>,
     /// Where `preferences.toml` is kept, when this client keeps it.
     preferences_dir: Option<PathBuf>,
+    /// The log file diagnostics go to, when start-up said: `--log-file` can
+    /// put it somewhere other than the default.
+    log_file: Option<PathBuf>,
     /// What `preferences.toml` held when this client started or last applied.
     preferences: dispatch_config::preferences::Preferences,
     /// `config.toml`'s `[interface]`, kept to work out where a value came from.
@@ -1010,6 +1013,7 @@ impl App {
             pressed_double: false,
             ui_dir: None,
             preferences_dir: None,
+            log_file: None,
             preferences: dispatch_config::preferences::Preferences::default(),
             interface_config: dispatch_config::InterfaceConfig::default(),
             interface_present: dispatch_config::InterfaceKeysPresent::default(),
@@ -1635,6 +1639,11 @@ impl App {
         let _ = self.state.set_pane_title(id, name);
     }
 
+    /// Says where diagnostics are written, for Settings to show.
+    pub fn set_log_file(&mut self, path: PathBuf) {
+        self.log_file = Some(path);
+    }
+
     /// Starts the directory browser at `dir` rather than the working
     /// directory.
     pub fn browse_from(&mut self, dir: impl Into<PathBuf>) {
@@ -1676,7 +1685,7 @@ impl App {
         present: dispatch_config::InterfaceKeysPresent,
     ) {
         let dir = dir.into();
-        self.preferences = dispatch_config::preferences::load_or_default(&dir);
+        self.preferences = self.read_preferences(&dir).unwrap_or_default();
         self.interface_config = interface;
         self.interface_present = present;
         self.preferences_dir = Some(dir);
@@ -15744,6 +15753,26 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
+    fn advanced_shows_the_log_file_in_use() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        let log = scratch("log-file").join("chosen.log");
+        app.set_log_file(log.clone());
+        open_category_by_keys(&mut app, 2);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+        }
+        let field = workspace(&app).view.selected_field().expect("a row");
+        assert_eq!(field.id, "log_file");
+        assert_eq!(
+            field.value,
+            log.display().to_string(),
+            "the one --log-file named"
+        );
+    }
+
+    #[test]
     fn discard_keeps_what_was_committed_when_the_file_cannot_be_read() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
@@ -16025,6 +16054,41 @@ args = ["--effort", "{value}"]
             Some(dispatch_config::preferences::Accent::Custom(
                 dispatch_config::preferences::Rgb8(0xff, 0x88, 0x00)
             ))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_preferences_file_is_said_at_start_up() {
+        let (mut app, ..) = attached_app();
+        with_preferences_holding(&mut app, "not = [toml");
+        assert!(app.status.is_error());
+        assert!(
+            app.status.text.contains("preferences.toml can't be read"),
+            "{}",
+            app.status.text
+        );
+    }
+
+    #[test]
+    fn an_unreadable_preferences_file_is_said_when_settings_opens() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences_holding(&mut app, "[interface]\nfocus_follows_pointer = true\n");
+        assert!(app.status.is_empty(), "{}", app.status.text);
+        let file = dir.join(dispatch_config::preferences::FILE);
+        std::fs::write(&file, "not = [toml").expect("spoiled");
+
+        press_alt(&mut app, ',');
+        assert!(app.status.is_error());
+        assert!(
+            app.status.text.starts_with(&file.display().to_string()),
+            "it names the file: {}",
+            app.status.text
+        );
+        assert_eq!(
+            workspace(&app).base.interface.focus_follows_pointer,
+            Some(true),
+            "what was last read stays committed"
         );
     }
 

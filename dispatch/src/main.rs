@@ -118,7 +118,7 @@ fn parse_size(text: &str) -> Result<(u16, u16), String> {
 
 fn main() -> Result<ExitCode> {
     let args = Args::parse();
-    init_logging(args.log_file.clone())?;
+    let log_file = init_logging(args.log_file.clone())?;
 
     match args.command {
         Some(Command::Delegate {
@@ -218,6 +218,7 @@ fn main() -> Result<ExitCode> {
     } else {
         App::new(harnesses)
     };
+    app.set_log_file(log_file);
 
     for machine in &machines {
         // Not `args`: that is the command line's own, still read below.
@@ -447,7 +448,9 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
 ///
 /// A TUI owns the screen, so anything written to stdout or stderr would land
 /// in the middle of the interface.
-fn init_logging(override_path: Option<PathBuf>) -> Result<()> {
+///
+/// Returns the file it chose, which Settings shows.
+fn init_logging(override_path: Option<PathBuf>) -> Result<PathBuf> {
     use tracing_subscriber::EnvFilter;
 
     let path = match override_path {
@@ -472,5 +475,5 @@ fn init_logging(override_path: Option<PathBuf>) -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    Ok(())
+    Ok(path)
 }
