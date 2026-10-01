@@ -593,6 +593,9 @@ impl App {
             pointer::Target::Dialog(pointer::DialogHit::FieldStep(index, forward)) => {
                 self.settings_step_at(index, forward);
             }
+            pointer::Target::Dialog(pointer::DialogHit::FieldReset(index)) => {
+                self.settings_reset_at(index);
+            }
             pointer::Target::Dialog(pointer::DialogHit::Close) => self.settings_close(),
             pointer::Target::Dialog(pointer::DialogHit::Step(index, forward)) => {
                 if let Some(Overlay::Settings { form, .. }) = &mut self.overlay {

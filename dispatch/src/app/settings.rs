@@ -175,7 +175,44 @@ fn plain_row(
         applies,
         changed: false,
         conflict: false,
+        resettable: false,
     }
+}
+
+/// Whether the draft sets the preference a row edits, rather than leaving it
+/// to `config.toml` and the default.
+fn is_set(draft: &Preferences, id: &str) -> bool {
+    match id {
+        "focus_follows_pointer" => draft.interface.focus_follows_pointer.is_some(),
+        "hover_claims_panes" => draft.interface.hover_claims_panes.is_some(),
+        "motion" => draft.interface.motion.is_some(),
+        "theme" => draft.appearance.theme.is_some(),
+        "accent" | "accent_custom" => draft.appearance.accent.is_some(),
+        "icons" => draft.appearance.icons.is_some(),
+        _ => false,
+    }
+}
+
+/// Puts the preference a row edits back to "inherit". Returns whether the
+/// row edits a preference at all.
+fn unset(draft: &mut Preferences, id: &str) -> bool {
+    match id {
+        "focus_follows_pointer" => draft.interface.focus_follows_pointer = None,
+        "hover_claims_panes" => draft.interface.hover_claims_panes = None,
+        "motion" => draft.interface.motion = None,
+        "theme" => draft.appearance.theme = None,
+        "accent" | "accent_custom" => draft.appearance.accent = None,
+        "icons" => draft.appearance.icons = None,
+        _ => return false,
+    }
+    true
+}
+
+/// What a step stores: nothing, when it lands on what the field would
+/// inherit and nothing was committed for it, so stepping there and back is
+/// no change and never pins the default into the file.
+fn settled<T: PartialEq>(value: T, inherited: T, committed: Option<&T>) -> Option<T> {
+    (committed.is_some() || value != inherited).then_some(value)
 }
 
 /// A path as text, or `unknown` when it could not be worked out.
@@ -256,10 +293,13 @@ impl App {
         for (rect, index) in layout.fields {
             hits.push(rect, at(DialogHit::Field(index)));
         }
+        for (rect, index) in layout.resets {
+            hits.push(rect, at(DialogHit::FieldReset(index)));
+        }
         for (rect, index, forward) in layout.steps {
             hits.push(rect, at(DialogHit::FieldStep(index, forward)));
         }
-        for (rect, id) in layout.buttons {
+        for (rect, id) in layout.buttons.into_iter().chain(layout.actions) {
             hits.push(rect, at(DialogHit::Button(id)));
         }
         hits.push(layout.close, at(DialogHit::Close));
@@ -331,6 +371,7 @@ impl App {
                     applies,
                     changed,
                     conflict: conflict(key),
+                    resettable: false,
                 }
             };
         let choices =
@@ -408,6 +449,9 @@ impl App {
             "icons",
         ));
         fields.extend(self.advanced_fields());
+        for field in &mut fields {
+            field.resettable = is_set(draft, field.id);
+        }
         fields
     }
 
@@ -626,9 +670,12 @@ impl App {
                         // again writes their choice knowingly.
                         let fresh = preferences::load_or_default(&dir);
                         rebase(section, &mut workspace.base, &mut workspace.draft, &fresh);
+                        // The user's edit is what stays in the draft, so
+                        // the message says what each button now does with it.
+                        let it = if fields.len() == 1 { "it" } else { "them" };
                         self.warn(format!(
-                            "changed elsewhere since you opened Settings: {}; \
-                             it now shows the newer value",
+                            "{} changed elsewhere since you opened Settings; \
+                             Apply again to replace {it} with yours, or Discard to take {it}",
                             fields.join(", ")
                         ));
                         workspace.conflicts = fields;
@@ -779,6 +826,15 @@ impl App {
 
     /// What a footer button, or a prompt's, does.
     fn press_settings_button(&mut self, workspace: &mut SettingsWorkspace, id: ButtonId) -> Flow {
+        // While the prompt asks, only its own buttons answer: an Action row
+        // under it is still drawn, and still clickable, but must wait.
+        let answers = matches!(
+            id,
+            ButtonId::Apply | ButtonId::Discard | ButtonId::KeepEditing
+        );
+        if workspace.leaving.is_some() && !answers {
+            return Flow::Stay;
+        }
         match id {
             ButtonId::Apply => {
                 let applied = self.apply_settings(workspace);
@@ -870,14 +926,25 @@ impl App {
             return;
         }
         let effective = self.draft_effective(workspace);
-        let draft = &mut workspace.draft;
+        // What each field would be with nothing set in Settings: every field
+        // is layered on its own, so the empty preferences give all of them.
+        let inherited = preferences::effective(
+            &self.interface_config,
+            &self.interface_present,
+            &Preferences::default(),
+        );
+        let (base, draft) = (&workspace.base, &mut workspace.draft);
         match id {
             "theme" => {
                 let at = THEMES
                     .iter()
                     .position(|(choice, _)| *choice == effective.theme.value)
                     .unwrap_or(0);
-                draft.appearance.theme = Some(THEMES[wrapped(at, THEMES.len(), forward)].0);
+                draft.appearance.theme = settled(
+                    THEMES[wrapped(at, THEMES.len(), forward)].0,
+                    inherited.theme.value,
+                    base.appearance.theme.as_ref(),
+                );
             }
             "accent" => {
                 let next = wrapped(
@@ -885,7 +952,7 @@ impl App {
                     PRESETS.len() + 1,
                     forward,
                 );
-                draft.appearance.accent = Some(match PRESETS.get(next) {
+                let accent = match PRESETS.get(next) {
                     Some((preset, _)) => *preset,
                     // Starts from the colour in force, so choosing Custom
                     // changes nothing until it is edited.
@@ -893,14 +960,26 @@ impl App {
                         let dispatch_tui::theme::Rgb(r, g, b) = self.theme.palette().accent;
                         Accent::Custom(Rgb8(r, g, b))
                     }
-                });
+                };
+                draft.appearance.accent = settled(
+                    accent,
+                    inherited.accent.value,
+                    base.appearance.accent.as_ref(),
+                );
             }
             "focus_follows_pointer" => {
-                draft.interface.focus_follows_pointer =
-                    Some(!effective.focus_follows_pointer.value);
+                draft.interface.focus_follows_pointer = settled(
+                    !effective.focus_follows_pointer.value,
+                    inherited.focus_follows_pointer.value,
+                    base.interface.focus_follows_pointer.as_ref(),
+                );
             }
             "hover_claims_panes" => {
-                draft.interface.hover_claims_panes = Some(!effective.hover_claims_panes.value);
+                draft.interface.hover_claims_panes = settled(
+                    !effective.hover_claims_panes.value,
+                    inherited.hover_claims_panes.value,
+                    base.interface.hover_claims_panes.as_ref(),
+                );
             }
             // The sidebar acts at once, as dragging and `Alt s` do, so it
             // never touches the draft.
@@ -914,17 +993,59 @@ impl App {
                 self.refresh_settings(workspace);
                 return;
             }
-            "motion" => draft.interface.motion = Some(!effective.motion.value),
+            "motion" => {
+                draft.interface.motion = settled(
+                    !effective.motion.value,
+                    inherited.motion.value,
+                    base.interface.motion.as_ref(),
+                );
+            }
             "icons" => {
                 let at = ICONS
                     .iter()
                     .position(|(set, _)| *set == effective.icons.value)
                     .unwrap_or(0);
-                draft.appearance.icons = Some(ICONS[wrapped(at, ICONS.len(), forward)].0);
+                draft.appearance.icons = settled(
+                    ICONS[wrapped(at, ICONS.len(), forward)].0,
+                    inherited.icons.value,
+                    base.appearance.icons.as_ref(),
+                );
             }
             _ => return,
         }
         self.preview(workspace);
+    }
+
+    /// Puts the highlighted field back to what it inherits: Reset to default.
+    /// Applying then removes it from the file.
+    fn reset_selected(&mut self, workspace: &mut SettingsWorkspace) {
+        if !workspace.view.search().is_empty() {
+            Self::request_jump(workspace);
+            if workspace.leaving.is_some() {
+                return;
+            }
+        }
+        let Some(id) = workspace.view.selected_field().map(|field| field.id) else {
+            return;
+        };
+        if unset(&mut workspace.draft, id) {
+            workspace.text = None;
+            workspace.view.set_editing(false);
+            self.preview(workspace);
+        }
+    }
+
+    /// A field's reset control was pressed, by its row among those shown.
+    pub(super) fn settings_reset_at(&mut self, row: usize) {
+        self.in_settings(|app, workspace| {
+            if workspace.leaving.is_some() {
+                return Flow::Stay;
+            }
+            workspace.view.select_field(row);
+            workspace.view.set_focus(Focus::Fields);
+            app.reset_selected(workspace);
+            Flow::Stay
+        });
     }
 
     /// What Enter does on the highlighted field.
@@ -1043,6 +1164,9 @@ impl App {
             (Focus::Fields, KeyCode::Left) => self.step_selected(workspace, false),
             (Focus::Fields, KeyCode::Right) => self.step_selected(workspace, true),
             (Focus::Fields, KeyCode::Enter) => return self.activate_selected(workspace),
+            (Focus::Fields, KeyCode::Backspace | KeyCode::Delete) => {
+                self.reset_selected(workspace);
+            }
 
             (Focus::Buttons, KeyCode::Left) => workspace.view.move_button(false),
             (Focus::Buttons, KeyCode::Right) => workspace.view.move_button(true),
@@ -1138,9 +1262,12 @@ impl App {
                         self.hold_settings_press(owner, mouse)
                     }
                     _ if asking => {}
-                    (Some(DialogHit::FieldStep(..) | DialogHit::Close), Some(owner)) => {
-                        self.hold_settings_press(owner, mouse)
-                    }
+                    (
+                        Some(
+                            DialogHit::FieldStep(..) | DialogHit::FieldReset(_) | DialogHit::Close,
+                        ),
+                        Some(owner),
+                    ) => self.hold_settings_press(owner, mouse),
                     (Some(DialogHit::Category(index)), _) => self.in_settings(|_, workspace| {
                         workspace.view.set_focus(Focus::Categories);
                         Self::request_category(workspace, index);

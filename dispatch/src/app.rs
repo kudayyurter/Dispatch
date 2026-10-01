@@ -15430,6 +15430,36 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
+    fn mouse_only_the_sidebar_width_is_reset() {
+        use dispatch_config::ui_state::{self, DEFAULT_SIDEBAR};
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        app.keep_ui_in(&dir);
+        app.sidebar_width = DEFAULT_SIDEBAR + 6;
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "[ Settings ]") + 2, y);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(workspace(&app).view.category(), 0, "Mouse & layout");
+
+        let layout = app.settings_layout().expect("open");
+        let reset = layout
+            .actions
+            .iter()
+            .find(|(_, id)| *id == pointer::ButtonId::ResetSidebar)
+            .expect("the Reset row's button is clickable")
+            .0;
+        click_rect(&mut app, reset);
+
+        assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR);
+        assert_eq!(ui_state::load(&dir).sidebar_width, DEFAULT_SIDEBAR);
+        assert!(matches!(app.overlay, Some(Overlay::Preferences(_))));
+    }
+
+    #[test]
     fn show_sidebar_in_a_narrow_window_toggles_the_drawer() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
@@ -15601,11 +15631,18 @@ args = ["--effort", "{value}"]
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
         assert!(app.status.is_error());
+        // It says what happens next, which is that the user's own choice is
+        // still the one pending: Apply writes it, Discard takes theirs.
+        let message = &app.status.text;
         assert!(
-            app.status.text.contains("newer value"),
-            "{}",
-            app.status.text
+            message.starts_with("theme changed elsewhere since you opened Settings"),
+            "{message}"
         );
+        assert!(
+            message.contains("Apply again to replace it with yours"),
+            "{message}"
+        );
+        assert!(message.contains("Discard to take it"), "{message}");
 
         // Their value is the committed one now; the user's edit is still
         // pending over it.
@@ -15755,6 +15792,135 @@ args = ["--effort", "{value}"]
             Some(dispatch_config::preferences::Accent::Custom(
                 dispatch_config::preferences::Rgb8(0xff, 0x88, 0x00)
             ))
+        );
+    }
+
+    #[test]
+    fn stepping_back_to_the_inherited_theme_leaves_nothing_pending() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+
+        assert_eq!(
+            workspace(&app).draft.appearance.theme,
+            None,
+            "inherited again"
+        );
+        assert!(workspace(&app).draft == workspace(&app).base);
+        drawn(&mut app, &mut terminal);
+        assert!(!offers_apply(&app), "nothing is pending");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none(), "and closing does not ask");
+        assert!(!dir.join(dispatch_config::preferences::FILE).exists());
+    }
+
+    #[test]
+    fn motion_flipped_twice_is_not_a_change() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|f| f.id),
+            Some("motion")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(workspace(&app).draft.interface.motion, Some(false));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            workspace(&app).draft.interface.motion,
+            None,
+            "config.toml and the default decide it again"
+        );
+        assert!(workspace(&app).draft == workspace(&app).base);
+    }
+
+    /// Keeps preferences in a fresh directory whose `preferences.toml` already
+    /// holds `contents`.
+    fn with_preferences_holding(app: &mut App, contents: &str) -> PathBuf {
+        let dir = scratch("settings-held");
+        std::fs::write(dir.join(dispatch_config::preferences::FILE), contents)
+            .expect("the file is written");
+        app.keep_preferences_in(
+            &dir,
+            dispatch_config::InterfaceConfig::default(),
+            dispatch_config::InterfaceKeysPresent::default(),
+        );
+        dir
+    }
+
+    #[test]
+    fn backspace_resets_a_field_to_what_it_inherits() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences_holding(&mut app, "[appearance]\ntheme = \"dark\"\n");
+        app.apply_stored_appearance();
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            workspace(&app)
+                .view
+                .selected_field()
+                .map(|f| f.source.as_str()),
+            Some("Settings")
+        );
+        press(&mut app, KeyCode::Backspace);
+
+        let open = workspace(&app);
+        assert_eq!(open.draft.appearance.theme, None);
+        let field = open.view.selected_field().expect("Theme is selected");
+        assert_eq!(field.source, "Built-in", "it shows what it inherits");
+        assert_eq!(field.value, "Follow terminal");
+        assert!(field.changed);
+        assert_eq!(
+            app.theme.palette(),
+            app.terminal_palette,
+            "the inherited theme is previewed"
+        );
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(saved.appearance.theme, None, "Apply removed it");
+    }
+
+    #[test]
+    fn the_reset_control_resets_a_field_with_the_mouse() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences_holding(&mut app, "[appearance]\nicons = \"plain\"\n");
+        let mut terminal = a_wide_terminal();
+        open_appearance_by_keys(&mut app);
+        drawn(&mut app, &mut terminal);
+        let layout = app.settings_layout().expect("open");
+        // Icons is the fourth Appearance row, and the only one set here.
+        assert_eq!(
+            layout
+                .resets
+                .iter()
+                .map(|(_, row)| *row)
+                .collect::<Vec<_>>(),
+            [3],
+            "only a field Settings set can be reset"
+        );
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Settings ↺"), "{text}");
+        click_rect(&mut app, layout.resets[0].0);
+
+        assert_eq!(workspace(&app).draft.appearance.icons, None);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|f| f.id),
+            Some("icons")
         );
     }
 

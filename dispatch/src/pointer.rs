@@ -101,6 +101,9 @@ pub enum DialogHit {
     /// A field's `‹` (false) or `›` (true), with its index among the rows
     /// shown. A compact category arrow carries `usize::MAX`.
     FieldStep(usize, bool),
+    /// A field's reset control, which puts it back to what it inherits, by
+    /// its index among the rows shown.
+    FieldReset(usize),
     /// The Settings search row.
     Search,
     /// The Settings `[×]`.

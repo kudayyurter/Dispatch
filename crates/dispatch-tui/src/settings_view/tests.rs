@@ -15,6 +15,7 @@ fn view() -> SettingsView {
         applies: "Applies now",
         changed: false,
         conflict: false,
+        resettable: false,
     };
     SettingsView::new(
         vec![
@@ -221,6 +222,7 @@ fn the_list_keeps_its_place_until_the_selection_leaves_it() {
             applies: "Read only",
             changed: false,
             conflict: false,
+            resettable: false,
         })
         .collect();
     let mut view = SettingsView::new(vec!["All".into()], fields);

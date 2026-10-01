@@ -66,6 +66,8 @@ pub struct FieldView {
     pub changed: bool,
     /// Changed on disk by something else since it was loaded.
     pub conflict: bool,
+    /// Set in Settings, so it can be put back to what it would inherit.
+    pub resettable: bool,
 }
 
 /// Which part of the workspace has the keyboard.
@@ -95,7 +97,13 @@ pub struct SettingsLayout {
     /// A `‹` (false) or `›` (true) with its row's index among the rows shown.
     /// A compact category arrow has index `usize::MAX`.
     pub steps: Vec<(Rect, usize, bool)>,
+    /// The source of a field Settings set, which puts it back to what it
+    /// inherits, with its row's index among the rows shown.
+    pub resets: Vec<(Rect, usize)>,
+    /// The footer's buttons.
     pub buttons: Vec<(Rect, ButtonId)>,
+    /// The `[ … ]` of each Action row drawn, with the button it presses.
+    pub actions: Vec<(Rect, ButtonId)>,
 }
 
 /// The layout and the few extra measurements drawing needs, worked out once
@@ -498,12 +506,26 @@ impl SettingsView {
             .unwrap_or(0)
     }
 
-    fn source_text(field: &FieldView) -> &str {
+    /// What the source column says. A field Settings set carries `↺`, the
+    /// control that resets it, so the click target is visible.
+    fn source_text(field: &FieldView) -> String {
         if field.conflict {
-            "changed elsewhere"
+            "changed elsewhere".to_string()
+        } else if field.resettable {
+            format!("{} ↺", field.source)
         } else {
-            &field.source
+            field.source.clone()
         }
+    }
+
+    /// Where a row's source is drawn, and what it says, cut to its column.
+    fn source_span(field: &FieldView, row: Rect, plan: &Plan) -> Option<(u16, String)> {
+        if plan.source_width == 0 {
+            return None;
+        }
+        let source = truncate(&Self::source_text(field), plan.source_width);
+        let x = row.right().saturating_sub(1 + cols(source.width()));
+        Some((x, source))
     }
 
     /// What is drawn for a field's value, and where it starts.
@@ -694,6 +716,21 @@ impl SettingsView {
             let rows: Vec<(Rect, usize)> = plan.layout.fields.clone();
             for (row, position) in rows {
                 let field = &self.fields[plan.shown[position]];
+                if field.resettable
+                    && !field.conflict
+                    && let Some((x, text)) = Self::source_span(field, row, &plan)
+                {
+                    plan.layout
+                        .resets
+                        .push((Rect::new(x, row.y, cols(text.width()), 1), position));
+                }
+                if let FieldKind::Action(id) = field.kind
+                    && let Some((x, text)) = self.value_span(field, false, row, &plan)
+                {
+                    plan.layout
+                        .actions
+                        .push((Rect::new(x, row.y, cols(text.width()), 1), id));
+                }
                 if !field.kind.steps() {
                     continue;
                 }
@@ -1026,8 +1063,10 @@ impl Widget for &SettingsView {
             if let Some((vx, value)) = self.value_span(field, chosen, *row, &plan) {
                 let style = match field.kind {
                     FieldKind::ReadOnly => base.patch(chrome.secondary),
-                    FieldKind::Action(_) => {
-                        if barred {
+                    // Held under the pointer, it shows pressed as a footer
+                    // button does.
+                    FieldKind::Action(id) => {
+                        if barred || self.pressed == Some(id) {
                             chrome.selection
                         } else {
                             chrome.accent
@@ -1037,10 +1076,7 @@ impl Widget for &SettingsView {
                 };
                 write(buf, *row, vx, row.y, &value, style);
             }
-            if plan.source_width > 0 {
-                let source = SettingsView::source_text(field);
-                let source = truncate(source, plan.source_width);
-                let sx = row.right().saturating_sub(1 + cols(source.width()));
+            if let Some((sx, source)) = SettingsView::source_span(field, *row, &plan) {
                 write(
                     buf,
                     *row,
@@ -1057,7 +1093,10 @@ impl Widget for &SettingsView {
         }
 
         if let (Some(row), Some(field)) = (plan.description, self.selected_field()) {
-            let text = format!("{} · {}", field.description, field.applies);
+            let mut text = format!("{} · {}", field.description, field.applies);
+            if field.resettable {
+                text.push_str(" · Backspace resets");
+            }
             put(
                 buf,
                 row,

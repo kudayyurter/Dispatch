@@ -169,8 +169,9 @@ you press `[ Apply ]`, which writes only the section you changed to
 another category, or closing, with changes pending asks whether to Apply,
 Discard or Keep editing. The footer counts the changes, as in
 `2 changes in Appearance`. If `preferences.toml` was changed by something else
-since Settings opened, Apply writes nothing, marks the fields concerned
-`changed elsewhere`, and shows the newer value; apply again to write yours.
+since Settings opened, Apply writes nothing and marks the fields concerned
+`changed elsewhere`. Your edit stays pending: apply again to replace the newer
+value with yours, or discard to take the newer one.
 
 The sidebar rows are the exception: they act at once and are saved to
 `ui.toml`, as dragging the edge and `Alt s` do, and they are never pending. In
