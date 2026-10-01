@@ -2178,6 +2178,16 @@ impl App {
                 self.state.set_reported(pane, true);
                 true
             }
+            // Some window, perhaps this one, kept the pane: the mark goes
+            // everywhere, along with a question about it still open here.
+            ServerMessage::SubagentKept { pane } => {
+                self.state.set_reported(pane, false);
+                if matches!(self.overlay, Some(Overlay::Reported { pane: asked, .. }) if asked == pane)
+                {
+                    self.overlay = None;
+                }
+                true
+            }
         }
     }
 
@@ -2760,14 +2770,9 @@ impl App {
         {
             self.expanded.insert(id);
         }
-        // Looking at a pane that has reported is the natural moment to ask
-        // what to do with it, but never over a question already open.
-        if self.overlay.is_none() && self.state.pane(id).is_some_and(|pane| pane.reported) {
-            self.overlay = Some(Overlay::Reported {
-                pane: id,
-                prompt: reported_prompt(),
-            });
-        }
+        // A reported pane is not asked about here: focus follows the
+        // pointer, so passing over the pane would open a question one `y`
+        // from killing it. The status row's reopen key asks instead.
     }
 
     /// Asks about the first reported subagent, if there is one.
@@ -2800,9 +2805,17 @@ impl App {
                 self.overlay = None;
                 self.close_pane(pane);
             }
+            // Told to the daemon, which would otherwise mark the pane again
+            // in every window that next subscribes, this one included.
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.overlay = None;
                 self.state.set_reported(pane, false);
+                if let Some(daemon) = self
+                    .attachment_for_pane(pane)
+                    .map(|attachment| attachment.client.handle())
+                {
+                    daemon.send(ClientMessage::KeepReported { pane });
+                }
             }
             _ => {}
         }
@@ -11454,11 +11467,45 @@ mod tests {
 
         assert!(app.overlay.is_none());
         assert!(!app.state.pane(child).expect("still listed").reported);
+        let told: Vec<ClientMessage> = sent.try_iter().collect();
         assert!(
-            !sent
-                .try_iter()
+            !told
+                .iter()
                 .any(|m| matches!(m, ClientMessage::ClosePane { .. })),
             "nothing is closed"
+        );
+        assert!(
+            told.contains(&ClientMessage::KeepReported { pane: child }),
+            "the daemon is told, or the question comes back on reconnect: {told:#?}"
+        );
+    }
+
+    #[test]
+    fn focusing_a_reported_subagent_does_not_ask() {
+        // Focus follows the pointer, so a pane is focused by passing over
+        // it: a question one `y` from killing the pane must not open that way.
+        let (mut app, child, _daemon, _sent) = app_with_a_reported_child();
+
+        app.focus_pane(child);
+
+        assert!(app.overlay.is_none(), "no question opens on focus");
+        assert!(app.state.pane(child).expect("listed").reported);
+    }
+
+    #[test]
+    fn a_subagent_kept_in_another_window_loses_its_mark_here() {
+        let (mut app, child, daemon, _sent) = app_with_a_reported_child();
+        app.open_next_reported();
+
+        daemon
+            .send(ServerMessage::SubagentKept { pane: child })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(!app.state.pane(child).expect("still listed").reported);
+        assert!(
+            app.overlay.is_none(),
+            "the question another window answered is withdrawn"
         );
     }
 

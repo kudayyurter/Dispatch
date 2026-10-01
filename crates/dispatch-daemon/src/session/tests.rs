@@ -6638,3 +6638,177 @@ fn a_harness_without_an_interactive_form_refuses_interactive() {
     let reason = refusal(&drain(&caller)).expect("refused");
     assert!(reason.contains("[task.interactive]"), "{reason}");
 }
+
+/// A daemon under `interactive_on_done = "ask"` with a window subscribed as
+/// client 1, an interactive subagent that has reported, and the window's
+/// inbox drained.
+#[cfg(unix)]
+fn reported_under_ask(label: &str) -> (Daemon, TempDir, Inbox, PaneId) {
+    let limits = DelegationLimits {
+        interactive_on_done: dispatch_config::OnDone::Ask,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, dir) = daemon_with_limits(label, limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+    (daemon, dir, ui, child)
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_reported_subagent_tells_every_window() {
+    let (mut daemon, _dir, ui, child) = reported_under_ask("keep-reported");
+    let other = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let _ = drain(&other);
+
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: child });
+
+    for inbox in [&ui, &other] {
+        assert!(
+            drain(inbox)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::SubagentKept { pane } if *pane == child)),
+            "every window hears it was kept"
+        );
+    }
+    assert_eq!(daemon.pane_count(), 2, "kept, not closed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_window_attaching_after_a_keep_is_not_asked_again() {
+    let (mut daemon, _dir, _ui, child) = reported_under_ask("keep-then-attach");
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: child });
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    assert!(
+        !drain(&late)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { .. })),
+        "the user already answered"
+    );
+
+    // Kept for good: a second report is still refused.
+    let again = report_from(&mut daemon, 21, child, "again");
+    assert!(matches!(
+        report_outcome(&drain(&again)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("already reported")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_pane_that_is_not_waiting_is_ignored() {
+    let (mut daemon, project, _dir) = daemon("keep-not-waiting");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let top = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: top });
+
+    assert!(
+        !drain(&ui).iter().any(|m| matches!(
+            m,
+            ServerMessage::SubagentKept { .. } | ServerMessage::Error { .. }
+        )),
+        "nothing to keep, and nothing wrong with asking"
+    );
+}
+
+#[test]
+fn keeping_an_unknown_pane_is_an_error() {
+    let (mut daemon, _project, _dir) = daemon("keep-unknown");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::KeepReported {
+            pane: PaneId::new(),
+        },
+    );
+
+    assert!(drain(&ui).iter().any(|m| matches!(
+        m,
+        ServerMessage::Error {
+            error: ProtocolError::NoSuchPane(_)
+        }
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_report_to_a_caller_that_has_gone_leaves_the_pane_alone() {
+    let (mut daemon, project, _dir) = daemon("report-caller-gone");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    // The caller's connection ends, and a reply to it fails before its
+    // detach is handled: the daemon forgets the client without abandoning
+    // what it asked for, so the pane still names it.
+    drop(caller);
+    daemon.request_for_test(9, ClientMessage::Ping { token: 1 });
+
+    let late = report_from(&mut daemon, 20, child, "nobody");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+    assert_eq!(daemon.pane_count(), 2, "not closed by a report nobody got");
+    let _ = drain(&ui);
+
+    // Not marked reported either: once the detach is handled, a report it
+    // sends is told the same, not that it already reported.
+    daemon.detach_for_test(9);
+    daemon.tick();
+    let again = report_from(&mut daemon, 21, child, "still nobody");
+    assert!(matches!(
+        report_outcome(&drain(&again)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_outlives_its_parents_pane() {
+    let (mut daemon, project, _dir) = daemon("interactive-parent-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: parent });
+
+    assert!(
+        !drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane } if *pane == child)),
+        "the user may be working in it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "the parent went, the child stayed");
+    assert!(daemon.pane_size_for_test(child).is_some());
+}

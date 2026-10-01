@@ -55,6 +55,11 @@ pub struct DaemonPane {
     pub interactive: bool,
     /// Whether it has sent its report. A second one is refused.
     pub reported: bool,
+    /// Whether it has reported under `interactive_on_done = "ask"` and the
+    /// user has not yet answered. Kept apart from `reported`, which never
+    /// clears: keeping the pane answers the question, but a second report is
+    /// still refused.
+    pub awaiting_decision: bool,
 }
 
 impl DaemonPane {

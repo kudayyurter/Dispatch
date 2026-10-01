@@ -204,10 +204,14 @@ Windows interactive form until one is shown to be safe.
   `Ctrl p x` does.
 - **On report**, with `"ask"`: the pane stays open and is marked
   **reported**. It gets its own glyph and colour in the sidebar, and the status
-  row counts reported panes as it counts blocked ones. Focusing it, or the
-  status row's reopen key, shows: "Subagent finished and sent its report.
-  Close this pane?" `y` closes it. `n` clears the mark and leaves an ordinary
-  pane the user can go on talking to.
+  row counts reported panes as it counts blocked ones. Only the status row's
+  reopen key shows: "Subagent finished and sent its report. Close this
+  pane?" Focusing the pane does not, because focus follows the pointer and
+  passing over the pane would open a question one `y` from killing it. `y`
+  closes it. `n` clears the mark and leaves an ordinary pane the user can go
+  on talking to; the window tells the daemon (`KeepReported`), which tells
+  every window (`SubagentKept`) and stops replaying `SubagentReported` to
+  windows that subscribe later.
 - **Never closed under the user.** An interactive subagent is never ended
   because its caller went away. One-shot subagents still are, as today
   (`abandon`).
@@ -238,13 +242,16 @@ All new fields carry `#[serde(default)]`, following `message.rs`.
 - `ClientMessage::DelegateRequest` gains `handoff: Option<Handoff>` and
   `interactive: bool`. `task` stays, and a request carrying only `task` is
   refused with the same reason the command gives.
-- `Handoff` holds the five sections and the full text, so the approval prompt
-  can show sections and the subagent gets the file verbatim.
+- `Handoff` holds the five sections, the text before the first heading
+  (`preamble`), and the full text, so the approval prompt can show
+  everything the subagent will read and the subagent gets the file verbatim.
 - New `ClientMessage::DelegateReport { pane: PaneId, report: String }`.
 - `ServerMessage::DelegateFinished` gains `report: Option<String>`.
 - `ServerMessage::DelegatePending` gains `handoff: Option<Handoff>` and
   `interactive: bool`, for the approval prompt.
 - New `ServerMessage::SubagentReported { pane: PaneId }`, for `"ask"`.
+- New `ClientMessage::KeepReported { pane: PaneId }`, the user's `n`, and
+  `ServerMessage::SubagentKept { pane: PaneId }`, its answer to every window.
 - The protocol version stays 1.1: `dispatch-proto` bumps it only for a change
   an older peer cannot safely ignore, and optional fields and new messages are
   not such a change.
@@ -253,7 +260,9 @@ All new fields carry `#[serde(default)]`, following `message.rs`.
 
 The prompt shows the five sections under their headings, in a fixed order
 (Goal, Done when, Constraints, Context, Report back: what the user needs to
-judge first comes first), and marks an interactive request as such. A long
+judge first comes first), and marks an interactive request as such. Text before
+the first heading goes to the subagent too, so when there is any it is shown
+first, under "Before the sections". A long
 handoff wraps and scrolls as a long task does today.
 
 ## Configuration

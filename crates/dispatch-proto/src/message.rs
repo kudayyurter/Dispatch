@@ -310,6 +310,19 @@ pub enum ClientMessage {
         report: String,
     },
 
+    /// The user chose to keep an interactive subagent that reported, rather
+    /// than close it.
+    ///
+    /// Told to the daemon rather than settled in the one window that asked:
+    /// the daemon replays [`ServerMessage::SubagentReported`] to every client
+    /// that subscribes, so a choice kept locally would come back on the next
+    /// reconnect and in every other window. An older daemon skips it as
+    /// `Unknown`, and the question returns there as it always did.
+    KeepReported {
+        /// Which pane.
+        pane: PaneId,
+    },
+
     /// Moves a top-level pane to another tab, or onto a new one.
     MovePane {
         /// Which pane.
@@ -560,6 +573,18 @@ pub enum ServerMessage {
     /// Its own message rather than a new [`PaneStatus`]: an older client
     /// skips an unknown message, and loses only the mark.
     SubagentReported {
+        /// Which pane.
+        pane: PaneId,
+    },
+
+    /// A reported subagent is to be kept: some window answered
+    /// [`ServerMessage::SubagentReported`] with [`ClientMessage::KeepReported`].
+    ///
+    /// Sent to every subscriber so the mark, and any question still open
+    /// about the pane, clears in every window and not only the one that
+    /// answered. An older client skips it as `Unknown` and keeps its mark
+    /// until it next reconnects.
+    SubagentKept {
         /// Which pane.
         pane: PaneId,
     },

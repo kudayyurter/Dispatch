@@ -761,11 +761,11 @@ impl Daemon {
                 }
 
                 // A reported pane waiting on the user's decision is marked in
-                // every window, a late one included.
-                if self.limits.interactive_on_done == dispatch_config::OnDone::Ask {
-                    for pane in self.panes.values().filter(|p| p.interactive && p.reported) {
-                        existing.push(ServerMessage::SubagentReported { pane: pane.id });
-                    }
+                // every window, a late one included; one the user chose to
+                // keep is not, or the question would come back on every
+                // reconnect.
+                for pane in self.panes.values().filter(|p| p.awaiting_decision) {
+                    existing.push(ServerMessage::SubagentReported { pane: pane.id });
                 }
 
                 // Every project's tabs, empty ones included: a client that
@@ -885,6 +885,7 @@ impl Daemon {
             } => self.delegate_request(id, parent, harness, handoff, interactive, size),
 
             ClientMessage::DelegateReport { pane, report } => self.report(id, pane, report),
+            ClientMessage::KeepReported { pane } => self.keep_reported(id, pane),
 
             ClientMessage::DelegateDecision {
                 request,
@@ -1197,6 +1198,7 @@ impl Daemon {
             branch: None,
             interactive: false,
             reported: false,
+            awaiting_decision: false,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -1685,11 +1687,23 @@ impl Daemon {
             self.send(client, answer(ReportOutcome::NotWaiting { reason }));
             return;
         };
+        // A caller whose connection failed a send is forgotten at once, but
+        // what it asked for is only let go once its detach is handled. A
+        // report in between would be delivered to nobody and then close the
+        // pane, so it is told nobody is waiting and the pane is left as it
+        // was, for the detach to settle.
+        if !self.clients.contains_key(&caller) {
+            let reason = "the agent that asked is no longer waiting".to_string();
+            self.send(client, answer(ReportOutcome::NotWaiting { reason }));
+            return;
+        }
 
         target.request = None;
         target.caller = None;
         target.reported = true;
         let interactive = target.interactive;
+        let ask = interactive && self.limits.interactive_on_done == dispatch_config::OnDone::Ask;
+        target.awaiting_decision = ask;
 
         self.send(
             caller,
@@ -1712,6 +1726,29 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Records that the user chose to keep a reported subagent, and tells
+    /// every window so the mark clears everywhere and stays cleared for a
+    /// window that attaches later.
+    ///
+    /// A pane not waiting on that choice is ignored rather than refused: two
+    /// windows answering the same question at once is not a mistake.
+    fn keep_reported(&mut self, client: ClientId, pane: PaneId) {
+        let Some(target) = self.panes.get_mut(&pane) else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+        if !target.awaiting_decision {
+            return;
+        }
+        target.awaiting_decision = false;
+        self.broadcast(ServerMessage::SubagentKept { pane });
     }
 
     /// Starts an approved subagent and tells everyone.
@@ -1896,6 +1933,7 @@ impl Daemon {
                 branch: None,
                 interactive,
                 reported: false,
+                awaiting_decision: false,
             },
         );
 

@@ -951,6 +951,7 @@ fn the_handoff_messages_round_trip() {
             pane,
             report: "done".into(),
         },
+        ClientMessage::KeepReported { pane },
     ];
     for message in &messages {
         assert_eq!(&round_trip(message), message);
@@ -969,6 +970,7 @@ fn the_handoff_messages_round_trip() {
             },
         },
         ServerMessage::SubagentReported { pane },
+        ServerMessage::SubagentKept { pane },
     ];
     for message in &server {
         assert_eq!(&round_trip(message), message);
@@ -1023,9 +1025,55 @@ fn an_older_client_skips_the_report_messages() {
         ServerMessage::ReportAnswered {
             outcome: ReportOutcome::Delivered,
         },
+        ServerMessage::SubagentKept {
+            pane: PaneId::new(),
+        },
     ] {
         let bytes = rmp_serde::to_vec_named(&message).expect("encodes");
         let decoded: Old = rmp_serde::from_slice(&bytes).expect("an older peer decodes it");
         assert!(matches!(decoded, Old::Unknown));
     }
+}
+
+#[test]
+fn an_older_daemon_skips_keep_reported() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Old {
+        Ping {},
+        #[serde(other)]
+        Unknown,
+    }
+
+    let bytes = rmp_serde::to_vec_named(&ClientMessage::KeepReported {
+        pane: PaneId::new(),
+    })
+    .expect("encodes");
+    let decoded: Old = rmp_serde::from_slice(&bytes).expect("an older peer decodes it");
+    assert!(matches!(decoded, Old::Unknown));
+}
+
+#[test]
+fn a_handoff_from_an_older_build_has_an_empty_preamble() {
+    #[derive(serde::Serialize)]
+    struct Old {
+        goal: String,
+        context: String,
+        constraints: String,
+        done_when: String,
+        report_back: String,
+        text: String,
+    }
+
+    let bytes = rmp_serde::to_vec_named(&Old {
+        goal: "g".into(),
+        context: "c".into(),
+        constraints: "None.".into(),
+        done_when: "d".into(),
+        report_back: "r".into(),
+        text: "Intro.\n## Goal\ng\n".into(),
+    })
+    .expect("encodes");
+    let decoded: dispatch_core::Handoff = rmp_serde::from_slice(&bytes).expect("decodes");
+    assert_eq!(decoded.preamble, "");
 }

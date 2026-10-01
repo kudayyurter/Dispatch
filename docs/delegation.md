@@ -36,11 +36,12 @@ headings and text before the first one; they go through as written. The limit is
 64 KiB.
 
 Dispatch asks you first, every time — unless you have approved that pane
-wholesale with `A`, which lasts until the daemon stops. The prompt shows the five
-sections, Goal and Done when first. The subagent runs as a pane under the one
-that asked, and the caller gets its report, or its output and exit code, when it
-finishes. Focus stays where it was: `Ctrl p s` (or `^a s`) brings the
-subagent into the grid to watch it, and `Ctrl p c` (or `^a c`) puts it back.
+wholesale with `A`, which lasts until the daemon stops. The prompt shows any text
+above the first heading, then the five sections, Goal and Done when first. The
+subagent runs as a pane under the one that asked, and the caller gets its report,
+or its output and exit code, when it finishes. Focus stays where it was:
+`Ctrl p s` (or `^a s`) brings the subagent into the grid to watch it, and
+`Ctrl p c` (or `^a c`) puts it back.
 
 The subagent receives the handoff word for word, after a short preamble that
 says who started it, that nobody can answer questions while it works, and how to
@@ -133,12 +134,14 @@ one that tries, and says why.
 When the subagent runs `dispatch report`, what happens to its pane follows
 `interactive_on_done`. `"close"`, the default, closes the pane once the report
 has been delivered, as `Ctrl p x` would. `"ask"` keeps it open, marked as
-reported in the sidebar, and asks "Close this pane?": `y` closes it, `n` leaves it
-as an ordinary pane you can keep talking to. Dispatch never closes an interactive
-subagent under you for any other reason, not even if the agent that asked has
-gone. If that agent has gone before the report, `dispatch report` exits 75 and the
-pane stays. If the interface exits without reporting, the caller gets exit 75 and
-no tail, because a full-screen interface's raw bytes are not readable output.
+reported in the sidebar, and the status line's reopen key asks "Close this
+pane?": `y` closes it, `n` leaves it as an ordinary pane you can keep talking to,
+in every window. Focusing the pane does not ask, since focus follows the mouse.
+Dispatch never closes an interactive subagent under you for any other reason, not
+even if the agent that asked has gone. If that agent has gone before the report,
+`dispatch report` exits 75 and the pane stays. If the interface exits without
+reporting, the caller gets exit 75 and no tail, because a full-screen interface's
+raw bytes are not readable output.
 
 An interactive subagent that never reports keeps its caller waiting, until the
 24-hour backstop in `dispatch delegate`. You will see it sitting idle in the
