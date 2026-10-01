@@ -8,14 +8,6 @@ args = []
 command = "cmd.exe"
 args = ["/c", "agy"]
 
-# `dispatch delegate --interactive` starts the agent's own interface with
-# the handoff as its first prompt, so it can be watched and typed into. It
-# says it is finished by running `dispatch report`. There is no Windows form:
-# the prompt would sit on cmd.exe's command line, and an interactive agent
-# cannot read it from a file instead.
-[task.interactive]
-args = ["-i", "{task}"]
-
 # Each setting's args go after the launch's own, with {value} replaced by
 # what was chosen. Unset passes nothing and leaves the choice to agy.
 #

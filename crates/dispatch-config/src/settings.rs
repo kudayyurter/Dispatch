@@ -503,6 +503,20 @@ impl HarnessDef {
         Some(run)
     }
 
+    /// The interactive launch of `task` on `os`, with the flags and variables
+    /// `values` turn on added after its own, as for any pane.
+    #[must_use]
+    pub fn interactive_launch_with(
+        &self,
+        os: &str,
+        task: &str,
+        values: &Choices,
+    ) -> Option<Launch> {
+        let mut launch = self.interactive_launch_for(os, task)?;
+        self.apply_settings(&mut launch, values);
+        Some(launch)
+    }
+
     /// Each value in `values` that differs from the file's default, as the
     /// new-pane picker names it beside the harness: an option by its label,
     /// typed text as itself, agent default and flags by the setting's label.

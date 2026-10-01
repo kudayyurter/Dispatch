@@ -444,6 +444,24 @@ fn a_one_shot_run_gets_the_flags_after_its_task() {
 }
 
 #[test]
+fn an_interactive_launch_gets_the_saved_settings_too() {
+    let def: crate::HarnessDef = toml::from_str(
+        "id = \"agent\"\ndisplay_name = \"Agent\"\ncommand = \"agent\"\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\n\n\
+         [task.interactive]\nargs = [\"{task}\"]\n\n\
+         [[settings]]\nkey = \"model\"\nlabel = \"Model\"\nkind = \"text\"\nargs = [\"--model\", \"{value}\"]\n",
+    )
+    .expect("valid");
+    let mut values = Choices::new();
+    values.insert("model".into(), "opus".into());
+
+    let launch = def
+        .interactive_launch_with("linux", "the brief", &values)
+        .expect("has a form");
+    assert_eq!(launch.args, vec!["the brief", "--model", "opus"]);
+}
+
+#[test]
 fn a_windows_file_form_keeps_its_redirect_and_gets_the_flags() {
     // cmd.exe reads a redirect wherever it stands, so flags after it still
     // reach the agent, and the task still never touches the command line.

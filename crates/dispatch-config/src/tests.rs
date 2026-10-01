@@ -1504,3 +1504,68 @@ fn opencodes_model_reaches_it_through_a_private_server() {
         "with no model chosen, the pane uses the shared service"
     );
 }
+
+fn interactive_harness() -> HarnessDef {
+    toml::from_str(
+        "id = \"agent\"\ndisplay_name = \"Agent\"\ncommand = \"agent\"\n\n\
+         [platform.windows]\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"agent\"]\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\n\n\
+         [task.interactive]\nargs = [\"-i\", \"{task}\"]\n\n\
+         [task.interactive.platform.windows]\nargs = [\"/c\", \"agent\", \"-i\", \"{task}\"]\n",
+    )
+    .expect("valid")
+}
+
+#[test]
+fn an_interactive_form_puts_the_task_in_its_arguments() {
+    let launch = interactive_harness()
+        .interactive_launch_for("linux", "the brief")
+        .expect("has a form");
+    assert_eq!(launch.command, "agent");
+    assert_eq!(launch.args, vec!["-i".to_string(), "the brief".to_string()]);
+}
+
+#[test]
+fn a_harness_without_an_interactive_form_has_none() {
+    let mut def = interactive_harness();
+    def.task.as_mut().expect("has [task]").interactive = None;
+    assert!(def.interactive_launch_for("linux", "x").is_none());
+}
+
+#[test]
+fn an_interactive_form_that_never_names_the_task_is_no_form() {
+    let mut def = interactive_harness();
+    def.task.as_mut().expect("has [task]").interactive = Some(InteractiveLaunch {
+        args: vec!["-i".into()],
+        platform: Default::default(),
+    });
+    assert!(
+        def.interactive_launch_for("linux", "x").is_none(),
+        "the handoff would never reach the agent"
+    );
+}
+
+#[test]
+fn an_interactive_form_through_cmd_is_refused_on_windows() {
+    let def = interactive_harness();
+    let launch = def
+        .interactive_launch_for("windows", "x & y")
+        .expect("has a windows form");
+    let reason = def
+        .interactive_refusal_as("windows", &launch)
+        .expect("refused");
+    assert!(reason.contains("cmd.exe"), "{reason}");
+    assert!(def.interactive_refusal_as("linux", &launch).is_none());
+}
+
+#[test]
+fn every_shipped_harness_has_an_interactive_form() {
+    for built_in in crate::defaults::BUILT_INS {
+        let def: HarnessDef = toml::from_str(built_in.toml).expect("ships valid");
+        assert!(
+            def.interactive_launch_for("linux", "the brief").is_some(),
+            "{} ships no [task.interactive]",
+            built_in.id
+        );
+    }
+}

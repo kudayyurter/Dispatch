@@ -36,6 +36,20 @@ pub struct DelegationLimits {
     /// floor by design — an agent on an unattended daemon must not wait for a
     /// person who is not there — so the way to wait longer is a larger number.
     pub request_timeout_secs: u64,
+    /// What happens to an interactive subagent's pane once it has reported.
+    pub interactive_on_done: OnDone,
+}
+
+/// What happens to an interactive subagent's pane once it has reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnDone {
+    /// It closes itself, as a one-shot subagent ends on its own.
+    #[default]
+    Close,
+    /// It stays open, marked as reported, and the user is asked before it
+    /// closes.
+    Ask,
 }
 
 impl Default for DelegationLimits {
@@ -44,6 +58,7 @@ impl Default for DelegationLimits {
             max_depth: 1,
             max_live_per_parent: 4,
             request_timeout_secs: 600,
+            interactive_on_done: OnDone::Close,
         }
     }
 }
@@ -311,7 +326,12 @@ impl Config {
 
 /// Dotted paths of keys Dispatch does not know.
 fn unknown_keys(raw: &toml::Table) -> Vec<String> {
-    const DELEGATION: [&str; 3] = ["max_depth", "max_live_per_parent", "request_timeout_secs"];
+    const DELEGATION: [&str; 4] = [
+        "max_depth",
+        "max_live_per_parent",
+        "request_timeout_secs",
+        "interactive_on_done",
+    ];
     const SHELL: [&str; 3] = ["command", "args", "login"];
 
     let mut unknown = Vec::new();

@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 
 pub use config::{
     Config, DelegationLimits, InterfaceConfig, KeyTable, KeyValue, KeysConfig, LoadedConfig,
-    LoginShell, ShellConfig,
+    LoginShell, OnDone, ShellConfig,
 };
 pub use harness::{
-    ChoiceOption, HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput,
-    TaskLaunch, TaskRun,
+    ChoiceOption, HarnessDef, InteractiveArgs, InteractiveLaunch, Launch, SettingDef, SettingKind,
+    TASK_FILE_ENV, TaskArgs, TaskInput, TaskLaunch, TaskRun,
 };
 pub use settings::{
     Allowed, Choices, MAX_VALUE_CHARS, SAFE_CHARACTERS, allowed, fit_limits, is_safe_char,

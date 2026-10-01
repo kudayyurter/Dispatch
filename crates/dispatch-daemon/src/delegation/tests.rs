@@ -46,6 +46,7 @@ fn raised_caps_are_honoured() {
         max_depth: 2,
         max_live_per_parent: 8,
         request_timeout_secs: 60,
+        ..DelegationLimits::default()
     };
 
     assert_eq!(refusal(1, 7, generous, true, "claude"), None);

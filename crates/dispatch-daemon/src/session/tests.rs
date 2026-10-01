@@ -2391,6 +2391,7 @@ fn approving_more_requests_than_the_cap_allows_starts_only_what_fits() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -2452,6 +2453,7 @@ fn approvals_from_two_interfaces_do_not_share_one_slot() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -2505,6 +2507,7 @@ fn a_blanket_approved_pane_at_its_cap_is_refused_rather_than_started() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -5386,6 +5389,7 @@ fn a_pane_placed_on_a_tab_delegates_under_the_same_cap() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = subscribed(&mut daemon, 1);
