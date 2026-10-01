@@ -206,8 +206,9 @@ effective interface values (`set_motion`, `set_focus_follows_pointer`,
 **Sizing.**
 - ≥100×28: centred, at most 110×34, with a one-cell margin.
 - Smaller: the whole body.
-- Under 72 columns: the category list becomes a category picker, with a Back
-  control on the field page.
+- Under 72 columns: the category list becomes a one-row category switcher
+  (`‹ Appearance ›`) at the top of the field column, so categories and fields
+  stay on one page and no Back control is needed.
 - Under 40×10: a message "Make the window larger to use Settings" and the `[×]`
   only.
 
