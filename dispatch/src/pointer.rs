@@ -107,6 +107,25 @@ pub enum MenuHit {
     Area,
 }
 
+/// A part of the footer that answers a click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterHit {
+    /// The count of panes waiting on the user.
+    Attention,
+    /// The count of delegation requests waiting.
+    Delegations,
+    /// The message, which an error lets the user dismiss.
+    Message,
+    /// The `[ Activity ]` button.
+    Activity,
+    /// The `[ Settings ]` button.
+    Settings,
+    /// Scroll mode's way back to live output.
+    ReturnToLive,
+    /// The `[ Done ]` button of a key mode.
+    LeaveMode,
+}
+
 /// What a cell of the frame belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -123,6 +142,8 @@ pub enum Target {
     PaneMenu(PaneId),
     /// A tile's interior: the child's.
     PaneContent(PaneId),
+    /// A part of the footer row.
+    Footer(FooterHit),
     /// The open menu.
     Menu(MenuHit),
     /// The open dialog.

@@ -552,7 +552,7 @@ fn dispatch_starts_and_draws_its_interface() {
     let mut app = Harness::start(Size::new(100, 30));
 
     assert!(
-        app.wait_for(|lines| contains(lines, "pane(s)")),
+        app.wait_for(|lines| contains(lines, "[ Settings ]")),
         "the status bar should be drawn"
     );
 }
@@ -561,7 +561,7 @@ fn dispatch_starts_and_draws_its_interface() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn the_prefix_is_announced_so_a_keystroke_never_vanishes() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01");
 
@@ -578,7 +578,7 @@ fn a_spawned_pane_runs_a_real_shell_that_echoes() {
     // through a pseudoterminal, and its output is emulated, laid out and
     // painted back.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
 
@@ -595,7 +595,7 @@ fn a_pane_is_told_the_size_of_the_rectangle_it_was_given() {
     // A child that redraws to the wrong size is the most visible bug the
     // layout can have, and only the child can confirm what it was told.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
 
@@ -616,7 +616,7 @@ fn a_second_pane_halves_the_width_of_the_first() {
     // Two panes cut down the middle, which is the specified layout, and both
     // children must learn their new size.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
     app.spawn_shell();
@@ -636,7 +636,7 @@ fn a_second_pane_halves_the_width_of_the_first() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
     app.spawn_shell();
@@ -699,7 +699,7 @@ fn the_browser_opens_beside_the_project_dispatch_was_started_in() {
     std::fs::create_dir_all(&project).expect("temp dir is writable");
 
     let mut app = Harness::spawn_in(&fixture, &project, Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01o");
 
@@ -715,7 +715,7 @@ fn quitting_restores_the_terminal() {
     // A Dispatch that exits without restoring leaves the user with a shell
     // that does not echo.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01q");
 
@@ -738,7 +738,7 @@ fn the_harness_picker_can_be_cancelled() {
     // Escape must leave nothing behind: a picker that dismissed but still
     // swallowed keys would look like Dispatch had frozen.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01n");
     assert!(app.wait_for(|lines| contains(lines, "New pane")));
@@ -761,7 +761,7 @@ fn the_harness_picker_can_be_cancelled() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn the_project_picker_lists_the_open_project() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01p");
     assert!(
@@ -808,7 +808,7 @@ fn the_harness_manager_reports_when_nothing_needs_adding() {
     // manager has nothing to offer and must say so rather than opening an
     // empty box.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01H");
     assert!(
@@ -822,7 +822,7 @@ fn the_harness_manager_reports_when_nothing_needs_adding() {
 fn a_picker_takes_the_keyboard_while_it_is_open() {
     // Arrow keys must choose rather than reach the agent underneath.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
     app.send(b"\x01n");
@@ -856,7 +856,7 @@ fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output()
     // Scrollback is only useful if new output does not yank the view away
     // and there is a plain way back, which in scroll mode is Esc.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.spawn_shell();
 
@@ -870,7 +870,7 @@ fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output()
     // The prefix route into scroll mode, which is what `^a [` became.
     app.send(b"\x01[");
     assert!(
-        app.wait_for(|lines| contains(lines, "SCROLL")),
+        app.wait_for(|lines| contains(lines, "Scrollback")),
         "the prefix then [ opens scroll mode"
     );
 
@@ -883,7 +883,7 @@ fn the_prefix_then_a_bracket_scrolls_back_and_esc_returns_to_the_newest_output()
 
     app.send(b"\x1b");
     assert!(
-        app.wait_for(|lines| contains(lines, "row80") && !contains(lines, "SCROLL")),
+        app.wait_for(|lines| contains(lines, "row80") && !contains(lines, "Scrollback")),
         "Esc returns to the newest output"
     );
 
@@ -996,7 +996,7 @@ fn a_client_waits_for_a_daemon_that_is_restarted() {
     // Named, not "the daemon": the client holds one connection per machine, so
     // the notice has to say which one went quiet.
     assert!(
-        dispatch.wait_for(|lines| contains(lines, "waiting for local")),
+        dispatch.wait_for(|lines| contains(lines, "local unreachable")),
         "the client should say which daemon is gone rather than look alive"
     );
 
@@ -1020,7 +1020,7 @@ fn a_pane_is_named_by_what_its_agent_calls_itself() {
     // An agent says what it is doing with a title sequence. The sidebar should
     // say that rather than the harness's name for the rest of the session.
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
     app.spawn_shell();
     assert!(
         app.wait_for(|lines| contains(lines, "$")),
@@ -1448,7 +1448,7 @@ fn a_machine_asleep_at_startup_joins_when_it_wakes() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn the_picker_offers_the_users_shell_first() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     app.send(b"\x01n");
     assert!(
@@ -1469,7 +1469,7 @@ fn the_picker_offers_the_users_shell_first() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
     app.spawn_shell();
 
     // Ctrl t, then n: the picker, for a pane on a new tab.
@@ -1478,7 +1478,12 @@ fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
     app.send(b"\r");
 
     assert!(
-        app.wait_for(|lines| contains(lines, "tab 2/2")),
+        // The footer no longer counts tabs; the tab row shows the second.
+        app.wait_for(|lines| {
+            lines
+                .first()
+                .is_some_and(|row| row.contains("Test Shell   Shell"))
+        }),
         "the new pane is on a tab of its own"
     );
 }
@@ -1487,7 +1492,7 @@ fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
     app.spawn_shell();
 
     app.send(b"seq -f 'line-%03g' 1 200\r");
@@ -1497,7 +1502,7 @@ fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
     app.send(b"\x13");
     app.send(&[b'k'; 30]);
     assert!(
-        app.wait_for(|lines| contains(lines, "SCROLL") && !contains(lines, "line-200")),
+        app.wait_for(|lines| contains(lines, "Scrollback") && !contains(lines, "line-200")),
         "k scrolls the output back"
     );
 
@@ -1510,7 +1515,7 @@ fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
 
     app.send(b"\x1b");
     assert!(
-        app.wait_for(|lines| contains(lines, "line-200") && !contains(lines, "SCROLL")),
+        app.wait_for(|lines| contains(lines, "line-200") && !contains(lines, "Scrollback")),
         "Esc returns to live output"
     );
 }
@@ -1519,7 +1524,7 @@ fn scroll_mode_reads_a_shells_output_back_and_esc_returns() {
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn lock_mode_gives_the_shell_the_keys_dispatch_takes() {
     let mut app = Harness::start(Size::new(100, 30));
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
     app.spawn_shell();
     // Type-ahead into a shell that has not started yet can be lost.
     assert!(
@@ -1544,7 +1549,7 @@ fn lock_mode_gives_the_shell_the_keys_dispatch_takes() {
     );
     let lines = app.lines();
     assert!(contains(&lines, "LOCKED"), "still locked");
-    assert!(!contains(&lines, "PANE  "), "no pane mode while locked");
+    assert!(!contains(&lines, "[ Done ]"), "no pane mode while locked");
 
     // Ctrl d ends `cat`; Ctrl g unlocks.
     app.send(b"\x04\x07");
@@ -1564,7 +1569,7 @@ fn a_key_rebound_in_config_toml_is_the_one_dispatch_reads() {
     std::fs::write(&config, text).expect("temp dir is writable");
 
     let mut app = Harness::spawn(&fixture, Size::new(100, 30), &[]);
-    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    assert!(app.wait_for(|lines| contains(lines, "[ Settings ]")));
 
     // Ctrl b, then n: the picker, through the moved prefix.
     app.send(b"\x02");

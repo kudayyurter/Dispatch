@@ -493,6 +493,7 @@ impl App {
             | pointer::Target::Tab(_)
             | pointer::Target::PaneHeader(_)
             | pointer::Target::PaneMenu(_)
+            | pointer::Target::Footer(_)
             | pointer::Target::Menu(_)
             | pointer::Target::Dialog(_) => {
                 let still_on = self
@@ -562,6 +563,7 @@ impl App {
             pointer::Target::PaneMenu(id) => {
                 self.open_pane_menu(id, (mouse.column, mouse.row.saturating_add(1)));
             }
+            pointer::Target::Footer(hit) => self.activate_footer(hit),
             // An item acts on its release, like any control.
             pointer::Target::Menu(pointer::MenuHit::Item(index)) => {
                 let action = match &self.overlay {

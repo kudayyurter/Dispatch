@@ -26,7 +26,7 @@ The row across the top names each tab after its first pane's title, or the
 name you give it, with `+` at its end for a new one. Click a tab to go to
 it. When there are more tabs than fit, the row scrolls to keep yours in view.
 
-`Ctrl t` enters tab mode, and the status row lists its keys:
+`Ctrl t` enters tab mode, and its keys are:
 
 | Key | Does |
 |---|---|
@@ -48,8 +48,9 @@ grouped four at a time, as before.
 ## Keys
 
 Keys work the way zellij's do: a `Ctrl` key enters a mode for one kind of
-thing, the status row lists that mode's keys, and `Esc` leaves it. Every
-other key goes to the pane.
+thing, the footer names the mode you are in, and `Esc` leaves it. Every
+other key goes to the pane. The footer does not list keys: `Alt /` does, in
+command help.
 
 | Key | Mode |
 |---|---|
@@ -59,6 +60,30 @@ other key goes to the pane.
 | `Ctrl o` | session: `p` projects, `o` open a project, `m` add a machine, `H` harnesses, `a` approvals, `f` fold, `q` quit, `w` list the agents waiting on you, `b` fold the sidebar, `<` `>` narrow or widen it, `?` command help |
 | `Ctrl g` | lock: every key goes to the pane until `Ctrl g` again |
 | `Ctrl a` | the prefix: one command key, as in tmux — every `^a` command still works, and `^a [` opens scroll mode; `^a w` goes to the next agent waiting on you, `^a b` folds the sidebar, `^a ?` opens command help |
+
+## The footer
+
+The last row says what is going on, left to right:
+
+- `Connected` when Dispatch is attached to a daemon, or, when a machine is down,
+  `laptop unreachable — its agents are still running`. Standalone never says
+  `Connected`.
+- A message, when there is one. A message that reports success goes after five
+  seconds. An error stays until another message replaces it, or you click it.
+- `3 working` for the panes that are running.
+- `2 need attention` for the panes waiting on you; click it to pick one.
+- `1 delegation waiting` for a request from an agent; click it to decide.
+- `[ Activity ]`, then `[ Settings ]` at the right edge. Both are buttons.
+
+A message stands in for `Connected` and the working count. When the row is too
+narrow, parts go in this order: the working count, `Connected`, `[ Activity ]`,
+and then the message is cut with `…`. What needs you, and `[ Settings ]`, are
+kept while they fit.
+
+In a mode the footer shows the mode's name (`PANE`, `TAB`, `SESSION`) and a
+`[ Done ]` button that leaves it. Scroll mode shows `Scrollback · 120 lines above
+live` and `[ Return to live ]`. The prefix shows `PREFIX`. Locked shows
+`LOCKED · Ctrl g unlocks`, with no button: only the key leaves it.
 
 Some keys work without a mode: `Alt n` opens a new pane on this tab,
 `Alt a` goes to the next agent waiting on you, in any project,
@@ -71,9 +96,7 @@ quick `Esc` followed by a letter (as in vim) can reach Dispatch as `Alt` and
 that letter.
 
 A project with nothing open shows how to start: the keys for a new agent, for a
-shell and for command help, as you have them bound. The status row ends with
-the help key in normal mode (not in a mode, while locked, or while a dialog is
-open), whatever else it is saying.
+shell and for command help, as you have them bound.
 
 Four of these keys are newly taken from panes: `Ctrl p` is a shell's
 previous-history key, `Ctrl s` is XON/XOFF flow control's stop, `Ctrl o` is
@@ -164,8 +187,8 @@ answer, and quiet is not finished.
 
 A folded project's row carries the most urgent state among its panes --
 blocked, then done, then working -- and each tab is prefixed the same way, so
-a pane that needs you shows from anywhere. The status row counts the blocked
-panes too: `2 waiting on you`.
+a pane that needs you shows from anywhere. The footer counts the blocked
+panes too: `2 need attention`.
 
 Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
 terminal it runs in.

@@ -45,6 +45,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
+mod footer;
 mod pointer_routing;
 use pointer_routing::MenuAction;
 
@@ -2487,7 +2488,7 @@ impl App {
                 // in `decide`, before this message was ever sent. Substituting
                 // the next request under the user's fingers would risk
                 // approving something they never read; closing and leaving
-                // the reminder (see `draw_status`) is what `decide` itself
+                // the reminder (see `footer_parts`) is what `decide` itself
                 // does for the next request too, except deliberately, only
                 // once the user asks with `^a a`.
                 if showing_this_one {
@@ -4843,7 +4844,7 @@ impl App {
                 sidebar_spun = self.draw_sidebar(frame, Rect::default(), now);
             }
         }
-        self.draw_status(frame, area);
+        self.draw_footer(frame, area, &mut hits);
 
         self.draw_overlay(frame, panes_area, body);
         if let Some(layout) = self.dialog_layout() {
@@ -5944,186 +5945,6 @@ impl App {
             })
             .collect();
         Paragraph::new(text).render(rect, frame.buffer_mut());
-    }
-
-    fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-
-        let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-
-        // Derived live from the queue rather than stamped once when `Esc`
-        // defers: a stamped string can be clobbered by any later write to
-        // `self.status`, and a deadline the daemon enforces means a deferral
-        // whose reminder went missing is decided by inaction — the one
-        // outcome this whole feature exists to prevent. Silent while the
-        // prompt itself is on screen, since it would only repeat what is
-        // already in front of the user.
-        //
-        // Put after `self.status` rather than in its place: a daemon
-        // disconnect or an error is worth knowing about more than a queued
-        // prompt is, and when the daemon is gone the prompt cannot be acted
-        // on anyway, so hiding the disconnect notice behind it would be
-        // exactly backwards.
-        //
-        // The key that reopens it is named as it is bound, and left out when
-        // no key reaches it, rather than naming one that does nothing.
-        let waiting_reminder = (!self.pending.is_empty()
-            && !matches!(self.overlay, Some(Overlay::Approval { .. })))
-        .then(|| {
-            let waiting = format!("{} delegation(s) waiting", self.pending.len());
-            match self.router.keymap().path_to(Command::Approvals) {
-                Some(keys) => format!("{waiting} — {keys}"),
-                None => waiting,
-            }
-        });
-
-        // A blocked pane on another tab, or in a folded project, still needs
-        // to be found; the status row is the one place always on screen, and
-        // it stays said over an overlay, which may be what hides the pane.
-        // Counted from the walk `Alt a` takes, so the number said here is
-        // always the number that key can reach.
-        let blocked = self
-            .pane_order()
-            .into_iter()
-            .filter(|id| self.is_waiting(*id))
-            .count();
-        let blocked_reminder = (blocked > 0).then(|| {
-            let waiting = format!("{blocked} waiting on you");
-            match self.router.keymap().path_to(Command::NextAttention) {
-                Some(keys) => format!("{waiting} — {keys}"),
-                None => waiting,
-            }
-        });
-
-        // Read from the `Device.reachable` `sync_attachment` stamps each poll,
-        // not asked live: this runs every frame, and re-checking the
-        // connection here would mean answering the same question twice — the
-        // sidebar and the refusal path already read this same field, and
-        // disagreeing with them is worse than being a tick stale. Named,
-        // because on a fleet "the daemon" says nothing about which machine
-        // went.
-        let unreachable: Vec<String> = self
-            .state
-            .devices()
-            .iter()
-            .filter(|device| !device.reachable)
-            .map(|device| device.name.clone())
-            .collect();
-
-        // Ahead of `self.status`, which may still hold whatever was happening
-        // when the connection went: a user needs to know the agents are out of
-        // reach more than they need the last message.
-        let lead = if !unreachable.is_empty() {
-            Some(format!(
-                "waiting for {} — its agents are still running",
-                unreachable.join(", ")
-            ))
-        } else if !self.status.is_empty() {
-            Some(self.status.to_string())
-        } else {
-            None
-        };
-
-        let mode = self.router.key_mode();
-        let keymap = self.router.keymap();
-        let text = if mode == KeyMode::Prefix {
-            // A prefix that armed invisibly is how a keystroke goes missing
-            // with no explanation.
-            "PREFIX".to_string()
-        } else if mode == KeyMode::Lock {
-            // Everything the normal row says but its keys, which lock does
-            // not read: a lock can last all afternoon, and a refusal or a
-            // waiting agent hidden behind it for that long is as good as
-            // dropped.
-            std::iter::once(keymap.lock_help())
-                .chain(lead)
-                .chain(waiting_reminder)
-                .chain(blocked_reminder)
-                .collect::<Vec<_>>()
-                .join("  ")
-        } else if mode.is_modal() {
-            // A mode spells out its own keys, from the same table that runs
-            // them. A message goes between its name and its keys: several
-            // keys keep the mode on, and a refusal hidden behind the key list
-            // would make the key look dead.
-            let help = keymap.mode_help(mode);
-            match help.split_once("  ") {
-                Some((title, keys)) if !self.status.is_empty() => {
-                    format!("{title}  {}  {keys}", self.status)
-                }
-                _ => help,
-            }
-        } else {
-            let help = lead.is_none().then(|| {
-                let panes = self.state.visible_panes().len();
-                let tabs = if self.tab_count() > 1 {
-                    format!("  tab {}/{}", self.current_tab() + 1, self.tab_count())
-                } else {
-                    String::new()
-                };
-                // Attached is worth saying: it is the difference between
-                // closing Dispatch and killing the agents.
-                let where_ = self
-                    .device()
-                    .map_or_else(String::new, |device| format!("  {device}"));
-                format!("{panes} pane(s){where_}{tabs}  {}", keymap.normal_help())
-            });
-
-            // The reminders ahead of the key help: it alone runs past eighty
-            // columns, and whatever follows it is cut off on the terminals
-            // most people have. The key help is the one thing here that is
-            // the same every time, so it is what can best afford to lose its
-            // end.
-            lead.into_iter()
-                .chain(waiting_reminder)
-                .chain(blocked_reminder)
-                .chain(help)
-                .collect::<Vec<_>>()
-                .join("  ")
-        };
-
-        // On `tab`, like the active tab, and in the same text colour for the
-        // same reason.
-        let style = if mode != KeyMode::Normal {
-            Style::default()
-                .bg(self.theme.tab)
-                .fg(self.theme.text)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(self.theme.faded)
-        };
-
-        // The way into the command help, pinned to the end of the row and
-        // reserved first, so no message can push it off. A mode's row lists
-        // its own keys instead, and locked, help is not reachable anyway.
-        let chip = (mode == KeyMode::Normal && self.overlay.is_none())
-            .then(|| keymap.path_to(Command::Help))
-            .flatten()
-            .map(|keys| format!("{keys} help"));
-        let reserved = chip
-            .as_ref()
-            .map_or(0, |chip| {
-                u16::try_from(Span::raw(chip.as_str()).width() + 2).unwrap_or(u16::MAX)
-            })
-            .min(row.width);
-
-        Paragraph::new(text).style(style).render(
-            Rect::new(row.x, row.y, row.width - reserved, 1),
-            frame.buffer_mut(),
-        );
-        if let Some(chip) = chip
-            && reserved > 2
-        {
-            Paragraph::new(chip)
-                .style(Style::default().fg(self.theme.faded))
-                .alignment(ratatui::layout::Alignment::Right)
-                .render(
-                    Rect::new(row.x + row.width - reserved, row.y, reserved, 1),
-                    frame.buffer_mut(),
-                );
-        }
     }
 
     /// Fits every visible pane to the rectangle it now occupies, and
@@ -8639,7 +8460,7 @@ mod tests {
     }
 
     #[test]
-    fn the_waiting_reminder_names_its_key_and_survives_an_overlay() {
+    fn the_attention_count_survives_an_overlay_and_names_no_key() {
         let (mut app, project, daemon, _sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 2);
         block(&mut app, panes[0]);
@@ -8647,16 +8468,17 @@ mod tests {
 
         drawn(&mut app, &mut terminal);
         assert!(
-            bottom_row(&terminal).contains("1 waiting on you — Alt a"),
+            bottom_row(&terminal).contains("1 need attention"),
             "{}",
             bottom_row(&terminal)
         );
+        assert!(!bottom_row(&terminal).contains("Alt a"));
 
         app.open_attention_picker();
         assert!(app.overlay.is_some());
         drawn(&mut app, &mut terminal);
         assert!(
-            bottom_row(&terminal).contains("1 waiting on you"),
+            bottom_row(&terminal).contains("1 need attention"),
             "{}",
             bottom_row(&terminal)
         );
@@ -8669,7 +8491,7 @@ mod tests {
         drawn(&mut app, &mut terminal);
         let row = bottom_row(&terminal);
         assert!(
-            row.contains("1 waiting on you") && !row.contains("waiting on you —"),
+            row.contains("1 need attention") && !row.contains("need attention —"),
             "{row}"
         );
     }
@@ -9350,15 +9172,15 @@ mod tests {
             text.lines()
                 .last()
                 .expect("a row")
-                .contains("2 waiting on you"),
+                .contains("2 need attention"),
             "{text}"
         );
     }
 
     #[test]
     fn the_reminders_fit_an_eighty_column_status_row() {
-        // The key help alone runs past eighty columns, so a reminder after it
-        // was cut off on the terminals most people have.
+        // What needs the user must still be said on the terminals most people
+        // have, beside the button that opens Settings.
         let (mut app, project, daemon, _sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 2);
         app.state
@@ -9379,14 +9201,12 @@ mod tests {
         let text = rendered_text(&terminal);
         let row = text.lines().last().expect("a row");
 
-        assert!(row.contains("1 waiting on you"), "{row:?}");
+        assert!(row.contains("1 need attention"), "{row:?}");
+        assert!(row.contains("1 delegation waiting"), "{row:?}");
+        assert!(row.trim_end().ends_with("[ Settings ]"), "{row:?}");
         assert!(
-            row.contains("1 delegation(s) waiting — Ctrl a a"),
-            "{row:?}"
-        );
-        assert!(
-            row.find("waiting on you") < row.find("pane"),
-            "the key help follows, where being cut costs least (the help chip keeps the end): {row:?}"
+            row.find("need attention") < row.find("delegation"),
+            "attention comes first: {row:?}"
         );
     }
 
@@ -9440,10 +9260,8 @@ mod tests {
         );
 
         let row = row_with_a_request_waiting(&mut app, project, pane);
-        assert!(
-            row.contains("1 delegation(s) waiting — Ctrl b a"),
-            "{row:?}"
-        );
+        assert!(row.contains("1 delegation waiting"), "{row:?}");
+        assert!(!row.contains('—'), "the footer names no key: {row:?}");
 
         app.open_harness_picker();
         assert_eq!(
@@ -9462,7 +9280,7 @@ mod tests {
         );
 
         let row = row_with_a_request_waiting(&mut app, project, pane);
-        assert!(row.contains("1 delegation(s) waiting  "), "{row:?}");
+        assert!(row.contains("1 delegation waiting"), "{row:?}");
         assert!(!row.contains('—'), "{row:?}");
 
         rebind(
@@ -10944,7 +10762,7 @@ mod tests {
             "the disconnect notice must stay visible: {last_row}"
         );
         assert!(
-            last_row.contains("delegation(s) waiting"),
+            last_row.contains("delegation waiting"),
             "the queued prompt should still be mentioned: {last_row}"
         );
     }
@@ -13054,31 +12872,25 @@ mod tests {
     }
 
     #[test]
-    fn tab_mode_is_spelled_out_on_the_status_row() {
+    fn tab_mode_is_named_on_the_footer_with_a_way_out() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
         let mut terminal = a_terminal();
 
         drawn(&mut app, &mut terminal);
-        assert!(bottom_row(&terminal).contains("Ctrl t tabs"));
+        assert!(!bottom_row(&terminal).contains("Ctrl t tabs"));
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
-        // The generated tab row is longer than this hundred-column test
-        // terminal, so the row is a prefix of the full help rather than
-        // equal to it.
-        assert!(
-            app.router
-                .keymap()
-                .mode_help(KeyMode::Tab)
-                .starts_with(bottom_row(&terminal).trim_end())
-        );
+        let row = bottom_row(&terminal);
+        assert!(row.starts_with("TAB"), "{row:?}");
+        assert!(row.trim_end().ends_with("[ Done ]"), "{row:?}");
     }
 
     #[test]
-    fn a_refusal_in_tab_mode_shows_ahead_of_its_keys() {
-        // `[` keeps the mode on, so a refusal hidden behind the key list
-        // would make the key look dead.
+    fn a_refusal_in_tab_mode_shows_beside_its_name() {
+        // `[` keeps the mode on, so a refusal hidden would make the key look
+        // dead.
         let (mut app, project, daemon, _sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 1);
         send_tabs(&mut app, &daemon, project, &[&panes]);
@@ -13091,8 +12903,8 @@ mod tests {
 
         let row = bottom_row(&terminal);
         assert_eq!(app.router.key_mode(), KeyMode::Tab, "still in the mode");
-        assert!(row.starts_with("TAB  no tab to the left  "), "{row:?}");
-        assert!(row.contains("n new"), "the keys still follow: {row:?}");
+        assert!(row.starts_with("TAB · no tab to the left"), "{row:?}");
+        assert!(row.trim_end().ends_with("[ Done ]"), "{row:?}");
     }
 
     #[test]
@@ -14177,24 +13989,22 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
-    fn each_mode_spells_out_its_keys_on_the_status_row() {
+    fn each_mode_is_named_on_the_footer() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
         let mut terminal = a_wide_terminal();
 
-        for (key, mode) in [
-            ('p', KeyMode::Pane),
-            ('t', KeyMode::Tab),
-            ('s', KeyMode::Scroll),
-            ('o', KeyMode::Session),
+        for (key, named) in [
+            ('p', "PANE"),
+            ('t', "TAB"),
+            ('s', "Scrollback"),
+            ('o', "SESSION"),
         ] {
             key_with(&mut app, KeyCode::Char(key), KeyModifiers::CONTROL);
             drawn(&mut app, &mut terminal);
-            assert_eq!(
-                bottom_row(&terminal).trim_end(),
-                app.router.keymap().mode_help(mode),
-                "{mode:?}"
-            );
+            let row = bottom_row(&terminal);
+            assert!(row.starts_with(named), "{named}: {row:?}");
+            assert!(!row.contains("Ctrl"), "no key list: {row:?}");
             press(&mut app, KeyCode::Esc);
         }
     }
@@ -14208,7 +14018,7 @@ args = ["--effort", "{value}"]
         key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
 
-        assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED  Ctrl g unlock");
+        assert_eq!(bottom_row(&terminal).trim_end(), "LOCKED · Ctrl g unlocks");
     }
 
     #[test]
@@ -14224,7 +14034,7 @@ args = ["--effort", "{value}"]
 
         assert_eq!(
             bottom_row(&terminal).trim_end(),
-            "LOCKED  Ctrl g unlock  far is unreachable"
+            "LOCKED · Ctrl g unlocks · far is unreachable"
         );
     }
 
@@ -14246,8 +14056,8 @@ args = ["--effort", "{value}"]
         drawn(&mut app, &mut terminal);
 
         let row = bottom_row(&terminal);
-        assert!(row.starts_with("LOCKED  Ctrl g unlock"), "{row:?}");
-        assert!(row.contains("1 delegation(s) waiting"), "{row:?}");
+        assert!(row.starts_with("LOCKED · Ctrl g unlocks"), "{row:?}");
+        assert!(row.contains("1 delegation waiting"), "{row:?}");
     }
 
     #[test]
@@ -14299,47 +14109,22 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
-    fn the_normal_row_lists_the_mode_keys() {
+    fn a_rebound_key_shows_in_the_command_help() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
-        let mut terminal = a_wide_terminal();
+        rebind(&mut app, &[("normal", "Alt w", "close_pane")]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 60))
+            .expect("a test backend can be created");
 
+        // Keys left the footer; the command help is where they are found.
+        app.open_help();
         drawn(&mut app, &mut terminal);
 
+        let text = rendered_text(&terminal);
         assert!(
-            bottom_row(&terminal).contains(
-                "Ctrl p pane  Ctrl t tabs  Ctrl s scroll  Ctrl o session  Ctrl g lock  Ctrl a prefix"
-            ),
-            "{}",
-            bottom_row(&terminal)
-        );
-    }
-
-    #[test]
-    fn a_rebound_key_shows_on_the_status_row() {
-        let (mut app, project, daemon, _sent) = attached_app();
-        spawn_several(&mut app, &daemon, project, 1);
-        let mut keys = dispatch_config::KeysConfig::default();
-        keys.modes.insert(
-            "pane".into(),
-            dispatch_config::KeyTable::Table(
-                [(
-                    "w".to_string(),
-                    dispatch_config::KeyValue::Command("close_pane".into()),
-                )]
-                .into(),
-            ),
-        );
-        app.set_keymap(dispatch_tui::Keymap::with_overrides(&keys).0);
-        let mut terminal = a_wide_terminal();
-
-        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
-        drawn(&mut app, &mut terminal);
-
-        assert!(
-            bottom_row(&terminal).contains("x/w close"),
-            "{}",
-            bottom_row(&terminal)
+            text.lines()
+                .any(|line| line.contains("Close the focused pane  Alt w")),
+            "{text}"
         );
     }
 
@@ -14703,19 +14488,288 @@ args = ["--effort", "{value}"]
         assert!(app.overlay.is_none());
     }
 
+    fn footer(app: &mut App, width: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20))
+            .expect("a test backend can be created");
+        drawn(app, &mut terminal);
+        bottom_row(&terminal)
+    }
+
     #[test]
-    fn the_help_chip_survives_a_long_status_message() {
+    fn the_footer_says_what_is_going_on_not_which_keys_to_press() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+        let row = footer(&mut app, 120);
+        assert!(
+            row.contains("Connected · 1 working · 1 need attention"),
+            "{row}"
+        );
+        assert!(row.trim_end().ends_with("[ Settings ]"), "{row}");
+        assert!(row.contains("[ Activity ]"), "{row}");
+        assert!(!row.contains("Ctrl"), "no shortcut wall: {row}");
+        assert!(!row.contains("help"), "{row}");
+    }
+
+    #[test]
+    fn a_standalone_footer_claims_no_connection() {
+        let (mut app, _pane) = app_with_a_pane("/tmp/solo", "shell", "Shell");
+        assert!(!footer(&mut app, 120).contains("Connected"));
+    }
+
+    #[test]
+    fn a_message_takes_the_place_of_the_connection_and_the_working_count() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        app.say("registered claude");
+        let row = footer(&mut app, 120);
+        assert!(row.contains("registered claude"), "{row}");
+        assert!(!row.contains("Connected"), "{row}");
+        assert!(!row.contains("working"), "{row}");
+    }
+
+    #[test]
+    fn an_unreachable_machine_is_named_in_place_of_the_connection() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
-        app.set_status("x".repeat(200));
+        let device = app.state.devices()[0].id;
+        app.state.set_device_reachable(device, false);
+        let row = footer(&mut app, 120);
+        assert!(
+            row.contains("unreachable — its agents are still running"),
+            "{row}"
+        );
+        assert!(!row.contains("Connected"), "{row}");
+    }
+
+    #[test]
+    fn a_narrow_footer_keeps_attention_and_settings() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+        app.warn("something went wrong with a long explanation of why");
+        for width in [80, 60, 40, 30] {
+            let row = footer(&mut app, width);
+            assert!(row.contains("need attention"), "{width}: {row}");
+            assert!(row.contains("Settings"), "{width}: {row}");
+        }
+        let row = footer(&mut app, 40);
+        assert!(!row.contains("working"), "routine counts go first: {row}");
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_working_then_connection_then_activity() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Running)
+            .expect("exists");
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+        // `used` is the width that holds everything with Settings beside it.
+        let full = footer(&mut app, 120);
+        let used = cell_of(&full, "[ Activity ]") + 12 + 13;
+        let row = footer(&mut app, used - 4);
+        assert!(!row.contains("working"), "{row}");
+        assert!(row.contains("Connected"), "{row}");
+        assert!(row.contains("[ Activity ]"), "{row}");
+
+        // Then the connection, with the activity button still there.
+        let row = footer(&mut app, used - 14);
+        assert!(!row.contains("Connected"), "{row}");
+        assert!(row.contains("[ Activity ]"), "{row}");
+
+        // Then the activity button.
+        let row = footer(&mut app, 32);
+        assert!(!row.contains("Activity"), "{row}");
+        assert!(row.contains("1 need attention"), "{row}");
+        assert!(row.contains("[ Settings ]"), "{row}");
+    }
+
+    #[test]
+    fn the_footer_parts_do_what_they_say_when_clicked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+
+        // A waiting pane: its count opens the attention picker.
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "need attention"), y);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Attention(_))),
+            "the attention picker opens"
+        );
+        app.overlay = None;
+        drawn(&mut app, &mut terminal);
+
+        // An error: clicking it dismisses it.
+        app.warn("far is unreachable");
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "far is unreachable"), y);
+        assert!(app.status.text.is_empty(), "the error is dismissed");
+
+        // A message that reports success is not a button.
+        app.say("registered claude");
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "registered claude"), y);
+        assert_eq!(app.status.text, "registered claude");
+
+        // A delegation: its count opens the approval.
+        app.clear_status();
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: panes[0],
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "delegation waiting"), y);
+        assert!(matches!(app.overlay, Some(Overlay::Approval { .. })));
+    }
+
+    #[test]
+    fn the_footer_buttons_are_inert_until_their_screens_exist() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+        let row = bottom_row(&terminal);
+        for button in ["[ Activity ]", "[ Settings ]"] {
+            click(&mut app, cell_of(&row, button), y);
+            assert!(app.overlay.is_none(), "{button}");
+        }
+    }
+
+    #[test]
+    fn a_right_click_on_the_footer_does_nothing() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.warn("far is unreachable");
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+        let column = cell_of(&bottom_row(&terminal), "far is unreachable");
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column,
+            y,
+        );
+        mouse_at(
+            &mut app,
+            MouseEventKind::Up(crossterm::event::MouseButton::Right),
+            column,
+            y,
+        );
+        assert_eq!(app.status.text, "far is unreachable");
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn every_mode_has_a_compact_footer() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let lines: String = (1..=60).map(|n| format!("line-{n:03}\r\n")).collect();
+        print(&mut app, &daemon, pane, lines.as_bytes());
+        let mut terminal = a_wide_terminal();
+        let y = terminal.size().expect("sized").height - 1;
+
+        // Scroll mode says how far back the viewport is, and has a way out.
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        assert!(row.contains("Scrollback · 3 lines above live"), "{row}");
+        assert!(row.trim_end().ends_with("[ Return to live ]"), "{row}");
+        click(&mut app, cell_of(&row, "[ Return to live ]"), y);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        assert!(app.scrolling.is_none(), "back to live output");
+
+        // A line, in the singular.
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('k'));
+        drawn(&mut app, &mut terminal);
+        assert!(
+            bottom_row(&terminal).contains("Scrollback · 1 line above live"),
+            "{}",
+            bottom_row(&terminal)
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // Pane mode: its name, and a button that leaves it.
+        key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        assert!(row.contains("PANE"), "{row}");
+        click(&mut app, cell_of(&row, "[ Done ]"), y);
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+
+        // The prefix, armed, says so.
+        key_with(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).contains("PREFIX"));
+        press(&mut app, KeyCode::Esc);
+
+        // Locked: the key out, and no button.
+        key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        assert!(row.contains("LOCKED · Ctrl g unlocks"), "{row}");
+        assert!(!row.contains('['), "lock has no exit button: {row}");
+    }
+
+    #[test]
+    fn a_scrollback_footer_on_the_alternate_screen_claims_no_lines() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        print(&mut app, &daemon, pane, b"\x1b[?1049hfull screen");
+        key_with(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let row = footer(&mut app, 120);
+        assert!(row.contains("Scrollback"), "{row}");
+        assert!(!row.contains("lines above"), "{row}");
+    }
+
+    #[test]
+    fn a_long_message_never_pushes_settings_off_the_footer() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.warn("x".repeat(200));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
             .expect("a test backend can be created");
         drawn(&mut app, &mut terminal);
         assert!(
-            bottom_row(&terminal).trim_end().ends_with("Alt / help"),
+            bottom_row(&terminal).trim_end().ends_with("[ Settings ]"),
             "{}",
             bottom_row(&terminal)
         );
+        assert!(bottom_row(&terminal).contains('…'), "the message is cut");
     }
 
     /// The top border of `pane`'s tile, as last drawn.
@@ -14821,7 +14875,7 @@ args = ["--effort", "{value}"]
         let mut terminal = a_wide_terminal();
         drawn(&mut app, &mut terminal);
         assert!(
-            bottom_row(&terminal).contains("3 waiting on you"),
+            bottom_row(&terminal).contains("3 need attention"),
             "{}",
             bottom_row(&terminal)
         );
@@ -14859,23 +14913,6 @@ args = ["--effort", "{value}"]
         key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Esc);
         assert!(!app.drawer_open, "in normal mode Esc puts it away");
-    }
-
-    #[test]
-    fn the_help_chip_is_hidden_while_an_overlay_has_the_keyboard() {
-        let (mut app, project, daemon, _sent) = attached_app();
-        spawn_several(&mut app, &daemon, project, 1);
-        let mut terminal = a_terminal();
-        drawn(&mut app, &mut terminal);
-        assert!(bottom_row(&terminal).contains("Alt / help"));
-
-        app.open_help();
-        drawn(&mut app, &mut terminal);
-        assert!(!bottom_row(&terminal).contains("Alt / help"));
-
-        app.overlay = None;
-        drawn(&mut app, &mut terminal);
-        assert!(bottom_row(&terminal).contains("Alt / help"));
     }
 
     #[test]
