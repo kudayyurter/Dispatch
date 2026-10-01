@@ -59,6 +59,8 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
         harness,
         task: task.to_string(),
         size,
+        handoff: None,
+        interactive: false,
     });
     eprintln!("[dispatch] waiting for approval (pane {parent})");
 

@@ -1960,6 +1960,8 @@ impl App {
                 harness,
                 task,
                 depth,
+                handoff: _,
+                interactive: _,
             } => {
                 self.pending.push_back(PendingRequest {
                     request,
@@ -2136,6 +2138,8 @@ impl App {
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
+            | ServerMessage::ReportAnswered { .. }
+            | ServerMessage::SubagentReported { .. }
             | ServerMessage::Unknown => false,
         }
     }

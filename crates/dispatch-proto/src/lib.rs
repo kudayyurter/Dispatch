@@ -22,8 +22,8 @@ pub mod message;
 
 pub use frame::{Frame, FrameError, MAX_FRAME_BYTES};
 pub use message::{
-    ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ProtocolError, Role, ServerMessage,
-    Version,
+    ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ProtocolError, ReportOutcome, Role,
+    ServerMessage, Version,
 };
 
 /// The protocol version this build speaks.

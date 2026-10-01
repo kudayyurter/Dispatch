@@ -240,7 +240,9 @@ All new fields carry `#[serde(default)]`, following `message.rs`.
 - `ServerMessage::DelegatePending` gains `handoff: Option<Handoff>` and
   `interactive: bool`, for the approval prompt.
 - New `ServerMessage::SubagentReported { pane: PaneId }`, for `"ask"`.
-- The protocol's minor version goes up.
+- The protocol version stays 1.1: `dispatch-proto` bumps it only for a change
+  an older peer cannot safely ignore, and optional fields and new messages are
+  not such a change.
 
 ## Approval prompt
 

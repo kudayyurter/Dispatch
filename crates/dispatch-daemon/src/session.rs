@@ -838,7 +838,12 @@ impl Daemon {
                 harness,
                 task,
                 size,
+                handoff: _,
+                interactive: _,
             } => self.delegate_request(id, parent, harness, task, size),
+
+            // Task 5.
+            ClientMessage::DelegateReport { .. } => {}
 
             ClientMessage::DelegateDecision {
                 request,
@@ -1489,6 +1494,8 @@ impl Daemon {
             harness: harness.clone(),
             task: task.clone(),
             depth,
+            handoff: None,
+            interactive: false,
         };
 
         self.pending.insert(
@@ -1759,6 +1766,7 @@ impl Daemon {
                 request,
                 exit: -1,
                 tail,
+                report: None,
             },
         );
     }
@@ -2025,6 +2033,7 @@ impl Daemon {
                         request,
                         exit: code,
                         tail: pane.history[start..].to_vec(),
+                        report: None,
                     },
                 ));
             }

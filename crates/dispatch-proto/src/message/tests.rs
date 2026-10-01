@@ -363,6 +363,8 @@ fn the_delegation_messages_round_trip() {
             harness: "claude".into(),
             task: "write the tests".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
         ClientMessage::DelegateDecision {
             request,
@@ -382,6 +384,8 @@ fn the_delegation_messages_round_trip() {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         },
         ServerMessage::DelegateResolved {
             request,
@@ -403,6 +407,7 @@ fn the_delegation_messages_round_trip() {
             request,
             exit: 0,
             tail: b"done\r\n".to_vec(),
+            report: None,
         },
     ];
     for message in replies {
@@ -450,6 +455,7 @@ fn a_delegate_callers_tail_is_binary_not_a_list_of_numbers() {
         request: RequestId::new(),
         exit: 0,
         tail: vec![200u8; 1024],
+        report: None,
     };
 
     let mut buf = Vec::new();
@@ -919,5 +925,107 @@ fn an_older_build_reads_the_shared_size_messages_as_unknown() {
     for _ in 0..3 {
         let read: Older = Frame::read(&mut reader).expect("an older build reads it");
         assert_eq!(read, Older::Unknown);
+    }
+}
+
+fn sample_handoff() -> dispatch_core::Handoff {
+    dispatch_core::Handoff::parse(
+        "## Goal\ng\n## Context\nc\n## Constraints\nNone.\n## Done when\nd\n## Report back\nr\n",
+    )
+    .expect("complete")
+}
+
+#[test]
+fn the_handoff_messages_round_trip() {
+    let pane = PaneId::new();
+    let messages = vec![
+        ClientMessage::DelegateRequest {
+            parent: pane,
+            harness: "claude".into(),
+            task: "g".into(),
+            size: (80, 24),
+            handoff: Some(sample_handoff()),
+            interactive: true,
+        },
+        ClientMessage::DelegateReport {
+            pane,
+            report: "done".into(),
+        },
+    ];
+    for message in &messages {
+        assert_eq!(&round_trip(message), message);
+    }
+
+    let server = vec![
+        ServerMessage::DelegateFinished {
+            request: RequestId::new(),
+            exit: 0,
+            tail: Vec::new(),
+            report: Some("done".into()),
+        },
+        ServerMessage::ReportAnswered {
+            outcome: ReportOutcome::NotWaiting {
+                reason: "gone".into(),
+            },
+        },
+        ServerMessage::SubagentReported { pane },
+    ];
+    for message in &server {
+        assert_eq!(&round_trip(message), message);
+    }
+}
+
+#[test]
+fn a_request_from_an_older_client_has_no_handoff() {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Old {
+        DelegateRequest {
+            parent: PaneId,
+            harness: String,
+            task: String,
+            size: (u16, u16),
+        },
+    }
+
+    let bytes = rmp_serde::to_vec_named(&Old::DelegateRequest {
+        parent: PaneId::new(),
+        harness: "claude".into(),
+        task: "do it".into(),
+        size: (80, 24),
+    })
+    .expect("encodes");
+    let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("decodes");
+    assert!(matches!(
+        decoded,
+        ClientMessage::DelegateRequest {
+            handoff: None,
+            interactive: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn an_older_client_skips_the_report_messages() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Old {
+        Pong {},
+        #[serde(other)]
+        Unknown,
+    }
+
+    for message in [
+        ServerMessage::SubagentReported {
+            pane: PaneId::new(),
+        },
+        ServerMessage::ReportAnswered {
+            outcome: ReportOutcome::Delivered,
+        },
+    ] {
+        let bytes = rmp_serde::to_vec_named(&message).expect("encodes");
+        let decoded: Old = rmp_serde::from_slice(&bytes).expect("an older peer decodes it");
+        assert!(matches!(decoded, Old::Unknown));
     }
 }

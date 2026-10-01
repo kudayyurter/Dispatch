@@ -731,6 +731,8 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
             // from the subagent running, whatever a shell echoes of its input.
             task: "echo delegated-$((6*7))".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     )
     .expect("writing succeeds");

@@ -1291,6 +1291,8 @@ fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Inbox {
             harness: "shell".into(),
             task: task.into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
     caller
@@ -1554,6 +1556,8 @@ fn a_pane_the_daemon_does_not_own_cannot_delegate() {
             harness: "shell".into(),
             task: "echo hello".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
 
@@ -2021,6 +2025,8 @@ fn an_interface_client_that_delegates_is_not_told_twice() {
             harness: "shell".into(),
             task: "echo self".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");
@@ -2073,6 +2079,8 @@ fn a_harness_with_an_empty_task_form_is_refused_without_asking() {
             harness: "no-task-args".into(),
             task: "echo never".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
 
@@ -3886,6 +3894,8 @@ fn assert_a_task_reaches_the_capture_exactly(
             harness: "capture".into(),
             task: task.into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");
@@ -4014,6 +4024,8 @@ fn delegating_to(
             harness: harness.into(),
             task: task.into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
 
@@ -4445,6 +4457,8 @@ fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
             harness: "mixed".into(),
             task: "anything".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
 
@@ -4506,6 +4520,8 @@ fn a_task_form_that_would_put_the_task_on_cmds_command_line_is_refused() {
             harness: "old".into(),
             task: "x & echo DISPATCH_AUDIT_MARKER".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
 
@@ -5672,6 +5688,8 @@ fn a_subagent_starts_with_the_saved_settings() {
             harness: "record".into(),
             task: "anything".into(),
             size: (80, 24),
+            handoff: None,
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");

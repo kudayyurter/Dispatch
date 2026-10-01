@@ -202,7 +202,9 @@ fn weight(message: &ServerMessage) -> usize {
     ENVELOPE
         + match message {
             ServerMessage::PaneOutput { bytes, .. } => bytes.len(),
-            ServerMessage::DelegateFinished { tail, .. } => tail.len(),
+            ServerMessage::DelegateFinished { tail, report, .. } => {
+                tail.len() + report.as_ref().map_or(0, String::len)
+            }
             ServerMessage::DelegatePending { task, .. } => task.len(),
             // Every tab the project has, each time any of them changes: a
             // client that stopped reading while tabs are renamed or moved
