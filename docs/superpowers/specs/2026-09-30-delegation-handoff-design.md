@@ -1,6 +1,6 @@
 # Delegation handoff, reports, and interactive subagents
 
-Status: design, approved 2026-09-30. Not yet implemented.
+Status: implemented on branch `daemon`; hands-on check of the interactive forms pending.
 Date: 2026-09-30.
 Branch: `daemon`, cut from `main` at 0d4f9b6.
 
@@ -180,6 +180,11 @@ checked by hand before release:
 | codex | `["{task}"]` |
 | agy | `["-i", "{task}"]` |
 | opencode | `["--prompt", "{task}"]` |
+
+Checked against the installed CLIs' `--help` on 2026-10-01: claude and codex
+list an optional `[prompt]` argument, agy's `-i` is an alias for
+`--prompt-interactive`, and opencode has `--prompt`. The forms still need a
+hands-on run.
 
 Saved settings (model, effort, permissions) are appended as for any launch. A
 harness without `[task.interactive]` refuses `--interactive` with exit 78.

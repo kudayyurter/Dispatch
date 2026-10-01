@@ -17,6 +17,25 @@ show the Linux path. The directory holds `config.toml`, a `harnesses/`
 directory with one file per agent (written on first run), your saved
 `harness-settings.toml`, and the project and machine lists.
 
+## Delegation
+
+What an agent may delegate, and how, is in [delegation.md](delegation.md). The
+caps live in `config.toml`:
+
+```toml
+# ~/.config/dispatch/config.toml
+[delegation]
+max_depth = 1
+max_live_per_parent = 4
+request_timeout_secs = 600
+interactive_on_done = "close"   # or "ask"
+```
+
+`interactive_on_done` is what happens to a `--interactive` subagent's pane once
+it has sent its report. `"close"` closes it. `"ask"` keeps it open, marked as
+reported, and asks before closing it. Any other value is an error that names
+these two.
+
 ## Shell panes
 
 The picker's first entry is your own shell — `Shell · zsh`, or whatever
@@ -136,6 +155,17 @@ kind = "choice"
 limited_by = "model"
 options = [{ value = "low", label = "Low" }, { value = "high", label = "High" }]
 args = ["--effort", "{value}"]
+```
+
+A harness that can run a delegated task declares how in `[task]`, and may add
+`[task.interactive]` for `dispatch delegate --interactive`: the same shape
+(`args`, `env`, `[task.platform.windows]`, `input`), starting the agent's own
+interface with the handoff as its first prompt.
+
+```toml
+# ~/.config/dispatch/harnesses/agy.toml
+[task.interactive]
+args = ["-i", "{task}"]   # {task} is the handoff, wrapped
 ```
 
 A `bool` adds its `args` when it is on. A value may hold only letters, digits
