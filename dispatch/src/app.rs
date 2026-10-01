@@ -1415,54 +1415,15 @@ impl App {
         ));
     }
 
-    /// Opens the list of every pane waiting on the user.
-    fn open_attention_picker(&mut self) {
+    /// One picker row for each pane in sidebar order that `include` keeps and
+    /// that is still live: project and title, then its state and, when it is
+    /// blocked, how long it has waited. Attention and Activity differ only in
+    /// which panes they keep.
+    fn pane_rows(&self, include: impl Fn(PaneId) -> bool) -> Vec<Item> {
         let now = self.now();
-        let items: Vec<Item> = self
-            .pane_order()
+        self.pane_order()
             .into_iter()
-            .filter(|id| self.is_waiting(*id))
-            .filter_map(|id| {
-                let pane = self.state.pane(id)?;
-                let project = self
-                    .state
-                    .projects()
-                    .iter()
-                    .find(|project| project.id == pane.project)
-                    .map_or("", |project| project.name.as_str());
-                let why = sidebar::status_text(pane.status, self.reason_of(id));
-                let waited = self
-                    .blocked_since
-                    .get(&id)
-                    .map_or_else(String::new, |since| {
-                        format!(" · {}", waited_for(now.saturating_duration_since(*since)))
-                    });
-                Some(
-                    Item::new(id.to_string(), format!("{project} · {}", pane.title))
-                        .with_detail(format!("{why}{waited}")),
-                )
-            })
-            .collect();
-
-        if items.is_empty() {
-            self.say(NOTHING_WAITING);
-            return;
-        }
-        self.overlay = Some(Overlay::Attention(
-            Picker::new("Waiting on you", items)
-                .with_hint("↑↓ choose  Enter go  Esc close")
-                .with_buttons(pointer::buttons::open_cancel()),
-        ));
-    }
-
-    /// Opens the list of every live pane, with what each is doing.
-    fn open_activity(&mut self) {
-        use dispatch_tui::button::{Button, ButtonId};
-
-        let now = self.now();
-        let items: Vec<Item> = self
-            .pane_order()
-            .into_iter()
+            .filter(|id| include(*id))
             .filter_map(|id| {
                 let pane = self.state.pane(id).filter(|pane| !pane.closed)?;
                 let project = self
@@ -1483,7 +1444,29 @@ impl App {
                         .with_detail(format!("{state}{waited}")),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// Opens the list of every pane waiting on the user.
+    fn open_attention_picker(&mut self) {
+        let items = self.pane_rows(|id| self.is_waiting(id));
+
+        if items.is_empty() {
+            self.say(NOTHING_WAITING);
+            return;
+        }
+        self.overlay = Some(Overlay::Attention(
+            Picker::new("Waiting on you", items)
+                .with_hint("↑↓ choose  Enter go  Esc close")
+                .with_buttons(pointer::buttons::open_cancel()),
+        ));
+    }
+
+    /// Opens the list of every live pane, with what each is doing.
+    fn open_activity(&mut self) {
+        use dispatch_tui::button::{Button, ButtonId};
+
+        let items = self.pane_rows(|_| true);
 
         if items.is_empty() {
             self.say(NO_PANES);
@@ -14701,6 +14684,21 @@ args = ["--effort", "{value}"]
         assert_eq!(app.state.selected_project(), Some(second));
         assert_eq!(app.state.focused_pane(), Some(theirs[0]));
         let _ = ours;
+    }
+
+    #[test]
+    fn the_activity_go_button_goes_to_the_selected_pane() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_wide_terminal();
+        app.open_activity();
+        drawn(&mut app, &mut terminal);
+
+        press(&mut app, KeyCode::Down);
+        click_button(&mut app, pointer::ButtonId::Go);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.state.focused_pane(), Some(panes[1]));
     }
 
     #[test]
