@@ -21,6 +21,10 @@ const SETTLE: Duration = Duration::from_secs(10);
 /// The built-in Shell now sorts first in the picker, so this one sorts first
 /// only among the harness files below it — it remains the harness the
 /// delegation tests delegate to, since it alone carries a `[task]` form.
+///
+/// A delegation's task is now a whole handoff, so its `[task]` runs a script,
+/// written beside it by [`Fixture::new`], that pulls the Goal section out of the
+/// handoff and runs that as shell. `{runner}` is where that script's path goes.
 const SHELL_HARNESS: &str = r#"
 id = "aaashell"
 display_name = "Test Shell"
@@ -28,8 +32,23 @@ command = "sh"
 args = []
 
 [task]
-args = ["-c", "{task}"]
+args = ["{runner}", "{task}"]
 "#;
+
+/// The script a delegated task runs: it evaluates the handoff's Goal section.
+const RUN_GOAL: &str = "goal=$(printf '%s\\n' \"$1\" | awk '/^## Goal[[:space:]]*$/{f=1;next} /^## /{f=0} f')\neval \"$goal\"\n";
+
+/// A shell command that pipes a complete handoff, whose Goal is `goal`, into
+/// `dispatch delegate`. The single quotes keep the Goal unexpanded in the
+/// parent shell, so only the subagent's runner evaluates it.
+fn delegate_command(goal: &str) -> Vec<u8> {
+    format!(
+        "printf '## Goal\\n{goal}\\n## Context\\nA test.\\n## Constraints\\nNone.\\n\
+         ## Done when\\nIt has run.\\n## Report back\\nNothing.\\n' \
+         | dispatch delegate --handoff -\r"
+    )
+    .into_bytes()
+}
 
 /// A running Dispatch, its screen, and the ability to type at it.
 struct Harness {
@@ -106,8 +125,15 @@ impl Fixture {
         std::fs::create_dir_all(&harnesses).expect("temp dir is writable");
         // The id must match the file stem, and sorting first among the
         // harness files is what makes "new pane" choose it over the others.
-        std::fs::write(harnesses.join("aaashell.toml"), SHELL_HARNESS.trim())
-            .expect("temp dir is writable");
+        let runner = harnesses.join("run-goal.sh");
+        std::fs::write(&runner, RUN_GOAL).expect("temp dir is writable");
+        std::fs::write(
+            harnesses.join("aaashell.toml"),
+            SHELL_HARNESS
+                .trim()
+                .replace("{runner}", &runner.display().to_string()),
+        )
+        .expect("temp dir is writable");
 
         // The built-in shell is offered first. Pinned to plain `sh` here, so
         // no test runs the developer's own shell and its prompt.
@@ -1135,7 +1161,7 @@ fn a_delegation_is_approved_by_hand_and_its_output_comes_back() {
         "the parent shell should be ready"
     );
 
-    dispatch.send(b"dispatch delegate \"echo delegated-$((6*7))\"\r");
+    dispatch.send(&delegate_command("echo delegated-$((6*7))"));
 
     assert!(
         dispatch.wait_for(|lines| contains(lines, "wants to delegate")),
@@ -1163,7 +1189,7 @@ fn a_denied_delegation_runs_nothing_and_says_so() {
     dispatch.spawn_shell();
     assert!(dispatch.wait_for(|lines| contains(lines, "$")));
 
-    dispatch.send(b"dispatch delegate \"echo never-run\"\r");
+    dispatch.send(&delegate_command("echo never-run"));
     assert!(dispatch.wait_for(|lines| contains(lines, "wants to delegate")));
 
     dispatch.send(b"d");

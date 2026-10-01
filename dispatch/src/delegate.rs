@@ -5,7 +5,7 @@
 //! its code — the shape of every other tool an agent runs.
 //!
 //! Status lines go to stderr and the subagent's output to stdout, so
-//! `dispatch delegate "…" > result.md` captures the work and nothing else while
+//! `dispatch delegate --handoff brief.md > result.md` captures the work and nothing else while
 //! a human watching the pane still sees progress.
 
 use std::process::ExitCode;
@@ -19,7 +19,11 @@ use dispatch_proto::{ClientMessage, DelegateOutcome, ProtocolError, Role, Server
 /// Exit codes, following `sysexits(3)` so an agent can branch without parsing
 /// prose. Documented in `--help` because an agent reads that far more often
 /// than a README.
-mod exit {
+pub(crate) mod exit {
+    /// The handoff is missing, incomplete, or over the limit.
+    pub const USAGE: u8 = 64;
+    /// The handoff, or a report, cannot be read.
+    pub const NOINPUT: u8 = 66;
     /// No daemon is listening.
     pub const UNAVAILABLE: u8 = 69;
     /// The request was never answered, the subagent's pane was closed under it
@@ -33,8 +37,78 @@ mod exit {
     pub const CONFIG: u8 = 78;
 }
 
+/// What `dispatch delegate` was asked to do.
+pub struct Args {
+    pub harness: Option<String>,
+    pub size: (u16, u16),
+    pub task: Option<String>,
+    pub handoff: Option<String>,
+    pub template: bool,
+    pub interactive: bool,
+}
+
+/// Reads `source`, a path or `-` for standard input, as text.
+///
+/// Read as bytes and converted lossily: one stray byte in what an agent
+/// piped in should not cost it the whole message.
+pub(crate) fn read_source(source: &str) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let bytes = if source == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        bytes
+    } else {
+        std::fs::read(source)?
+    };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Says why a handoff was not accepted, then prints the template, so an
+/// agent can retry in the right shape from the error alone.
+fn refuse_handoff(why: &str) -> ExitCode {
+    eprintln!("[dispatch] {why}");
+    eprintln!("[dispatch] the template (`dispatch delegate --template` prints it again):\n");
+    eprint!("{}", dispatch_core::handoff::TEMPLATE);
+    ExitCode::from(exit::USAGE)
+}
+
 /// Runs one delegation to completion.
-pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<ExitCode> {
+pub fn run(args: Args) -> Result<ExitCode> {
+    if args.template {
+        print!("{}", dispatch_core::handoff::TEMPLATE);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.task.is_some() {
+        return Ok(refuse_handoff(
+            "a bare task is no longer accepted: write a handoff and pass it with \
+             --handoff FILE, or --handoff - for standard input",
+        ));
+    }
+    let Some(source) = args.handoff else {
+        return Ok(refuse_handoff(
+            "no handoff: pass one with --handoff FILE, or --handoff - for standard input",
+        ));
+    };
+    let text = match read_source(&source) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("[dispatch] cannot read the handoff {source}: {error}");
+            return Ok(ExitCode::from(exit::NOINPUT));
+        }
+    };
+    let handoff = match dispatch_core::Handoff::parse(&text) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            let problems: Vec<String> = error.problems.iter().map(|p| format!("  - {p}")).collect();
+            return Ok(refuse_handoff(&format!(
+                "the handoff is not ready:\n{}",
+                problems.join("\n")
+            )));
+        }
+    };
+    let interactive = args.interactive;
+
     let parent: PaneId = std::env::var("DISPATCH_PANE")
         .context("DISPATCH_PANE is not set: `dispatch delegate` runs inside a Dispatch pane")?
         .parse()
@@ -52,15 +126,15 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
     // The parent's own harness when none was named: the common case is an agent
     // delegating to another of itself. The daemon resolves an empty string to
     // whichever harness the asking pane is running.
-    let harness = harness.unwrap_or_default();
+    let harness = args.harness.unwrap_or_default();
 
     client.send(ClientMessage::DelegateRequest {
         parent,
         harness,
-        task: task.to_string(),
-        size,
-        handoff: None,
-        interactive: false,
+        task: handoff.text.clone(),
+        size: args.size,
+        handoff: Some(handoff),
+        interactive,
     });
     eprintln!("[dispatch] waiting for approval (pane {parent})");
 
@@ -96,13 +170,21 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
                 },
 
                 ServerMessage::DelegateFinished {
-                    exit: code, tail, ..
+                    exit: code,
+                    tail,
+                    report,
+                    ..
                 } => {
                     use std::io::Write;
-                    std::io::stdout()
-                        .write_all(&tail)
-                        .context("failed to write the subagent's output")?;
-                    std::io::stdout().flush().ok();
+
+                    if let Some(report) = report {
+                        std::io::stdout()
+                            .write_all(report.as_bytes())
+                            .context("failed to write the subagent's report")?;
+                        std::io::stdout().flush().ok();
+                        eprintln!("[dispatch] the subagent reported");
+                        return Ok(ExitCode::SUCCESS);
+                    }
 
                     // -1 is the daemon's sentinel for a subagent that was
                     // killed rather than allowed to exit — its pane was closed
@@ -116,6 +198,19 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
                         return Ok(ExitCode::from(exit::TEMPFAIL));
                     }
 
+                    if interactive {
+                        eprintln!(
+                            "[dispatch] the subagent finished without a report (exit {code}); \
+                             its pane has what it did"
+                        );
+                        return Ok(ExitCode::from(exit::TEMPFAIL));
+                    }
+
+                    std::io::stdout()
+                        .write_all(&tail)
+                        .context("failed to write the subagent's output")?;
+                    std::io::stdout().flush().ok();
+                    eprintln!("[dispatch] no report was sent; returning the output tail");
                     eprintln!("[dispatch] subagent exited {code}");
                     return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
                 }
