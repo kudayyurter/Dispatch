@@ -268,6 +268,34 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Dotted paths of keys this build ignored, for the caller to log.
     pub unknown: Vec<String>,
+    /// Which `[interface]` keys the file wrote, as opposed to defaulted.
+    pub interface_present: InterfaceKeysPresent,
+}
+
+/// Which `[interface]` keys `config.toml` actually holds.
+///
+/// [`Config`] fills defaults, so it cannot say whether a value was written.
+/// Settings needs that to tell "set in config.toml" from "the default".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InterfaceKeysPresent {
+    /// `motion` is written.
+    pub motion: bool,
+    /// `focus_follows_pointer` is written.
+    pub focus_follows_pointer: bool,
+    /// `hover_claims_panes` is written.
+    pub hover_claims_panes: bool,
+}
+
+impl InterfaceKeysPresent {
+    fn of(raw: &toml::Table) -> Self {
+        let interface = raw.get("interface").and_then(toml::Value::as_table);
+        let has = |key: &str| interface.is_some_and(|table| table.contains_key(key));
+        Self {
+            motion: has("motion"),
+            focus_follows_pointer: has("focus_follows_pointer"),
+            hover_claims_panes: has("hover_claims_panes"),
+        }
+    }
 }
 
 impl Config {
@@ -284,6 +312,7 @@ impl Config {
                 return Ok(LoadedConfig {
                     config: Self::default(),
                     unknown: Vec::new(),
+                    interface_present: InterfaceKeysPresent::default(),
                 });
             }
             Err(source) => {
@@ -310,6 +339,7 @@ impl Config {
         Ok(LoadedConfig {
             config,
             unknown: unknown_keys(&raw),
+            interface_present: InterfaceKeysPresent::of(&raw),
         })
     }
 }

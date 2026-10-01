@@ -5,6 +5,7 @@ pub mod defaults;
 pub mod harness;
 pub mod harness_settings;
 pub mod machines;
+pub mod preferences;
 pub mod projects;
 pub mod settings;
 pub mod status;
@@ -20,8 +21,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use config::{
-    Config, DelegationLimits, InterfaceConfig, KeyTable, KeyValue, KeysConfig, LoadedConfig,
-    LoginShell, ShellConfig,
+    Config, DelegationLimits, InterfaceConfig, InterfaceKeysPresent, KeyTable, KeyValue,
+    KeysConfig, LoadedConfig, LoginShell, ShellConfig,
 };
 pub use harness::{
     ChoiceOption, HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput,

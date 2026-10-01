@@ -683,6 +683,15 @@ enum Target {
     Tab,
 }
 
+/// The look the interface is drawn with.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code, reason = "the theme and icon set read it, in a later task")]
+struct AppearanceInForce {
+    theme: dispatch_config::preferences::ThemeChoice,
+    accent: dispatch_config::preferences::Accent,
+    icons: dispatch_config::preferences::IconSet,
+}
+
 /// The application.
 pub struct App {
     mode: Mode,
@@ -775,6 +784,27 @@ pub struct App {
     /// Where the sidebar's width and fold are kept, when this client keeps
     /// them.
     ui_dir: Option<PathBuf>,
+    /// Where `preferences.toml` is kept, when this client keeps it.
+    #[allow(dead_code, reason = "Settings applies through it, in a later task")]
+    preferences_dir: Option<PathBuf>,
+    /// What `preferences.toml` held when this client started or last applied.
+    #[allow(dead_code, reason = "Settings edits a copy of it, in a later task")]
+    preferences: dispatch_config::preferences::Preferences,
+    /// `config.toml`'s `[interface]`, kept to work out where a value came from.
+    #[allow(
+        dead_code,
+        reason = "Settings shows each value's source, in a later task"
+    )]
+    interface_config: dispatch_config::InterfaceConfig,
+    /// Which `[interface]` keys `config.toml` wrote.
+    #[allow(
+        dead_code,
+        reason = "Settings shows each value's source, in a later task"
+    )]
+    interface_present: dispatch_config::InterfaceKeysPresent,
+    /// The appearance in force. Stored now and drawn with in a later task.
+    #[allow(dead_code, reason = "the theme and icon set read it, in a later task")]
+    appearance: AppearanceInForce,
     /// The whole window, as last drawn: what tells a toggle whether there is
     /// room to dock the sidebar.
     window: Rect,
@@ -972,6 +1002,11 @@ impl App {
             pressed_sidebar: None,
             pressed_double: false,
             ui_dir: None,
+            preferences_dir: None,
+            preferences: dispatch_config::preferences::Preferences::default(),
+            interface_config: dispatch_config::InterfaceConfig::default(),
+            interface_present: dispatch_config::InterfaceKeysPresent::default(),
+            appearance: AppearanceInForce::default(),
             window: Rect::default(),
             overlay_area: Rect::default(),
             approval_pressed: None,
@@ -1556,6 +1591,38 @@ impl App {
         self.sidebar_width = kept.sidebar_width;
         self.sidebar_collapsed = kept.sidebar_collapsed;
         self.ui_dir = Some(dir);
+    }
+
+    /// Keeps preferences in `dir`, and takes up what was kept there.
+    ///
+    /// `interface` and `present` are `config.toml`'s `[interface]` and which of
+    /// its keys were written. Every interface setting is then applied as
+    /// `preferences.toml` over `config.toml` over the built-in default.
+    pub fn keep_preferences_in(
+        &mut self,
+        dir: impl Into<PathBuf>,
+        interface: dispatch_config::InterfaceConfig,
+        present: dispatch_config::InterfaceKeysPresent,
+    ) {
+        let dir = dir.into();
+        self.preferences = dispatch_config::preferences::load_or_default(&dir);
+        self.interface_config = interface;
+        self.interface_present = present;
+        self.preferences_dir = Some(dir);
+
+        let effective = dispatch_config::preferences::effective(
+            &self.interface_config,
+            &self.interface_present,
+            &self.preferences,
+        );
+        self.set_motion(effective.motion.value);
+        self.set_hover_claims_panes(effective.hover_claims_panes.value);
+        self.set_focus_follows_pointer(effective.focus_follows_pointer.value);
+        self.appearance = AppearanceInForce {
+            theme: effective.theme.value,
+            accent: effective.accent.value,
+            icons: effective.icons.value,
+        };
     }
 
     /// Writes the sidebar's width and fold back, when this client keeps them.

@@ -359,3 +359,28 @@ fn a_mode_written_as_an_array_of_tables_does_not_stop_the_file_loading() {
         KeyTable::Other("array".into())
     );
 }
+
+#[test]
+fn interface_present_is_true_only_for_keys_written() {
+    let dir = TempDir::new("interface-present");
+    let path = dir.config("[interface]\nmotion = true\nhover_claims_panes = false\n");
+
+    let present = Config::load_reporting(&path)
+        .expect("the file loads")
+        .interface_present;
+
+    assert!(present.motion);
+    assert!(present.hover_claims_panes, "false is still written");
+    assert!(!present.focus_follows_pointer);
+}
+
+#[test]
+fn interface_present_is_all_false_without_a_file_or_a_section() {
+    let dir = TempDir::new("interface-present-none");
+    let missing = Config::load_reporting(&dir.path().join("config.toml")).expect("loads");
+    assert_eq!(missing.interface_present, InterfaceKeysPresent::default());
+
+    let path = dir.config("[shell]\nlogin = \"never\"\n");
+    let loaded = Config::load_reporting(&path).expect("loads");
+    assert_eq!(loaded.interface_present, InterfaceKeysPresent::default());
+}
