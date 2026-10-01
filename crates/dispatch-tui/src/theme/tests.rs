@@ -264,3 +264,21 @@ fn the_colour_drawn_and_the_colour_animated_agree() {
     let rgb = theme.rgb(Role::Faded);
     assert_eq!(theme.faded, Color::Rgb(rgb.0, rgb.1, rgb.2));
 }
+
+#[test]
+fn the_light_palette_reads_well() {
+    let theme = Theme::new(Palette::LIGHT, Depth::TrueColor);
+    assert!(contrast(theme.rgb(Role::Faded), Palette::LIGHT.background) >= READABLE);
+}
+
+#[test]
+fn an_accent_replaces_the_palettes() {
+    use dispatch_config::preferences::{Accent, Rgb8};
+    let terminal = Rgb(1, 2, 3);
+    assert_eq!(accent_rgb(&Accent::Terminal, terminal), terminal);
+    assert_eq!(accent_rgb(&Accent::Blue, terminal), Rgb(0x61, 0xaf, 0xef));
+    assert_eq!(
+        accent_rgb(&Accent::Custom(Rgb8(9, 8, 7)), terminal),
+        Rgb(9, 8, 7)
+    );
+}

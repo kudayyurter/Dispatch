@@ -25,6 +25,7 @@ use crate::backend::{Backend, RemotePane};
 use crate::pointer;
 use crate::tabs::{self, TabHit, TabView};
 use dispatch_config::machines::{self, Machine};
+use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
 use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
@@ -33,7 +34,7 @@ use dispatch_tui::input::{
 };
 use dispatch_tui::menu::{Menu, MenuItem};
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
-use dispatch_tui::theme::{Chrome, Role};
+use dispatch_tui::theme::{Chrome, Palette, Role, accent_rgb};
 use dispatch_tui::{
     Command, FormAction, Item, Keymap, PaneWidget, Picker, Prompt, SettingsForm, Sidebar, Theme,
     sidebar, truncate,
@@ -685,7 +686,6 @@ enum Target {
 
 /// The look the interface is drawn with.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code, reason = "the theme and icon set read it, in a later task")]
 struct AppearanceInForce {
     theme: dispatch_config::preferences::ThemeChoice,
     accent: dispatch_config::preferences::Accent,
@@ -804,8 +804,8 @@ pub struct App {
         reason = "Settings shows each value's source, in a later task"
     )]
     interface_present: dispatch_config::InterfaceKeysPresent,
-    /// The appearance in force. Stored now and drawn with in a later task.
-    #[allow(dead_code, reason = "the theme and icon set read it, in a later task")]
+    /// The appearance in force, kept so start-up can apply it once the
+    /// terminal's own palette is known.
     appearance: AppearanceInForce,
     /// The whole window, as last drawn: what tells a toggle whether there is
     /// room to dock the sidebar.
@@ -887,6 +887,9 @@ pub struct App {
     sent: Vec<ClientMessage>,
     /// The colours Dispatch draws its own chrome in.
     theme: Theme,
+    /// What the terminal said its colours were, before any theme or accent
+    /// preference was laid over them.
+    terminal_palette: Palette,
     /// Where the time comes from: the real clock in the binary, one moved by
     /// hand in tests, so every timing here can be tested without sleeping.
     clock: Box<dyn Fn() -> Instant>,
@@ -1009,6 +1012,7 @@ impl App {
             interface_config: dispatch_config::InterfaceConfig::default(),
             interface_present: dispatch_config::InterfaceKeysPresent::default(),
             appearance: AppearanceInForce::default(),
+            terminal_palette: Palette::FALLBACK,
             window: Rect::default(),
             overlay_area: Rect::default(),
             approval_pressed: None,
@@ -1146,15 +1150,54 @@ impl App {
     }
 
     /// Draws the interface in `theme` from the next frame on.
+    ///
+    /// The palette is also kept as the terminal's own, which a `Terminal`
+    /// theme and accent are drawn from however the appearance changes later.
     pub fn set_theme(&mut self, theme: Theme) {
+        self.terminal_palette = theme.palette();
         self.theme = theme;
     }
 
+    /// Draws the interface in `theme`, `accent` and `icons` from the next
+    /// frame on.
+    ///
+    /// Cheap and idempotent, so a live preview can call it on every change.
+    /// The depth is kept: it is the terminal's, not a preference.
+    pub fn apply_appearance(&mut self, theme: ThemeChoice, accent: &Accent, icons: IconSet) {
+        self.appearance = AppearanceInForce {
+            theme,
+            accent: *accent,
+            icons,
+        };
+
+        let base = match theme {
+            ThemeChoice::Terminal => self.terminal_palette,
+            ThemeChoice::Dark => Palette::FALLBACK,
+            ThemeChoice::Light => Palette::LIGHT,
+        };
+        let palette = Palette {
+            accent: accent_rgb(accent, base.accent),
+            ..base
+        };
+        self.theme = Theme::new(palette, self.theme.depth());
+        self.set_glyphs(match icons {
+            IconSet::Plain => &dispatch_tui::glyphs::Glyphs::PLAIN,
+            IconSet::Nerd => &dispatch_tui::glyphs::Glyphs::NERD,
+        });
+    }
+
+    /// Applies the appearance `preferences.toml` and `[interface]` settled
+    /// on, once the terminal's palette has been read.
+    pub fn apply_stored_appearance(&mut self) {
+        let AppearanceInForce {
+            theme,
+            accent,
+            icons,
+        } = self.appearance;
+        self.apply_appearance(theme, &accent, icons);
+    }
+
     /// Draws the sidebar and the tab chips with `glyphs` from the next frame on.
-    #[allow(
-        dead_code,
-        reason = "Settings applies the icon set through it, in a later task"
-    )]
     pub fn set_glyphs(&mut self, glyphs: &'static dispatch_tui::glyphs::Glyphs) {
         self.glyphs = glyphs;
     }
@@ -6233,6 +6276,29 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    #[test]
+    fn appearance_rebuilds_the_theme_and_glyphs() {
+        use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
+        use dispatch_tui::glyphs::Glyphs;
+        use dispatch_tui::theme::{Palette, Rgb};
+
+        let (mut app, ..) = attached_app();
+        app.terminal_palette = Palette::FALLBACK;
+        let depth = app.theme.depth();
+
+        app.apply_appearance(ThemeChoice::Light, &Accent::Red, IconSet::Plain);
+
+        let palette = Palette {
+            accent: Rgb(0xe0, 0x6c, 0x75),
+            ..Palette::LIGHT
+        };
+        assert_eq!(app.theme, Theme::new(palette, depth));
+        // By the flag rather than by address: a `const` is not promised one
+        // address at every use.
+        assert!(!app.glyphs.nerd);
+        assert_eq!(app.glyphs.default_icon, Glyphs::PLAIN.default_icon);
     }
 
     #[test]

@@ -309,6 +309,9 @@ fn main() -> Result<ExitCode> {
     install_panic_hook();
     let mut guard = TerminalGuard::acquire()?;
     app.set_theme(guard.theme());
+    // After the terminal's palette is known: a `terminal` theme or accent is
+    // drawn from it.
+    app.apply_stored_appearance();
 
     run(&mut app, &mut guard)?;
     Ok(ExitCode::SUCCESS)

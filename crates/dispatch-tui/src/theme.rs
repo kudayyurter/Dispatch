@@ -6,6 +6,7 @@
 //! mixes everything else from those three; a terminal that does not answer
 //! gets a built-in dark palette in the same spirit.
 
+use dispatch_config::preferences::Accent;
 use ratatui::style::{Color, Modifier, Style};
 
 /// A colour as three 8-bit channels.
@@ -91,6 +92,32 @@ impl Palette {
         foreground: Rgb(0xc8, 0xc8, 0xd8),
         accent: Rgb(0xb4, 0xa0, 0xf0),
     };
+
+    /// A light palette, for a terminal left on its own dark one or for a
+    /// user who wants Dispatch's chrome light whatever the terminal is.
+    pub const LIGHT: Palette = Palette {
+        background: Rgb(0xfa, 0xfa, 0xfa),
+        foreground: Rgb(0x38, 0x3a, 0x42),
+        accent: Rgb(0xa6, 0x26, 0xa4),
+    };
+}
+
+/// The colour an accent choice stands for, given the terminal's own accent
+/// for the choice that defers to it.
+#[must_use]
+pub fn accent_rgb(accent: &Accent, terminal: Rgb) -> Rgb {
+    let preset = |r, g, b| Rgb(r, g, b);
+    match accent {
+        Accent::Terminal => terminal,
+        Accent::Violet => preset(0xb4, 0xa0, 0xf0),
+        Accent::Blue => preset(0x61, 0xaf, 0xef),
+        Accent::Teal => preset(0x56, 0xb6, 0xc2),
+        Accent::Green => preset(0x98, 0xc3, 0x79),
+        Accent::Amber => preset(0xe5, 0xc0, 0x7b),
+        Accent::Red => preset(0xe0, 0x6c, 0x75),
+        Accent::Pink => preset(0xff, 0x79, 0xc6),
+        Accent::Custom(rgb) => Rgb(rgb.0, rgb.1, rgb.2),
+    }
 }
 
 /// How many colours the terminal can show.
@@ -170,6 +197,18 @@ impl Theme {
             palette,
             depth,
         }
+    }
+
+    /// The palette this theme was mixed from.
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        self.palette
+    }
+
+    /// The depth this theme draws at.
+    #[must_use]
+    pub fn depth(&self) -> Depth {
+        self.depth
     }
 
     /// The built-in palette at full depth.
