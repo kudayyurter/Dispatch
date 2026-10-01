@@ -111,6 +111,7 @@ fn search_finds_across_categories_and_offers_clear_when_empty() {
 #[test]
 fn tab_walks_search_categories_fields_buttons_and_back() {
     let mut view = view();
+    view.set_pending(Some("1 change in Appearance".into()));
     assert_eq!(view.focus(), Focus::Categories);
     view.focus_next();
     assert_eq!(view.focus(), Focus::Fields);
@@ -120,6 +121,16 @@ fn tab_walks_search_categories_fields_buttons_and_back() {
     assert_eq!(view.focus(), Focus::Search);
     view.focus_previous();
     assert_eq!(view.focus(), Focus::Buttons);
+}
+
+#[test]
+fn tab_passes_over_a_footer_without_buttons() {
+    let mut view = view();
+    view.set_focus(Focus::Fields);
+    view.focus_next();
+    assert_eq!(view.focus(), Focus::Search);
+    view.focus_previous();
+    assert_eq!(view.focus(), Focus::Fields);
 }
 
 #[test]
@@ -247,4 +258,20 @@ fn the_list_keeps_its_place_until_the_selection_leaves_it() {
     view.select_field(29);
     let layout = view.layout(area);
     assert!(layout.fields.iter().any(|(_, i)| *i == 29));
+}
+
+#[test]
+fn the_compact_category_row_shows_when_it_has_the_keyboard() {
+    let mut view = view();
+    view.set_chrome(crate::theme::loud_chrome());
+    let selection = crate::theme::loud_chrome().selection;
+    let cell_bg = |view: &SettingsView| {
+        let (buf, layout) = draw(view, 60, 18);
+        let (row, _) = layout.categories[0];
+        buf[(row.x + 1, row.y)].bg
+    };
+    view.set_focus(Focus::Categories);
+    assert_eq!(cell_bg(&view), selection.bg.expect("a bar"));
+    view.set_focus(Focus::Fields);
+    assert_ne!(cell_bg(&view), selection.bg.expect("a bar"));
 }

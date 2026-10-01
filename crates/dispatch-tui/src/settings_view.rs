@@ -24,7 +24,7 @@ const COMPACT_WIDTH: u16 = 72;
 /// Below this the box is only a message and the close control.
 const MIN_SIZE: (u16, u16) = (40, 10);
 /// The message a window too small to use Settings shows.
-const TOO_SMALL: &str = "Make the window larger to use Settings";
+const TOO_SMALL: &str = "Make the window larger to use Settings · Esc closes and discards changes";
 
 /// What a field edits, and so how its value is drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,22 +339,26 @@ impl SettingsView {
         };
     }
 
-    /// Search, categories, fields, buttons, and round again.
+    /// Search, categories, fields, buttons, and round again. The footer is
+    /// passed over while it has no buttons, since focus there would show
+    /// nowhere and Enter would do nothing.
     pub fn focus_next(&mut self) {
+        let buttons = !self.footer_buttons().is_empty();
         self.focus_on(match self.focus {
             Focus::Search => Focus::Categories,
             Focus::Categories => Focus::Fields,
-            Focus::Fields => Focus::Buttons,
-            Focus::Buttons => Focus::Search,
+            Focus::Fields if buttons => Focus::Buttons,
+            Focus::Fields | Focus::Buttons => Focus::Search,
         });
     }
 
     pub fn focus_previous(&mut self) {
+        let buttons = !self.footer_buttons().is_empty();
         self.focus_on(match self.focus {
-            Focus::Search => Focus::Buttons,
+            Focus::Search if buttons => Focus::Buttons,
+            Focus::Search | Focus::Buttons => Focus::Fields,
             Focus::Categories => Focus::Search,
             Focus::Fields => Focus::Categories,
-            Focus::Buttons => Focus::Fields,
         });
     }
 
@@ -885,15 +889,23 @@ impl Widget for &SettingsView {
             };
             let chosen = *index == self.category;
             if layout.compact {
-                put(
+                // The one row stands for the whole list, so it carries the
+                // focus bar as the list's selected row would.
+                let style = if self.focus == Focus::Categories {
+                    chrome.selection
+                } else {
+                    chrome.text
+                };
+                fill(
                     buf,
                     *row,
-                    row.x,
-                    row.y,
-                    name,
-                    usize::from(row.width),
-                    chrome.text,
+                    if self.focus == Focus::Categories {
+                        style
+                    } else {
+                        Style::default()
+                    },
                 );
+                put(buf, *row, row.x, row.y, name, usize::from(row.width), style);
                 continue;
             }
             let style = if chosen && self.focus == Focus::Categories {

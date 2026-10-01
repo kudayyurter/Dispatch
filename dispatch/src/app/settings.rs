@@ -235,6 +235,13 @@ fn hex(Rgb8(r, g, b): Rgb8) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// Adds `c` to a colour being typed, when it can be part of `#rrggbb`.
+fn push_hex(text: &mut String, c: char) {
+    if (c == '#' || c.is_ascii_hexdigit()) && text.len() < 7 {
+        text.push(c);
+    }
+}
+
 /// `index` stepped one place and wrapped within `len`.
 fn wrapped(index: usize, len: usize, forward: bool) -> usize {
     if forward {
@@ -871,9 +878,27 @@ impl App {
         self.in_settings(|app, workspace| app.press_settings_button(workspace, id));
     }
 
+    /// Whether the window is too small to show anything of the workspace
+    /// but its resize message and `[×]`.
+    fn settings_too_small(&self, workspace: &SettingsWorkspace) -> bool {
+        workspace.view.layout(self.overlay_area).too_small
+    }
+
+    /// Closes Settings without asking, throwing pending edits away: what a
+    /// window too small to show the prompt does, as its message says.
+    fn close_discarding(&mut self, workspace: &mut SettingsWorkspace) -> Flow {
+        workspace.leaving = None;
+        workspace.view.set_prompt(None);
+        self.discard_settings(workspace);
+        Flow::Close
+    }
+
     /// `[×]` was pressed.
     pub(super) fn settings_close(&mut self) {
-        self.in_settings(|_, workspace| {
+        self.in_settings(|app, workspace| {
+            if app.settings_too_small(workspace) {
+                return app.close_discarding(workspace);
+            }
             if workspace.leaving.is_some() {
                 return Flow::Stay;
             }
@@ -1087,6 +1112,15 @@ impl App {
             return Flow::Stay;
         }
 
+        // Too small to draw anything but the message, which says Esc closes
+        // and discards: every other key would edit what cannot be seen.
+        if self.settings_too_small(workspace) {
+            if key.code == KeyCode::Esc {
+                return self.close_discarding(workspace);
+            }
+            return Flow::Stay;
+        }
+
         // The prompt holds the keyboard on its buttons until it is answered.
         if workspace.leaving.is_some() {
             match key.code {
@@ -1180,15 +1214,32 @@ impl App {
         Flow::Stay
     }
 
+    /// Takes a paste into whatever is being typed: the custom accent, or the
+    /// search while it has the keyboard. Line breaks are dropped, as in every
+    /// prompt: Enter is a decision the paste must not make.
+    pub(super) fn settings_paste(&mut self, pasted: &str) {
+        self.in_settings(|app, workspace| {
+            if workspace.leaving.is_some() || app.settings_too_small(workspace) {
+                return Flow::Stay;
+            }
+            let typed = pasted.chars().filter(|c| !c.is_control());
+            if let Some(text) = workspace.text.as_mut() {
+                typed.for_each(|c| push_hex(text, c));
+                app.refresh_settings(workspace);
+            } else if workspace.view.focus() == Focus::Search {
+                typed.for_each(|c| workspace.view.push_search(c));
+            }
+            Flow::Stay
+        });
+    }
+
     /// Types into the custom accent.
     fn edit_text(&mut self, workspace: &mut SettingsWorkspace, key: &KeyEvent) {
         let Some(text) = workspace.text.as_mut() else {
             return;
         };
         match key.code {
-            KeyCode::Char(c) if (c == '#' || c.is_ascii_hexdigit()) && text.len() < 7 => {
-                text.push(c);
-            }
+            KeyCode::Char(c) => push_hex(text, c),
             KeyCode::Backspace => {
                 text.pop();
             }

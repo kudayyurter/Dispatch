@@ -3432,6 +3432,10 @@ impl App {
         // dropped: Enter is a decision, and the newline a copied path often
         // ends with must not make it for the user.
         if let Event::Paste(text) = event {
+            if matches!(self.overlay, Some(Overlay::Preferences(_))) {
+                self.settings_paste(text);
+                return Ok(());
+            }
             match &mut self.overlay {
                 Some(Overlay::OpenOn { prompt, .. } | Overlay::RenameTab { prompt, .. }) => text
                     .chars()
@@ -15951,6 +15955,110 @@ args = ["--effort", "{value}"]
                 .view
                 .selected_field()
                 .is_some_and(|f| f.changed)
+        );
+    }
+
+    #[test]
+    fn a_window_too_small_for_settings_takes_only_esc_which_discards() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        let before = app.theme.palette();
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_ne!(app.theme.palette(), before, "Light is previewed");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 8))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        assert!(app.settings_layout().expect("open").too_small);
+        let text = rendered_text(&terminal);
+        assert!(text.contains("discards"), "{text}");
+
+        let draft = workspace(&app).draft.clone();
+        let focus = workspace(&app).view.focus();
+        for key in [
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ] {
+            press(&mut app, key);
+        }
+        assert!(
+            workspace(&app).draft == draft,
+            "no key edits what cannot be seen"
+        );
+        assert_eq!(workspace(&app).view.focus(), focus);
+        assert!(workspace(&app).view.search().is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.overlay.is_none(),
+            "Esc closes without a prompt to answer"
+        );
+        assert_eq!(app.theme.palette(), before, "and the edit was discarded");
+        assert!(!dir.join(dispatch_config::preferences::FILE).exists());
+    }
+
+    #[test]
+    fn tab_skips_the_footer_when_it_has_no_buttons() {
+        use dispatch_tui::settings_view::Focus;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        press_alt(&mut app, ',');
+        assert_eq!(workspace(&app).view.focus(), Focus::Categories);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(workspace(&app).view.focus(), Focus::Fields);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            workspace(&app).view.focus(),
+            Focus::Search,
+            "nothing is pending, so there is no button to stop on"
+        );
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(workspace(&app).view.focus(), Focus::Fields);
+    }
+
+    #[test]
+    fn a_paste_reaches_the_settings_search_without_its_line_break() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        press_alt(&mut app, ',');
+        press(&mut app, KeyCode::BackTab);
+        app.handle(&Event::Paste("motion\r\n".into()), Size::new(100, 30))
+            .expect("a paste is handled");
+        assert_eq!(workspace(&app).view.search(), "motion");
+    }
+
+    #[test]
+    fn a_paste_reaches_the_custom_accent_being_typed() {
+        use dispatch_config::preferences::{Accent, Rgb8};
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        app.handle(&Event::Paste("#ff8800\n".into()), Size::new(100, 30))
+            .expect("a paste is handled");
+        assert_eq!(workspace(&app).text.as_deref(), Some("#ff8800"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            workspace(&app).draft.appearance.accent,
+            Some(Accent::Custom(Rgb8(0xff, 0x88, 0x00)))
         );
     }
 
