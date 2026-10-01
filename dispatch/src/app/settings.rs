@@ -27,8 +27,12 @@ const THEMES: [(ThemeChoice, &str); 3] = [
 ];
 
 /// The accents that are a plain choice; `Custom…` follows them.
+///
+/// `Accent::Terminal` is stored as "terminal" but shown as the theme's own:
+/// following the terminal it is the terminal's accent, and under Dark or
+/// Light it is the preset's, so "Terminal" would be wrong half the time.
 const PRESETS: [(Accent, &str); 8] = [
-    (Accent::Terminal, "Terminal"),
+    (Accent::Terminal, "Theme default"),
     (Accent::Violet, "Violet"),
     (Accent::Blue, "Blue"),
     (Accent::Teal, "Teal"),
@@ -405,7 +409,7 @@ impl App {
             row(
                 "accent",
                 "Accent",
-                "The colour that marks what is selected.",
+                "The colour that marks what is selected; Theme default is the terminal's own, or the preset's.",
                 choices(
                     PRESETS
                         .iter()

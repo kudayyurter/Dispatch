@@ -1,6 +1,7 @@
 //! Tests for the directory browser.
 
 use super::*;
+use crate::sidebar::REPOSITORY;
 
 /// A directory tree to browse, cleaned up when the test ends.
 struct Tree(PathBuf);

@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::button::{self, Button, ButtonId, DialogLayout};
-use crate::sidebar::{REPOSITORY, SHUT_FOLDER};
+use crate::glyphs::Glyphs;
 use crate::theme::Chrome;
 
 /// One directory on offer.
@@ -64,6 +64,8 @@ pub struct Browser {
     scanning: bool,
     /// The dialog colours, set by whoever draws the overlay.
     chrome: Chrome,
+    /// The folder and repository marks, from the icon set in force.
+    glyphs: &'static Glyphs,
     /// What can be clicked along the foot, when the caller wants any.
     buttons: Vec<Button>,
     /// The button held down, drawn in the selection.
@@ -90,6 +92,7 @@ impl Browser {
             selected: 0,
             scanning: false,
             chrome: Chrome::default(),
+            glyphs: &Glyphs::NERD,
             buttons: Vec::new(),
             pressed: None,
             hovered: None,
@@ -126,6 +129,18 @@ impl Browser {
     /// Draws in `chrome`.
     pub fn set_chrome(&mut self, chrome: Chrome) {
         self.chrome = chrome;
+    }
+
+    /// The same browser, marking folders and repositories with `glyphs`.
+    #[must_use]
+    pub fn with_glyphs(mut self, glyphs: &'static Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
+    }
+
+    /// Marks folders and repositories with `glyphs` from the next frame on.
+    pub fn set_glyphs(&mut self, glyphs: &'static Glyphs) {
+        self.glyphs = glyphs;
     }
 
     /// Whether the listing is a scan's findings.
@@ -602,7 +617,7 @@ impl Widget for &Browser {
                 &" ".repeat(row.width as usize),
                 style,
             );
-            write(buf, *row, row.x, row.y, SHUT_FOLDER, style);
+            write(buf, *row, row.x, row.y, self.glyphs.folder, style);
 
             // A scan reports paths from all over the tree, so the label alone
             // would not say which "src" this is — and a path cut to fit keeps
@@ -617,7 +632,7 @@ impl Widget for &Browser {
 
             if entry.repo {
                 let x = row.x + 3 + u16::try_from(label.chars().count()).unwrap_or(0);
-                write(buf, *row, x, row.y, REPOSITORY, style);
+                write(buf, *row, x, row.y, self.glyphs.repository, style);
             }
         }
 

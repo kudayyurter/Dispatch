@@ -220,7 +220,7 @@ effective interface values (`set_motion`, `set_focus_follows_pointer`,
 ├────────────────┬───────────────────────────────────────────┤
 │ Mouse & layout │ Appearance                                │
 │ Appearance     │ Theme        ‹ Follow terminal ›   Settings│
-│ Advanced       │ Accent       ‹ Terminal ›          Built-in│
+│ Advanced       │ Accent       ‹ Theme default ›     Built-in│
 │                │ Motion       ‹ On ›               config   │
 │                │ Icons        ‹ Nerd Font ›         Built-in│
 │                │   Applies now · this window previews       │
@@ -285,7 +285,7 @@ part of the section's pending changes.
 | Field | Kind | Applies |
 |---|---|---|
 | Theme | Choice: Follow terminal, Dark, Light | now (preview) |
-| Accent | Choice: Terminal, Violet, Blue, Teal, Green, Amber, Red, Pink, Custom… | now (preview) |
+| Accent | Choice: Theme default, Violet, Blue, Teal, Green, Amber, Red, Pink, Custom… | now (preview) |
 | Custom accent | Text `#rrggbb`, shown when Accent is Custom | now (preview) |
 | Motion | Toggle | now |
 | Icons | Choice: Nerd Font, Plain | now (preview) |
@@ -324,8 +324,16 @@ All three pass through `Theme::new`, so the 4.5:1 secondary-text rule applies.
 | Red | `#e06c75` |
 | Pink | `#ff79c6` |
 
-Terminal keeps the reported accent, which is palette slot 5. In 256 colours, a
-non-terminal accent is mapped through `at_depth` like every other mixed colour.
+**Theme default** (stored as `accent = "terminal"`) keeps the theme's own
+accent: under Follow terminal it is the reported accent, palette slot 5; under
+Dark or Light it is the preset's. In 256 colours, an accent that is not the
+terminal's slot 5 is mapped through `at_depth` like every other mixed colour.
+
+**Surface.** A Dark or Light preset's text is mixed for its own background, so
+Dispatch paints that background behind its own surfaces: the sidebar, the tab
+row, the footer, every dialog and menu, and the Settings workspace. Ordinary
+text there takes the palette's foreground. Pane contents are never repainted,
+and Follow terminal paints no background.
 
 **Icons.** A new `crates/dispatch-tui/src/glyphs.rs` defines `pub struct Glyphs`.
 It holds every glyph the chrome draws: the state glyphs (starting, running,

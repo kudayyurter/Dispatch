@@ -1213,6 +1213,9 @@ impl App {
     /// Draws the sidebar and the tab chips with `glyphs` from the next frame on.
     pub fn set_glyphs(&mut self, glyphs: &'static dispatch_tui::glyphs::Glyphs) {
         self.glyphs = glyphs;
+        if let Some(Overlay::Browse(browser)) = &mut self.overlay {
+            browser.set_glyphs(glyphs);
+        }
     }
 
     /// Turns motion on or off: spinners, pulses, easing and transitions.
@@ -4327,7 +4330,9 @@ impl App {
         };
 
         self.overlay = Some(Overlay::Browse(
-            browser.with_buttons(pointer::buttons::open_cancel()),
+            browser
+                .with_buttons(pointer::buttons::open_cancel())
+                .with_glyphs(self.glyphs),
         ));
     }
 
@@ -6503,6 +6508,46 @@ mod tests {
             before,
             "the child's output is its own"
         );
+    }
+
+    /// Whether any cell drawn holds a private-use codepoint: a Nerd Font
+    /// glyph.
+    fn draws_nerd_glyphs(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {
+        rendered_text(terminal)
+            .chars()
+            .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
+    }
+
+    #[test]
+    fn plain_icons_reach_the_project_browser() {
+        use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
+        let (mut app, ..) = attached_app();
+        let dir = scratch("browse-plain");
+        std::fs::create_dir_all(dir.join("plain")).expect("written");
+        std::fs::create_dir_all(dir.join("repo/.git")).expect("written");
+        app.browse_from(&dir);
+        let mut terminal = a_wide_terminal();
+
+        app.open_browser();
+        drawn(&mut app, &mut terminal);
+        assert!(draws_nerd_glyphs(&terminal), "Nerd Font is the default");
+        app.overlay = None;
+
+        app.apply_appearance(ThemeChoice::Terminal, &Accent::Terminal, IconSet::Plain);
+        app.open_browser();
+        drawn(&mut app, &mut terminal);
+        assert!(
+            !draws_nerd_glyphs(&terminal),
+            "{}",
+            rendered_text(&terminal)
+        );
+        let text = rendered_text(&terminal);
+        assert!(text.contains("/ repo @"), "{text}");
+
+        // Changed while it is open, as a preview would.
+        app.apply_appearance(ThemeChoice::Terminal, &Accent::Terminal, IconSet::Nerd);
+        drawn(&mut app, &mut terminal);
+        assert!(draws_nerd_glyphs(&terminal));
     }
 
     #[test]
@@ -15926,6 +15971,25 @@ args = ["--effort", "{value}"]
             app.theme.palette().accent,
             before,
             "nothing visibly changed"
+        );
+    }
+
+    #[test]
+    fn the_default_accent_is_called_the_themes_own() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        let field = workspace(&app).view.selected_field().expect("Accent");
+        assert_eq!(field.id, "accent");
+        assert_eq!(field.value, "Theme default");
+        assert!(
+            matches!(&field.kind, dispatch_tui::settings_view::FieldKind::Choice(names)
+                if names.first().map(String::as_str) == Some("Theme default")),
+            "{:?}",
+            field.kind
         );
     }
 
