@@ -13,4 +13,4 @@ pub use mouse::{MouseAction, MouseButton, MouseEncoder, MouseInput};
 pub use screen::{Attrs, Cell, Rgb, Screen, ScreenReader};
 pub use session::{DRAIN_BUDGET, INPUT_BUDGET, Pty, PtyError, PtySession, RunState};
 pub use title::{Signals, TitleScanner};
-pub use vt::{Cursor, ScrollTo, Size, VtError, VtTerminal, encode_paste};
+pub use vt::{Cursor, ScrollTo, Scrollbar, Size, VtError, VtTerminal, encode_paste};

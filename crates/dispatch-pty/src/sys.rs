@@ -38,6 +38,9 @@ pub mod data {
     /// A mode's current value. Output type `GhosttyTerminalModeConfig *`, with
     /// its `mode` field set before the call.
     pub const MODE: i32 = 37;
+    /// The viewport's place in the scrollback. Output type
+    /// `GhosttyTerminalScrollbar *`.
+    pub const SCROLLBAR: i32 = 9;
 }
 
 /// `GhosttyTerminalModeConfig` from `terminal.h`, whose layout is frozen.
@@ -50,6 +53,18 @@ pub struct ModeConfig {
     pub mode: u16,
     /// The mode's current value.
     pub value: bool,
+}
+
+/// Mirrors `GhosttyTerminalScrollbar`, whose layout is frozen.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalScrollbar {
+    /// Rows in the whole scrollable area.
+    pub total: u64,
+    /// The first row the viewport shows.
+    pub offset: u64,
+    /// Rows the viewport shows.
+    pub len: u64,
 }
 
 /// `GHOSTTY_MODE_BRACKETED_PASTE`, which is `ghostty_mode_new(2004, false)`.

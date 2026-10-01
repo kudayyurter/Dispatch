@@ -60,6 +60,27 @@ impl Size {
     }
 }
 
+/// Where the viewport is in the scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollbar {
+    /// Rows in the whole scrollable area.
+    pub total: u64,
+    /// The first row the viewport shows.
+    pub offset: u64,
+    /// Rows the viewport shows.
+    pub len: u64,
+}
+
+impl Scrollbar {
+    /// How many rows of newer output lie below the viewport.
+    #[must_use]
+    pub fn above_live(&self) -> u64 {
+        self.total
+            .saturating_sub(self.offset)
+            .saturating_sub(self.len)
+    }
+}
+
 /// Where to move a pane's viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollTo {
@@ -225,6 +246,26 @@ impl VtTerminal {
         // SAFETY: the handle is live and the tag matches the union member set
         // above, which is the contract the tagged union documents.
         unsafe { sys::ghostty_terminal_scroll_viewport(self.handle, behavior) };
+    }
+
+    /// Where the viewport is in the scrollback, for saying how far back it is.
+    pub fn scrollbar(&self) -> Result<Scrollbar, VtError> {
+        let mut raw = sys::TerminalScrollbar::default();
+        // SAFETY: the terminal is live, and `raw` is the type the SCROLLBAR
+        // selector documents.
+        let code = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::data::SCROLLBAR,
+                (&raw mut raw).cast::<c_void>(),
+            )
+        };
+        VtError::check("ghostty_terminal_get(SCROLLBAR)", code)?;
+        Ok(Scrollbar {
+            total: raw.total,
+            offset: raw.offset,
+            len: raw.len,
+        })
     }
 
     /// The visible screen as plain text, one line per row.
@@ -638,5 +679,20 @@ mod scroll_tests {
         terminal.scroll(ScrollTo::Delta(-5));
 
         assert!(lines(&terminal).iter().any(|l| l.contains("only")));
+    }
+
+    #[test]
+    fn the_scrollbar_counts_the_lines_above_live() {
+        let mut terminal = VtTerminal::new(Size::new(20, 5)).expect("a terminal");
+        for line in 0..30 {
+            terminal.feed(format!("line {line}\r\n").as_bytes());
+        }
+        let at_bottom = terminal.scrollbar().expect("a scrollbar");
+        assert_eq!(at_bottom.above_live(), 0);
+        assert_eq!(at_bottom.len, 5);
+        assert!(at_bottom.total > 5);
+
+        terminal.scroll(ScrollTo::Delta(-3));
+        assert_eq!(terminal.scrollbar().expect("a scrollbar").above_live(), 3);
     }
 }
