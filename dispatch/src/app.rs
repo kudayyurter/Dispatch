@@ -65,6 +65,82 @@ const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
 /// What the status row says when no pane is waiting on the user.
 const NOTHING_WAITING: &str = "nothing waiting on you";
 
+/// How long a message that reports success stays on the footer.
+const MESSAGE_FOR: Duration = Duration::from_secs(5);
+
+/// Whether a message reports something done or something wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    /// Done; it goes after [`MESSAGE_FOR`].
+    Info,
+    /// Wrong; it stays until something replaces it or it is clicked away.
+    Error,
+}
+
+/// The footer's message.
+#[derive(Clone)]
+struct Status {
+    text: String,
+    kind: StatusKind,
+    at: Instant,
+}
+
+impl Status {
+    fn new(text: String, kind: StatusKind, at: Instant) -> Self {
+        Self { text, kind, at }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+    }
+
+    /// An empty message is never an error, so a cleared footer reads as calm.
+    fn is_error(&self) -> bool {
+        self.kind == StatusKind::Error && !self.text.is_empty()
+    }
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self::new(String::new(), StatusKind::Info, Instant::now())
+    }
+}
+
+// Deref keeps the many reads (`is_empty`, `starts_with`, `contains`) as they were.
+impl std::ops::Deref for Status {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+// Shows the words alone: a timestamp would make two equal messages unequal in
+// a test that compares their printed forms.
+impl std::fmt::Debug for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.text, f)
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<&str> for Status {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<str> for Status {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
 ///
@@ -732,7 +808,7 @@ pub struct App {
     /// The daemon resolves a request before it announces the pane, so the
     /// title is known one message before there is a row to put it on.
     child_titles: HashMap<PaneId, String>,
-    status: String,
+    status: Status,
     /// When this client last looked at its own panes' and projects' branches.
     branches_checked: Option<Instant>,
     /// How often it looks: [`dispatch_os::git::RECHECK`], or every poll in a
@@ -894,7 +970,7 @@ impl App {
             blocked_since: HashMap::new(),
             answered: HashMap::new(),
             child_titles: HashMap::new(),
-            status: String::new(),
+            status: Status::default(),
             branches_checked: None,
             branch_every: dispatch_os::git::RECHECK,
             quit: false,
@@ -1016,7 +1092,7 @@ impl App {
     /// looking, and the status line is the one place that survives to the
     /// first draw with no sidebar row and no attachment to hang a warning on.
     pub fn set_status(&mut self, status: impl Into<String>) {
-        self.status = status.into();
+        self.warn(status);
     }
 
     /// Draws the interface in `theme` from the next frame on.
@@ -1146,7 +1222,7 @@ impl App {
             .device(device)
             .map_or_else(|| "that machine".to_string(), |d| d.name.clone());
 
-        self.status = format!("{name} is unreachable");
+        self.warn(format!("{name} is unreachable"));
     }
 
     /// Folds or unfolds whatever the focus is in.
@@ -1290,7 +1366,7 @@ impl App {
 
         match next {
             Some(id) => self.go_to_pane(id),
-            None => self.status = NOTHING_WAITING.to_string(),
+            None => self.say(NOTHING_WAITING),
         }
     }
 
@@ -1357,7 +1433,7 @@ impl App {
             .collect();
 
         if items.is_empty() {
-            self.status = NOTHING_WAITING.to_string();
+            self.say(NOTHING_WAITING);
             return;
         }
         self.overlay = Some(Overlay::Attention(
@@ -1574,7 +1650,7 @@ impl App {
         };
 
         if let Err(error) = written {
-            self.status = format!("could not keep {}: {error}", root.display());
+            self.warn(format!("could not keep {}: {error}", root.display()));
         }
     }
 
@@ -1591,7 +1667,7 @@ impl App {
         };
 
         if let Err(error) = written {
-            self.status = format!("could not drop {}: {error}", root.display());
+            self.warn(format!("could not drop {}: {error}", root.display()));
         }
     }
 
@@ -1643,7 +1719,7 @@ impl App {
         let place = std::mem::take(&mut self.placing);
 
         let Some(project_id) = self.state.selected_project() else {
-            self.status = "no project selected".into();
+            self.warn("no project selected");
             return Ok(());
         };
 
@@ -1662,11 +1738,11 @@ impl App {
         let (display_name, launch) = match resolved {
             Some(Ok(found)) => found,
             Some(Err(reason)) => {
-                self.status = reason;
+                self.warn(reason);
                 return Ok(());
             }
             None => {
-                self.status = format!("unknown harness {harness:?}");
+                self.warn(format!("unknown harness {harness:?}"));
                 return Ok(());
             }
         };
@@ -1689,7 +1765,7 @@ impl App {
                 place,
                 settings: chosen,
             });
-            self.status = format!("starting {display_name}…");
+            self.say(format!("starting {display_name}…"));
             return Ok(());
         }
 
@@ -1707,7 +1783,7 @@ impl App {
         let session = match PtySession::spawn(&launch, &cwd, area) {
             Ok(session) => session,
             Err(error) => {
-                self.status = format!("failed to start {harness}: {error:#}");
+                self.warn(format!("failed to start {harness}: {error:#}"));
                 return Ok(());
             }
         };
@@ -1840,14 +1916,47 @@ impl App {
     /// that sweeps it is the one that shows its end, and a closed pane's tile
     /// holds the grid until that frame is drawn.
     #[must_use]
-    pub fn next_frame(&self, _now: Instant) -> Option<Duration> {
+    pub fn next_frame(&self, now: Instant) -> Option<Duration> {
         if !self.animations.is_empty() {
             return Some(TWEEN_FRAME);
         }
 
         // Only what the last frame drew: a running pane folded away or
         // scrolled out of the sidebar has no spinner to turn.
-        (self.motion && self.spinner_drawn).then_some(SPIN_FRAME)
+        // A success message goes by itself: the frame that clears it is due
+        // when it expires, even with nothing else moving.
+        let expiry = (!self.status.is_empty() && !self.status.is_error())
+            .then(|| MESSAGE_FOR.saturating_sub(now.saturating_duration_since(self.status.at)));
+        let spin = (self.motion && self.spinner_drawn).then_some(SPIN_FRAME);
+        match (spin, expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Puts a message on the footer that reports something done.
+    fn say(&mut self, text: impl Into<String>) {
+        self.status = Status::new(text.into(), StatusKind::Info, self.now());
+    }
+
+    /// Puts a message on the footer that reports something wrong.
+    fn warn(&mut self, text: impl Into<String>) {
+        self.status = Status::new(text.into(), StatusKind::Error, self.now());
+    }
+
+    /// Empties the footer's message.
+    fn clear_status(&mut self) {
+        self.status.clear();
+    }
+
+    /// Clears a message that reports success once its time is up; an error
+    /// stays until something replaces it.
+    fn expire_status(&mut self) {
+        let due = self.status.kind == StatusKind::Info
+            && self.now().saturating_duration_since(self.status.at) >= MESSAGE_FOR;
+        if due {
+            self.status.clear();
+        }
     }
 
     /// Takes on a pane that now exists, wherever its process is.
@@ -2076,11 +2185,11 @@ impl App {
             .state
             .device(device)
             .map_or_else(|| name.to_string(), |d| d.name.clone());
-        self.status = if first {
+        self.say(if first {
             format!("connected to {shown}")
         } else {
             format!("reattached to {shown}")
-        };
+        });
 
         true
     }
@@ -2116,7 +2225,7 @@ impl App {
             .device(device)
             .map(|d| d.name.clone())
             .unwrap_or_default();
-        self.status = format!("{name} unreachable: {error}");
+        self.warn(format!("{name} unreachable: {error}"));
         true
     }
 
@@ -2311,7 +2420,7 @@ impl App {
             }
 
             ServerMessage::Error { error } => {
-                self.status = error.to_string();
+                self.warn(error.to_string());
                 true
             }
 
@@ -2412,13 +2521,16 @@ impl App {
                 if typed_now {
                     let list = self.kept_list(device);
                     self.unkeep(&list, &root);
-                    self.status = format!("cannot open {} on {name}: {reason}", root.display());
+                    self.warn(format!(
+                        "cannot open {} on {name}: {reason}",
+                        root.display()
+                    ));
                 } else {
-                    self.status = format!(
+                    self.warn(format!(
                         "cannot open {} on {name}: {reason} \
                          (still kept; delete it from projects.toml if it is gone)",
                         root.display()
-                    );
+                    ));
                 }
                 true
             }
@@ -2963,7 +3075,7 @@ impl App {
         // Entering a mode wipes a stale message, so what the mode's row shows
         // between its name and its keys is about this mode.
         if !mode.is_modal() && self.router.key_mode().is_modal() {
-            self.status.clear();
+            self.clear_status();
         }
 
         self.perform(action);
@@ -3151,7 +3263,7 @@ impl App {
                 Some(Overlay::AddMachine(add)) => add.paste(text),
                 Some(Overlay::Settings { form, .. }) => {
                     if let FormAction::Refused(why) = form.paste(text) {
-                        self.status = why;
+                        self.warn(why);
                     }
                 }
                 _ => {}
@@ -3387,7 +3499,7 @@ impl App {
         let chosen = if browser.is_path() {
             let typed = browser.typed_dir();
             if typed.is_none() {
-                self.status = format!("no such directory: {}", browser.input());
+                self.warn(format!("no such directory: {}", browser.input()));
             }
             typed
         } else {
@@ -3429,7 +3541,7 @@ impl App {
 
         self.overlay = None;
         self.add_project_on(device, root.clone());
-        self.status = format!("opening {} on {name}", root.display());
+        self.say(format!("opening {} on {name}", root.display()));
     }
 
     /// Acts on one key while a machine is being added.
@@ -3478,14 +3590,17 @@ impl App {
             return true;
         };
         if let Err(error) = machines::add(&dir, machine.clone(), &this_machine()) {
-            self.status = format!("could not save {}: {error}", machine.name);
+            self.warn(format!("could not save {}: {error}", machine.name));
             return true;
         }
 
         let device = client.device();
         client.subscribe();
         self.attach_named(client, Some(machine.name.clone()), Vec::new());
-        self.status = format!("added {} (its daemon calls itself {device})", machine.name);
+        self.say(format!(
+            "added {} (its daemon calls itself {device})",
+            machine.name
+        ));
         true
     }
 
@@ -3725,7 +3840,7 @@ impl App {
                     .harnesses
                     .reloaded(&dir)
                     .context("failed to reload harness definitions")?;
-                self.status = format!("registered {id}");
+                self.say(format!("registered {id}"));
             }
             OverlayKind::Machine => {
                 let chosen = self
@@ -3762,9 +3877,9 @@ impl App {
         if let Some(dir) = &self.settings_dir
             && let Err(error) = dispatch_config::harness_settings::check(dir)
         {
-            self.status = format!(
+            self.warn(format!(
                 "harness-settings.toml can't be read, so saved settings are not used: {error}"
-            );
+            ));
         }
 
         let local = self.project_is_local();
@@ -3808,10 +3923,11 @@ impl App {
         if items.is_empty() {
             // The key as it is bound: a hint naming a key the user moved
             // would send them to the wrong one.
-            self.status = match self.router.keymap().path_to(Command::HarnessManager) {
+            let text = match self.router.keymap().path_to(Command::HarnessManager) {
                 Some(keys) => format!("no harnesses registered; press {keys} to add one"),
                 None => "no harnesses registered".into(),
             };
+            self.warn(text);
             return;
         }
 
@@ -3866,7 +3982,7 @@ impl App {
         };
 
         if !self.state.panes_for(project).is_empty() {
-            self.status = "close its panes first".into();
+            self.warn("close its panes first");
             return;
         }
 
@@ -3899,7 +4015,7 @@ impl App {
         }
 
         if self.state.remove_project(project).is_ok() {
-            self.status = format!("dropped {}", root.display());
+            self.say(format!("dropped {}", root.display()));
         }
 
         // Only a picker has a list to redraw; a menu closed itself.
@@ -3977,12 +4093,11 @@ impl App {
         // registry makes the next start attached; this keystroke must not
         // make this one.
         if matches!(self.mode, Mode::Standalone) {
-            self.status =
-                "machines need the daemon: restart Dispatch with --attach to add one".into();
+            self.warn("machines need the daemon: restart Dispatch with --attach to add one");
             return;
         }
         if self.kept.is_none() {
-            self.status = "there is no configuration directory to save a machine in".into();
+            self.warn("there is no configuration directory to save a machine in");
             return;
         }
 
@@ -4038,7 +4153,7 @@ impl App {
             self.select_project(project);
         }
 
-        self.status = format!("opened {}", root.display());
+        self.say(format!("opened {}", root.display()));
 
         if let Some(Overlay::Browse(browser)) = self.overlay.take() {
             // Kept for the next `^a o`, which is usually in the same tree.
@@ -4081,10 +4196,10 @@ impl App {
         let found = dispatch_config::discover_unregistered(&self.harnesses, &[]);
 
         if found.is_empty() {
-            self.status = format!(
+            self.say(format!(
                 "{} harness(es) registered; nothing else found on PATH",
                 self.harnesses.len()
-            );
+            ));
             return;
         }
 
@@ -4117,7 +4232,7 @@ impl App {
             return;
         };
         if def.settings.is_empty() {
-            self.status = format!("{} has no settings", def.display_name);
+            self.warn(format!("{} has no settings", def.display_name));
             return;
         }
 
@@ -4148,7 +4263,7 @@ impl App {
     fn settings_action(&mut self, action: FormAction, area: Size) -> Result<()> {
         match action {
             FormAction::None => {}
-            FormAction::Refused(why) => self.status = why,
+            FormAction::Refused(why) => self.warn(why),
             FormAction::Back => self.cancel_dialog(),
             FormAction::Save => self.save_settings(),
             FormAction::Open => {
@@ -4186,13 +4301,17 @@ impl App {
             return;
         };
 
-        self.status = match &self.settings_dir {
-            None => "couldn't save: there is nowhere to keep settings".to_string(),
+        let saved = match &self.settings_dir {
+            None => Err("couldn't save: there is nowhere to keep settings".to_string()),
             Some(dir) => match dispatch_config::harness_settings::save(dir, def, &form.values()) {
-                Ok(()) => format!("saved as {}'s default", def.display_name),
-                Err(error) => format!("couldn't save: {error}"),
+                Ok(()) => Ok(format!("saved as {}'s default", def.display_name)),
+                Err(error) => Err(format!("couldn't save: {error}")),
             },
         };
+        match saved {
+            Ok(text) => self.say(text),
+            Err(text) => self.warn(text),
+        }
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
@@ -4358,7 +4477,7 @@ impl App {
         // Not for the pane scroll mode is reading, where End and typing return
         // nowhere, and the mode's own row already says how to leave.
         if self.router.key_mode() != KeyMode::Scroll {
-            self.status = "scrolled back — press End or type to return".into();
+            self.say("scrolled back — press End or type to return");
         }
     }
 
@@ -4432,7 +4551,7 @@ impl App {
             pane.screen = screen;
         }
 
-        self.status.clear();
+        self.clear_status();
     }
 
     fn paste(&mut self, text: &str) {
@@ -4569,6 +4688,9 @@ impl App {
         // The real clock, because this measures real cost.
         let drawing = Instant::now();
         let area = frame.area();
+        // First, so a message that is due is gone on the frame `next_frame`
+        // asked for.
+        self.expire_status();
         let now = self.now();
         self.animations.sweep(now);
         self.notice_focus(now);
@@ -5062,7 +5184,7 @@ impl App {
     /// nothing can be done with it, and gives `None`.
     fn tab_to_change(&mut self) -> Option<TabId> {
         if let Some(reason) = self.tabs_refused() {
-            self.status = reason.into();
+            self.warn(reason);
             return None;
         }
         self.current_tab_id()
@@ -5117,7 +5239,7 @@ impl App {
             _ => Ok(()),
         };
         if let Err(error) = changed {
-            self.status = error.to_string();
+            self.warn(error.to_string());
         }
     }
 
@@ -5129,7 +5251,7 @@ impl App {
     /// opens the picker for.
     fn open_new_tab_picker(&mut self) {
         if let Some(reason) = self.tabs_refused() {
-            self.status = reason.into();
+            self.warn(reason);
             return;
         }
         self.open_picker_placing(Placement::NewAfter {
@@ -5151,7 +5273,7 @@ impl App {
             .pane(pane)
             .is_some_and(|pane| pane.parent.is_some())
         {
-            self.status = "a subagent stays beside the pane that asked for it".into();
+            self.warn("a subagent stays beside the pane that asked for it");
             return;
         }
         let Some(current) = self.tab_to_change() else {
@@ -5162,7 +5284,7 @@ impl App {
         let here = self.current_tab();
         let to = match here.checked_add_signed(step) {
             None => {
-                self.status = "no tab to the left".into();
+                self.warn("no tab to the left");
                 return;
             }
             Some(index) if index >= views.len() => Placement::NewAfter { tab: Some(current) },
@@ -5176,7 +5298,7 @@ impl App {
                     .and_then(|project| self.state.project_tabs(project))
                     .is_some_and(|tabs| tabs.is_full(tab));
                 if full {
-                    self.status = dispatch_core::TabError::Full.to_string();
+                    self.warn(dispatch_core::TabError::Full.to_string());
                     return;
                 }
                 Placement::Into { tab }
@@ -5899,7 +6021,7 @@ impl App {
                 unreachable.join(", ")
             ))
         } else if !self.status.is_empty() {
-            Some(self.status.clone())
+            Some(self.status.to_string())
         } else {
             None
         };
@@ -6162,6 +6284,38 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    #[test]
+    fn an_info_message_expires_and_asks_for_the_frame_that_clears_it() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.animations.sweep(app.now() + Duration::from_secs(10));
+        app.say("registered claude");
+        assert_eq!(app.status, "registered claude");
+        let left = app.next_frame(app.now()).expect("the expiry needs a frame");
+        assert!(
+            left <= MESSAGE_FOR && left > Duration::from_secs(4),
+            "{left:?}"
+        );
+
+        advance(&clock, MESSAGE_FOR + Duration::from_millis(1));
+        app.expire_status();
+        assert!(app.status.is_empty());
+        assert_eq!(app.next_frame(app.now()), None, "nothing left to clear");
+    }
+
+    #[test]
+    fn an_error_stays_until_replaced() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.warn("laptop is unreachable");
+        advance(&clock, Duration::from_secs(60));
+        app.expire_status();
+        assert_eq!(app.status, "laptop is unreachable");
+        assert!(app.status.is_error());
+        app.say("ok");
+        assert!(!app.status.is_error());
     }
 
     /// A clock the test moves by hand, installed in `app`.
@@ -10771,7 +10925,7 @@ mod tests {
 
         let (mut app, _) = app_with_one_pending();
         app.overlay = None; // deferred, as `Esc` leaves it
-        app.status = "waiting for the daemon — the agents are still running".into();
+        app.say("waiting for the daemon — the agents are still running");
 
         let mut terminal =
             Terminal::new(TestBackend::new(100, 30)).expect("a test backend can be created");
@@ -12537,13 +12691,13 @@ mod tests {
 
         app.move_focused_pane(1);
         assert_eq!(app.status, NEEDS_UPGRADE);
-        app.status.clear();
+        app.clear_status();
         app.open_rename_tab();
         assert_eq!(app.status, NEEDS_UPGRADE);
-        app.status.clear();
+        app.clear_status();
         app.open_close_tab();
         assert_eq!(app.status, NEEDS_UPGRADE);
-        app.status.clear();
+        app.clear_status();
         app.move_current_tab(1);
         assert_eq!(app.status, NEEDS_UPGRADE);
 
@@ -12571,7 +12725,7 @@ mod tests {
         app.open_new_tab_picker();
         assert_eq!(app.status, "no project selected");
 
-        app.status.clear();
+        app.clear_status();
         app.open_rename_tab();
         assert_eq!(app.status, "no project selected");
     }
@@ -12945,7 +13099,7 @@ mod tests {
     fn entering_tab_mode_clears_an_old_message() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
-        app.status = "something from before".into();
+        app.say("something from before");
 
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
 
@@ -14065,7 +14219,7 @@ args = ["--effort", "{value}"]
         let mut terminal = a_terminal();
         key_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
 
-        app.status = "far is unreachable".into();
+        app.warn("far is unreachable");
         drawn(&mut app, &mut terminal);
 
         assert_eq!(
@@ -14194,12 +14348,12 @@ args = ["--effort", "{value}"]
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
 
-        app.status = "old".into();
+        app.say("old");
         key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(app.status.is_empty());
 
         press(&mut app, KeyCode::Esc);
-        app.status = "old".into();
+        app.say("old");
         command(&mut app, '[');
         assert_eq!(app.router.key_mode(), KeyMode::Scroll);
         assert!(app.status.is_empty(), "through the prefix too");
@@ -15958,7 +16112,7 @@ args = ["--effort", "{value}"]
             MenuAction::FoldProject(second),
             MenuAction::RemoveProject(second),
         ] {
-            app.status.clear();
+            app.clear_status();
             app.choose_menu(action);
             assert!(app.overlay.is_none(), "{action:?} opened nothing");
             assert_eq!(app.status, "that project is gone", "{action:?}");

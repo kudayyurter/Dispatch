@@ -769,7 +769,7 @@ impl App {
         if self.state.focused_pane() == Some(id) {
             return true;
         }
-        self.status = "that pane is gone".into();
+        self.warn("that pane is gone");
         false
     }
 
@@ -780,7 +780,7 @@ impl App {
         if self.state.projects().iter().any(|project| project.id == id) {
             return true;
         }
-        self.status = "that project is gone".into();
+        self.warn("that project is gone");
         false
     }
 
@@ -788,7 +788,7 @@ impl App {
     /// opened on. `select_tab` would wrap a stale index to the first tab.
     fn select_menu_tab(&mut self, index: usize, id: Option<TabId>) -> bool {
         if self.tab_views().get(index).map(|view| view.id) != Some(id) {
-            self.status = "that tab is gone".into();
+            self.warn("that tab is gone");
             return false;
         }
         self.select_tab(index);
