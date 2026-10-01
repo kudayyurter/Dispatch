@@ -21,6 +21,10 @@ pub struct Approval<'a> {
     pub depth: u8,
     /// What it would be asked to do.
     pub task: &'a str,
+    /// The handoff, when the request carries one; shown by section.
+    pub handoff: Option<&'a dispatch_core::Handoff>,
+    /// Whether the subagent would run in its own interface.
+    pub interactive: bool,
     /// How many further requests are queued behind this one.
     pub waiting: usize,
     /// First line of the task to show, for scrolling a long one.
@@ -56,8 +60,36 @@ impl<'a> Approval<'a> {
             Line::from(""),
         ];
 
-        for line in self.task.lines() {
-            lines.push(Line::from(line.to_string()));
+        if self.interactive {
+            lines.push(Line::styled(
+                "runs interactively: you can watch it and type into it",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(""));
+        }
+
+        // Sections in a fixed order that puts what to do and how to know it is
+        // done ahead of the background, so the decision does not wait on
+        // scrolling past context.
+        match self.handoff {
+            Some(handoff) => {
+                for section in dispatch_core::Section::PROMPT_ORDER {
+                    lines.push(Line::styled(
+                        section.heading().to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    for line in handoff.section(section).lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                    lines.push(Line::from(""));
+                }
+                lines.pop();
+            }
+            None => {
+                for line in self.task.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
         }
 
         lines.push(Line::from(""));
@@ -171,10 +203,64 @@ mod tests {
             project: "dispatch",
             depth: 0,
             task,
+            handoff: None,
+            interactive: false,
             waiting: 0,
             scroll: 0,
             border: Style::default(),
         }
+    }
+
+    /// Each line of `widget`'s content, as plain text.
+    fn plain_lines(widget: &Approval<'_>) -> Vec<String> {
+        widget
+            .lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_handoff_is_shown_by_section_in_prompt_order() {
+        let handoff = dispatch_core::Handoff::parse(
+            "## Context\nthe background\n## Goal\nthe goal\n## Constraints\nNone.\n\
+             ## Done when\nthe check\n## Report back\nthe shape\n",
+        )
+        .expect("complete");
+        let widget = Approval {
+            handoff: Some(&handoff),
+            interactive: true,
+            ..approval(&handoff.text)
+        };
+        let text = plain_lines(&widget);
+        let at = |needle: &str| {
+            text.iter()
+                .position(|line| line == needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {text:#?}"))
+        };
+
+        assert!(at("Goal") < at("Done when"));
+        assert!(at("Done when") < at("Constraints"));
+        assert!(at("Constraints") < at("Context"));
+        assert!(at("Context") < at("Report back"));
+        assert!(at("the goal") == at("Goal") + 1);
+        assert!(text.iter().any(|line| line.contains("runs interactively")));
+        assert!(
+            !text.iter().any(|line| line.starts_with("## ")),
+            "headings are drawn, not the raw Markdown"
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_handoff_still_shows_its_task() {
+        let text = plain_lines(&approval("write the tests"));
+        assert!(text.iter().any(|line| line == "write the tests"));
+        assert!(!text.iter().any(|line| line.contains("runs interactively")));
     }
 
     /// The row count found by brute force: render into a buffer generous

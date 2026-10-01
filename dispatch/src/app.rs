@@ -150,8 +150,22 @@ struct PendingRequest {
     harness: String,
     /// What it would be asked to do, verbatim.
     task: String,
+    /// The structured handoff, when the request carries one.
+    handoff: Option<dispatch_core::Handoff>,
+    /// Whether the subagent would run in its own interface.
+    interactive: bool,
     /// How deep the asking pane already is.
     depth: u8,
+}
+
+impl PendingRequest {
+    /// The text the subagent's row is named from: the handoff's Goal, which
+    /// is short by design, rather than the whole handoff text.
+    fn title_source(&self) -> String {
+        self.handoff
+            .as_ref()
+            .map_or_else(|| self.task.clone(), |handoff| handoff.goal.clone())
+    }
 }
 
 /// A title with the agent's own mark taken off the front.
@@ -1960,8 +1974,8 @@ impl App {
                 harness,
                 task,
                 depth,
-                handoff: _,
-                interactive: _,
+                handoff,
+                interactive,
             } => {
                 self.pending.push_back(PendingRequest {
                     request,
@@ -1969,6 +1983,8 @@ impl App {
                     project,
                     harness,
                     task,
+                    handoff,
+                    interactive,
                     depth,
                 });
 
@@ -3127,7 +3143,8 @@ impl App {
         // leaves the queue here, one round trip before the daemon says whether
         // a pane came of it.
         if approve {
-            self.answered.insert(waiting.request, waiting.task.clone());
+            self.answered
+                .insert(waiting.request, waiting.title_source());
         }
 
         let message = ClientMessage::DelegateDecision {
@@ -3165,7 +3182,7 @@ impl App {
         self.pending
             .iter()
             .find(|waiting| waiting.request == request)
-            .map(|waiting| waiting.task.clone())
+            .map(PendingRequest::title_source)
     }
 
     /// Records a scroll of the task text of the request currently shown.
@@ -3212,6 +3229,8 @@ impl App {
             project,
             depth: request.depth,
             task: &request.task,
+            handoff: request.handoff.as_ref(),
+            interactive: request.interactive,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
             border: Style::default().fg(self.theme.faded),
@@ -6909,6 +6928,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests for the http client".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         for message in [
@@ -7033,6 +7054,43 @@ mod tests {
     }
 
     #[test]
+    fn a_subagent_is_titled_by_its_handoffs_goal() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let handoff = dispatch_core::Handoff::parse(
+            "## Context\nlong background first\n## Goal\nWrite the http client tests\n\
+             ## Constraints\nNone.\n## Done when\nthey pass\n## Report back\nwhich tests\n",
+        )
+        .expect("complete");
+        let request = RequestId::new();
+        let child = PaneId::new();
+
+        for message in [
+            ServerMessage::DelegatePending {
+                request,
+                parent,
+                project,
+                harness: "claude".into(),
+                task: handoff.text.clone(),
+                depth: 0,
+                handoff: Some(handoff.clone()),
+                interactive: false,
+            },
+            ServerMessage::DelegateResolved {
+                request,
+                outcome: DelegateOutcome::Approved { pane: child },
+            },
+            spawned(child, project, "claude", Some(parent), false),
+        ] {
+            daemon.send(message).expect("the app is listening");
+        }
+        app.poll_daemon();
+
+        let title = &app.state.pane(child).expect("adopted").title;
+        assert!(title.starts_with("Write the http"), "{title:?}");
+    }
+
+    #[test]
     fn a_task_title_keeps_whole_words_and_says_when_it_cut() {
         assert_eq!(
             task_title("write the tests"),
@@ -7075,6 +7133,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         app.overlay = Some(Overlay::Approval { scroll: 0 });
 
@@ -7941,6 +8001,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
@@ -7994,6 +8056,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         let mut terminal = a_terminal();
         drawn(app, &mut terminal);
@@ -9239,6 +9303,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -9436,6 +9502,8 @@ mod tests {
             harness: "claude".into(),
             task: "a second task".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         app.apply(ServerMessage::DelegateResolved {
@@ -12362,6 +12430,8 @@ args = ["--effort", "{value}"]
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         drawn(&mut app, &mut terminal);
 
