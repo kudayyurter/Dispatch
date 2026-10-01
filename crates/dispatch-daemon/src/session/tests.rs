@@ -6385,16 +6385,14 @@ fn a_report_nobody_is_waiting_for_says_so() {
     daemon.request_for_test(1, hello());
     daemon.request_for_test(1, ClientMessage::Subscribe);
     let parent = spawn_pane_for_test(&mut daemon, &ui, project);
-    let _caller = ask(&mut daemon, parent, "echo quick");
+    let caller = ask(&mut daemon, parent, "echo quick");
     let child = approve_and_spawn(&mut daemon, &ui);
-    // The one-shot exits and its caller is answered with the tail.
-    wait_for(&mut daemon, &ui, |m| {
-        m.iter().any(|m| matches!(m, ServerMessage::PaneChanged { pane, update: PaneUpdate::Status { .. } } if *pane == child))
+    // The one-shot exits and its caller is answered with the tail: the point
+    // at which nobody is waiting any more.
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
     });
-    for _ in 0..50 {
-        daemon.tick();
-        std::thread::sleep(Duration::from_millis(10));
-    }
 
     let late = report_from(&mut daemon, 20, child, "too late");
     assert!(matches!(

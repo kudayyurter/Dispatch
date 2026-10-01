@@ -41,7 +41,7 @@ pub const NO_HANDOFF: &str = "a bare task is not enough to delegate with: write 
 /// Why a request cannot be asked about, if it cannot.
 ///
 /// `depth` is how many parents the asking pane already has, `live` how many of
-/// its children are running, and `has_task_form` whether the harness has a
+/// its children are still working for it (their requests are open), and `has_task_form` whether the harness has a
 /// non-interactive shape to run at all (or, for an interactive request, an
 /// interactive one).
 #[must_use]
@@ -76,7 +76,7 @@ pub fn refusal(
 
     if live >= limits.max_live_per_parent {
         return Some(format!(
-            "this pane already has {live} subagents running, and the cap is {}",
+            "this pane already has {live} subagents working for it, and the cap is {}",
             limits.max_live_per_parent
         ));
     }
