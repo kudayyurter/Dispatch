@@ -12,6 +12,7 @@ pub mod pane;
 pub mod picker;
 pub mod prompt;
 pub mod settings_form;
+pub mod settings_view;
 pub mod sidebar;
 pub mod theme;
 

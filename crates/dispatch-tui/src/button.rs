@@ -24,6 +24,16 @@ pub enum ButtonId {
     Later,
     Ok,
     Close,
+    /// Settings: write the pending edits.
+    Apply,
+    /// Settings: drop the pending edits.
+    Discard,
+    /// Settings: stay on the page the prompt interrupted.
+    KeepEditing,
+    /// Settings: empty the search that found nothing.
+    ClearSearch,
+    /// Settings: put the sidebar back to how it came.
+    ResetSidebar,
 }
 
 /// One button.
