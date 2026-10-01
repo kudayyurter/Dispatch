@@ -12,6 +12,8 @@ use crate::theme::Chrome;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ButtonId {
     Open,
+    /// Go to the chosen pane; pressed exactly as `Open` is.
+    Go,
     Run,
     Cancel,
     OpenPane,

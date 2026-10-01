@@ -406,7 +406,7 @@ impl App {
                 self.handle_add_machine_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             }
             (Overlay::CloseTab { .. }, ButtonId::Close) => self.confirm_close_tab(),
-            (overlay, ButtonId::Open) if overlay.picker().is_some() => {
+            (overlay, ButtonId::Open | ButtonId::Go) if overlay.picker().is_some() => {
                 self.choose_selected(area)?;
             }
             _ => {}

@@ -434,8 +434,7 @@ impl App {
                 self.settle_scroll_mode();
             }
             FooterHit::LeaveMode => self.router.leave_mode(),
-            // Opened by Task 4, which adds the Activity list.
-            FooterHit::Activity => {}
+            FooterHit::Activity => self.open_activity(),
             // Opened by Task 9, which adds the Settings shell.
             FooterHit::Settings => {}
         }

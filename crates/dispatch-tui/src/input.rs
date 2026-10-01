@@ -126,6 +126,8 @@ pub enum Action {
     NextAttention,
     /// Open the list of every pane waiting on the user.
     AttentionPicker,
+    /// Open the list of every pane and what it is doing.
+    Activity,
     /// Fold the sidebar away or bring it back; in a narrow window, open or
     /// close it as a drawer over the panes.
     ToggleSidebar,

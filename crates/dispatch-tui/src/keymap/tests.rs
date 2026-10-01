@@ -810,3 +810,16 @@ fn every_command_says_what_it_does_and_no_two_say_the_same() {
         seen.push((said, *command));
     }
 }
+
+#[test]
+fn activity_is_a_named_command_with_no_default_key() {
+    assert_eq!(Command::from_name("activity"), Some(Command::Activity));
+    assert_eq!(Command::Activity.action(), Some(Action::Activity));
+    let keymap = Keymap::defaults();
+    for mode in KeyMode::ALL {
+        assert!(
+            keymap.chords_for(mode, Command::Activity).is_empty(),
+            "{mode:?} binds activity"
+        );
+    }
+}

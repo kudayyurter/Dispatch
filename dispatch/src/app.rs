@@ -65,6 +65,8 @@ const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
 
 /// What the status row says when no pane is waiting on the user.
 const NOTHING_WAITING: &str = "nothing waiting on you";
+/// Said when Activity is asked for and no pane is live.
+const NO_PANES: &str = "no panes yet";
 
 /// How long a message that reports success stays on the footer.
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
@@ -228,6 +230,7 @@ fn shell_label(command: &str) -> String {
 #[derive(Debug, Clone, Copy)]
 enum OverlayKind {
     Attention,
+    Activity,
     Harness,
     Project,
     Register,
@@ -419,6 +422,8 @@ enum Overlay {
     Machine(Picker),
     /// The panes waiting on the user, to go to one.
     Attention(Picker),
+    /// Every live pane and what it is doing, to go to one.
+    Activity(Picker),
     /// Every command, to find one and run it.
     Help(Picker),
     /// A machine being registered.
@@ -465,6 +470,7 @@ impl Overlay {
             Overlay::Browse(_) => "browse",
             Overlay::Machine(_) => "machine",
             Overlay::Attention(_) => "attention",
+            Overlay::Activity(_) => "activity",
             Overlay::Help(_) => "help",
             Overlay::AddMachine(_) => "add_machine",
             Overlay::OpenOn { .. } => "open_on",
@@ -483,6 +489,7 @@ impl Overlay {
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
             | Overlay::Attention(picker)
+            | Overlay::Activity(picker)
             | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
@@ -503,6 +510,7 @@ impl Overlay {
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
             | Overlay::Attention(picker)
+            | Overlay::Activity(picker)
             | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
             | Overlay::Browse(_)
@@ -524,6 +532,7 @@ impl Overlay {
             Overlay::Register(_) => Some(OverlayKind::Register),
             Overlay::Machine(_) => Some(OverlayKind::Machine),
             Overlay::Attention(_) => Some(OverlayKind::Attention),
+            Overlay::Activity(_) => Some(OverlayKind::Activity),
             // Help has its own key handling and runs a command, not a choice.
             Overlay::Help(_)
             | Overlay::Settings { .. }
@@ -545,6 +554,7 @@ impl Overlay {
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
             | Overlay::Attention(picker)
+            | Overlay::Activity(picker)
             | Overlay::Help(picker) => picker.desired_width(),
             Overlay::Settings { form, .. } => form.desired_width(),
             Overlay::OpenOn { prompt, .. }
@@ -568,6 +578,7 @@ impl Overlay {
             | Overlay::Register(picker)
             | Overlay::Machine(picker)
             | Overlay::Attention(picker)
+            | Overlay::Activity(picker)
             | Overlay::Help(picker) => picker.set_chrome(chrome),
             Overlay::Settings { form, .. } => form.set_chrome(chrome),
             Overlay::Browse(browser) => browser.set_chrome(chrome),
@@ -1441,6 +1452,58 @@ impl App {
             Picker::new("Waiting on you", items)
                 .with_hint("↑↓ choose  Enter go  Esc close")
                 .with_buttons(pointer::buttons::open_cancel()),
+        ));
+    }
+
+    /// Opens the list of every live pane, with what each is doing.
+    fn open_activity(&mut self) {
+        use dispatch_tui::button::{Button, ButtonId};
+
+        let now = self.now();
+        let items: Vec<Item> = self
+            .pane_order()
+            .into_iter()
+            .filter_map(|id| {
+                let pane = self.state.pane(id).filter(|pane| !pane.closed)?;
+                let project = self
+                    .state
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == pane.project)
+                    .map_or("", |project| project.name.as_str());
+                let state = sidebar::status_text(pane.status, self.reason_of(id));
+                let waited = self
+                    .blocked_since
+                    .get(&id)
+                    .map_or_else(String::new, |since| {
+                        format!(" · {}", waited_for(now.saturating_duration_since(*since)))
+                    });
+                Some(
+                    Item::new(id.to_string(), format!("{project} · {}", pane.title))
+                        .with_detail(format!("{state}{waited}")),
+                )
+            })
+            .collect();
+
+        if items.is_empty() {
+            self.say(NO_PANES);
+            return;
+        }
+        self.overlay = Some(Overlay::Activity(
+            Picker::new("Activity", items)
+                .with_hint("↑↓ choose  Enter go  Esc close")
+                .with_buttons(vec![
+                    Button {
+                        id: ButtonId::Cancel,
+                        label: "Cancel",
+                        default: false,
+                    },
+                    Button {
+                        id: ButtonId::Go,
+                        label: "Go",
+                        default: true,
+                    },
+                ]),
         ));
     }
 
@@ -3110,6 +3173,7 @@ impl App {
             Action::ToggleFold => self.toggle_fold(),
             Action::NextAttention => self.next_attention(),
             Action::AttentionPicker => self.open_attention_picker(),
+            Action::Activity => self.open_activity(),
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ResizeSidebar(by) => self.resize_sidebar(by),
             Action::OpenProject => self.start_open(),
@@ -3446,6 +3510,7 @@ impl App {
                 | Overlay::Register(_)
                 | Overlay::Machine(_)
                 | Overlay::Attention(_)
+                | Overlay::Activity(_)
                 | Overlay::Help(_),
             ) => {
                 self.overlay = None;
@@ -3805,7 +3870,7 @@ impl App {
     fn choose(&mut self, kind: OverlayKind, id: &str, area: Size) -> Result<()> {
         match kind {
             OverlayKind::Harness => self.spawn_pane(id, area)?,
-            OverlayKind::Attention => {
+            OverlayKind::Attention | OverlayKind::Activity => {
                 // Chosen from a list drawn a moment ago: the pane may have
                 // exited or been answered since, and then there is nowhere
                 // to go.
@@ -14601,6 +14666,60 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
+    fn activity_lists_every_live_pane_with_its_state_and_goes_to_one() {
+        let (mut app, first, daemon, _sent) = attached_app();
+        let project = Project::new("/tmp/second", ProjectSource::LocalDir);
+        let second = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let ours = spawn_several(&mut app, &daemon, first, 1);
+        app.select_project(second);
+        let theirs = spawn_several(&mut app, &daemon, second, 1);
+        app.state
+            .set_pane_status(theirs[0], PaneStatus::Running)
+            .expect("exists");
+        app.select_project(first);
+
+        app.open_activity();
+        let Some(Overlay::Activity(picker)) = &app.overlay else {
+            panic!("activity is open")
+        };
+        assert_eq!(picker.items().len(), 2);
+        assert!(
+            picker.items()[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Working")),
+            "{:?}",
+            picker.items()[1]
+        );
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.state.selected_project(), Some(second));
+        assert_eq!(app.state.focused_pane(), Some(theirs[0]));
+        let _ = ours;
+    }
+
+    #[test]
+    fn the_footer_activity_button_opens_activity() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "[ Activity ]"), y);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Activity(_))),
+            "activity opens"
+        );
+    }
+
+    #[test]
     fn the_footer_parts_do_what_they_say_when_clicked() {
         let (mut app, project, daemon, _sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 2);
@@ -14652,17 +14771,15 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
-    fn the_footer_buttons_are_inert_until_their_screens_exist() {
+    fn the_footer_settings_button_is_inert_until_its_screen_exists() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
         let mut terminal = a_wide_terminal();
         drawn(&mut app, &mut terminal);
         let y = terminal.size().expect("sized").height - 1;
         let row = bottom_row(&terminal);
-        for button in ["[ Activity ]", "[ Settings ]"] {
-            click(&mut app, cell_of(&row, button), y);
-            assert!(app.overlay.is_none(), "{button}");
-        }
+        click(&mut app, cell_of(&row, "[ Settings ]"), y);
+        assert!(app.overlay.is_none());
     }
 
     #[test]

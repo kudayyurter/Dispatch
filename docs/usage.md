@@ -73,7 +73,7 @@ The last row says what is going on, left to right:
 - `3 working` for the panes that are running.
 - `2 need attention` for the panes waiting on you; click it to pick one.
 - `1 delegation waiting` for a request from an agent; click it to decide.
-- `[ Activity ]`, then `[ Settings ]` at the right edge. Both are buttons.
+- `[ Activity ]`, then `[ Settings ]` at the right edge. Both are buttons; Activity lists every pane with what it is doing, and Enter goes to the one you choose.
 
 A message stands in for `Connected` and the working count. When the row is too
 narrow, parts go in this order: the working count, `Connected`, `[ Activity ]`,
@@ -127,7 +127,7 @@ The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
 drops that mode's defaults. A command is named in snake_case — `new_pane`,
 `close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
 `next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
-`next_attention`, `attention_picker`, `toggle_sidebar`, `sidebar_narrower`,
+`next_attention`, `attention_picker`, `activity`, `toggle_sidebar`, `sidebar_narrower`,
 `sidebar_wider`, `help`, `quit`, `pane_mode`, `lock`, `prefix`, and so on. A
 mistake is logged by name and skipped, and the rest still applies. `Esc` always leaves a mode,
 lock always has a key that unlocks, and a config that leaves no key to quit
