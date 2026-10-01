@@ -183,7 +183,10 @@ is `BuiltIn` or `Preferences`.
    replaced.
 
 **Reset** a field: set it to `None` in the draft. Applying then removes it from
-the file.
+the file. In Settings, `Backspace` or `Delete` on a field, or a click on its
+source (drawn `Settings ↺` while Settings sets it), resets it. A step that
+lands on the value the field would inherit, while nothing is committed for it,
+also stores `None`, so stepping there and back is no change.
 
 `config.toml` is never written. Sidebar width and fold stay in `ui.toml`.
 
@@ -209,8 +212,9 @@ effective interface values (`set_motion`, `set_focus_follows_pointer`,
 - Under 72 columns: the category list becomes a one-row category switcher
   (`‹ Appearance ›`) at the top of the field column, so categories and fields
   stay on one page and no Back control is needed.
-- Under 40×10: a message "Make the window larger to use Settings" and the `[×]`
-  only.
+- Under 40×10: a message "Make the window larger to use Settings · Esc closes
+  and discards changes" and the `[×]` only. Every other key is ignored, and
+  `Esc` or `[×]` closes without the prompt, discarding pending edits.
 
 **Layout:**
 
@@ -249,7 +253,8 @@ source, applies }`:
 
 **Mouse.** Every row, control and button is clickable through the pointer
 foundation. `DialogHit` gains `Category(usize)`, `Field(usize)`,
-`FieldStep(usize, bool)`, `Search` and `Close`. Labels and padded control areas
+`FieldStep(usize, bool)`, `FieldReset(usize)`, `Search` and `Close`. An Action
+row's `[ … ]` is a `DialogHit::Button` of its own id. Labels and padded control areas
 are clickable, not single glyphs. The wheel scrolls the field list and never
 changes a value. A click outside the workspace does nothing: it is a dialog,
 and it never discards edits.

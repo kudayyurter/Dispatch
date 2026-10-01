@@ -46,7 +46,7 @@ hover_claims_panes = true
 
 [appearance]
 theme = "light"       # "terminal" (the default), "dark" or "light"
-accent = "teal"       # terminal, violet, blue, teal, green, amber, red, pink, or "#rrggbb"
+accent = "teal"       # terminal (Theme default), violet, blue, teal, green, amber, red, pink, or "#rrggbb"
 icons = "plain"       # "nerd" (the default) or "plain"
 ```
 

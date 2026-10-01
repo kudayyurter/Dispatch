@@ -127,11 +127,11 @@ The tables are `normal`, `prefix`, `pane`, `tab`, `scroll`, `session` and
 drops that mode's defaults. A command is named in snake_case — `new_pane`,
 `close_pane`, `zoom`, `focus_left`, `focus_next`, `new_tab`, `rename_tab`,
 `next_tab`, `go_to_tab_1`, `scroll_half_down`, `scroll_top`, `project_picker`,
-`next_attention`, `attention_picker`, `activity`, `toggle_sidebar`, `sidebar_narrower`,
-`sidebar_wider`, `help`, `quit`, `pane_mode`, `lock`, `prefix`, and so on. A
-mistake is logged by name and skipped, and the rest still applies. `Esc` always leaves a mode,
-lock always has a key that unlocks, and a config that leaves no key to quit
-is logged. Keys are read when Dispatch starts.
+`next_attention`, `attention_picker`, `activity`, `settings`, `toggle_sidebar`,
+`sidebar_narrower`, `sidebar_wider`, `help`, `quit`, `pane_mode`, `lock`, `prefix`,
+and so on. A mistake is logged by name and skipped, and the rest still applies.
+`Esc` always leaves a mode, lock always has a key that unlocks, and a config
+that leaves no key to quit is logged. Keys are read when Dispatch starts.
 
 `Ctrl z` in an agent's pane closes that pane and ends the agent, as `Ctrl p x`
 would. An agent cannot be suspended in a pane -- there is no shell behind it to
@@ -150,18 +150,26 @@ switcher in a window under 72 columns wide):
 
 - **Mouse & layout**: focus follows pointer, hover claims shared panes, the
   sidebar's width, showing the sidebar, and a reset of its width.
-- **Appearance**: theme (follow the terminal, dark or light), accent (a preset
-  or your own `#rrggbb`), motion, and icons (Nerd Font or plain).
+- **Appearance**: theme (follow the terminal, dark or light), accent (Theme
+  default, a preset or your own `#rrggbb`), motion, and icons (Nerd Font or
+  plain). Theme default is the terminal's own accent while following the
+  terminal, and the preset's under Dark or Light. Dark and Light paint their
+  own background behind the sidebar, the tab row, the footer, dialogs, menus
+  and Settings, so they read the same on any terminal; what runs in a pane
+  keeps the terminal's colours.
 - **Advanced**: where the configuration file, preferences, `ui.toml`, harnesses
   and log file are, the version, and whether Dispatch is standalone or attached.
   It is read-only.
 
 Each row shows its value between `‹` and `›` and where the value comes from
-(`Built-in`, `config.toml` or `Settings`). `Tab` and `Shift Tab` move between the
-search box, the categories, the rows and the buttons; the arrow keys move and
-change values, `Enter` toggles or activates, and `Esc` closes the innermost
-thing first. Everything is clickable too, and the wheel scrolls without
-changing a value.
+(`Built-in`, `config.toml` or `Settings`). A value set in Settings reads
+`Settings ↺`: `Backspace` (or `Delete`), or a click on it, resets it to
+default, so it follows `config.toml` and the built-in again, and Apply removes
+it from `preferences.toml`. Stepping a value back to what it would inherit
+counts as no change. `Tab` and `Shift Tab` move between the search box, the
+categories, the rows and the buttons; the arrow keys move and change values,
+`Enter` toggles or activates, and `Esc` closes the innermost thing first.
+Everything is clickable too, and the wheel scrolls without changing a value.
 
 Appearance is previewed in this window as you edit it. Nothing is written until
 you press `[ Apply ]`, which writes only the section you changed to
@@ -179,7 +187,9 @@ a narrow window `Show sidebar` opens or closes the drawer, like the key.
 
 Typing in the search box filters every category by label, description and
 category name; `Enter` or a click on a result goes to it in its own category.
-Settings reopens on the row you left it on.
+Settings reopens on the row you left it on. In a window under 40 columns by 10
+rows it shows only a request to make the window larger; there, `Esc` or `[×]`
+closes it and discards any changes not yet applied.
 
 ## The sidebar
 
@@ -232,8 +242,12 @@ blocked, then done, then working -- and each tab is prefixed the same way, so
 a pane that needs you shows from anywhere. The footer counts the blocked
 panes too: `2 need attention`.
 
-Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
-terminal it runs in.
+These glyphs are Nerd Font ones by default, which want a patched font in the
+terminal. Settings > Appearance > Icons > Plain draws single ASCII characters
+instead -- `-` idle, `!` blocked, `*` finished out of sight, `+` and `x`
+exited cleanly and badly, `>` working with motion off, `@` a repository and
+`/` a folder -- and a harness as the first letter of its name. The spinner is
+the same in both.
 
 ## Menus
 
