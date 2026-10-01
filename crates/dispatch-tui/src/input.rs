@@ -135,6 +135,8 @@ pub enum Action {
     ResizeSidebar(i16),
     /// Open the searchable list of every command.
     Help,
+    /// Open Settings.
+    Settings,
     /// Quit.
     Quit,
 }

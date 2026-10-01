@@ -428,7 +428,7 @@ fn each_mode_spells_out_its_keys() {
     );
     assert_eq!(
         keymap.mode_help(KeyMode::Session),
-        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting  b sidebar  < narrower  > wider  ? help"
+        "SESSION  Esc/Enter done  p projects  o open  m machine  H harnesses  a approvals  f fold  q quit  w waiting  b sidebar  < narrower  > wider  ? help  , settings"
     );
     assert_eq!(
         keymap.normal_help(),
@@ -821,5 +821,25 @@ fn activity_is_a_named_command_with_no_default_key() {
             keymap.chords_for(mode, Command::Activity).is_empty(),
             "{mode:?} binds activity"
         );
+    }
+}
+
+#[test]
+fn settings_is_on_alt_comma_and_on_comma_in_the_prefix_and_session_modes() {
+    assert_eq!(Command::from_name("settings"), Some(Command::Settings));
+    assert_eq!(Command::Settings.action(), Some(Action::Settings));
+    assert_eq!(Command::Settings.describe(), "Open Settings");
+    let keymap = Keymap::defaults();
+    for (mode, chord) in [
+        (KeyMode::Normal, "Alt ,"),
+        (KeyMode::Prefix, ","),
+        (KeyMode::Session, ","),
+    ] {
+        let chords: Vec<String> = keymap
+            .chords_for(mode, Command::Settings)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(chords, [chord], "{mode:?}");
     }
 }

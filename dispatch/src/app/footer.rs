@@ -435,8 +435,7 @@ impl App {
             }
             FooterHit::LeaveMode => self.router.leave_mode(),
             FooterHit::Activity => self.open_activity(),
-            // Opened by Task 9, which adds the Settings shell.
-            FooterHit::Settings => {}
+            FooterHit::Settings => self.open_settings_workspace(),
         }
     }
 }

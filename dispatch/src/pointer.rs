@@ -94,23 +94,16 @@ pub enum DialogHit {
     Button(ButtonId),
     /// A value's `‹` or `›` in the settings form's row: `false` for back.
     Step(usize, bool),
-    // The Settings variants are constructed once the app wires the view in
-    // (Task 9); until then only the widget knows them.
     /// A category of the Settings workspace, by index.
-    #[allow(dead_code)]
     Category(usize),
     /// A field row of the Settings workspace, by its index among the rows shown.
-    #[allow(dead_code)]
     Field(usize),
     /// A field's `‹` (false) or `›` (true), with its index among the rows
     /// shown. A compact category arrow carries `usize::MAX`.
-    #[allow(dead_code)]
     FieldStep(usize, bool),
     /// The Settings search row.
-    #[allow(dead_code)]
     Search,
     /// The Settings `[×]`.
-    #[allow(dead_code)]
     Close,
     /// Anywhere else inside its box.
     Area,

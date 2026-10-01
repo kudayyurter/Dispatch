@@ -220,6 +220,11 @@ impl App {
     ) -> Result<()> {
         use crossterm::event::MouseButton;
 
+        if matches!(self.overlay, Some(Overlay::Preferences(_))) {
+            self.settings_pointer(mouse, target);
+            return Ok(());
+        }
+
         let hit = match target {
             Some(pointer::Target::Dialog(hit)) => Some(hit),
             _ => None,
@@ -339,10 +344,11 @@ impl App {
     }
 
     /// Marks the button held down, or none, on whichever dialog is open.
-    fn set_dialog_pressed(&mut self, pressed: Option<pointer::ButtonId>) {
+    pub(super) fn set_dialog_pressed(&mut self, pressed: Option<pointer::ButtonId>) {
         match &mut self.overlay {
             Some(Overlay::Browse(browser)) => browser.set_pressed(pressed),
             Some(Overlay::Settings { form, .. }) => form.set_pressed(pressed),
+            Some(Overlay::Preferences(workspace)) => workspace.view.set_pressed(pressed),
             Some(
                 Overlay::OpenOn { prompt, .. }
                 | Overlay::RenameTab { prompt, .. }
@@ -371,7 +377,7 @@ impl App {
             | Overlay::CloseTab { prompt, .. } => Some(prompt.layout(area)),
             Overlay::AddMachine(add) => Some(add.prompt().layout(area)),
             Overlay::Approval { scroll } => Some(self.approval_widget(*scroll)?.layout(area)),
-            Overlay::Menu(_) => None,
+            Overlay::Menu(_) | Overlay::Preferences(_) => None,
             overlay => overlay.picker().map(|picker| picker.layout(area)),
         }
     }
@@ -385,6 +391,7 @@ impl App {
             return Ok(());
         };
         match (overlay, id) {
+            (Overlay::Preferences(_), _) => self.settings_button(id),
             // Every dialog's way out.
             (_, ButtonId::Cancel) | (Overlay::Approval { .. }, ButtonId::Later) => {
                 self.cancel_dialog();
@@ -583,6 +590,10 @@ impl App {
             pointer::Target::Dialog(pointer::DialogHit::Button(id)) => {
                 self.press_button(id, area)?;
             }
+            pointer::Target::Dialog(pointer::DialogHit::FieldStep(index, forward)) => {
+                self.settings_step_at(index, forward);
+            }
+            pointer::Target::Dialog(pointer::DialogHit::Close) => self.settings_close(),
             pointer::Target::Dialog(pointer::DialogHit::Step(index, forward)) => {
                 if let Some(Overlay::Settings { form, .. }) = &mut self.overlay {
                     let action = form.step_row(index, forward);

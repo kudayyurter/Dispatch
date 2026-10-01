@@ -48,6 +48,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 mod footer;
 mod pointer_routing;
+mod settings;
 use pointer_routing::MenuAction;
 
 /// How wide a tile must be to have a `…` on its top border.
@@ -413,6 +414,8 @@ enum Overlay {
         /// The rows.
         form: SettingsForm,
     },
+    /// The Settings workspace.
+    Preferences(settings::SettingsWorkspace),
     /// A project to switch to.
     Project(Picker),
     /// A harness to register, found on PATH.
@@ -466,6 +469,7 @@ impl Overlay {
         match self {
             Overlay::Harness(_) => "harness",
             Overlay::Settings { .. } => "settings",
+            Overlay::Preferences(_) => "preferences",
             Overlay::Project(_) => "project",
             Overlay::Register(_) => "register",
             Overlay::Browse(_) => "browse",
@@ -493,6 +497,7 @@ impl Overlay {
             | Overlay::Activity(picker)
             | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
+            | Overlay::Preferences(_)
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
@@ -514,6 +519,7 @@ impl Overlay {
             | Overlay::Activity(picker)
             | Overlay::Help(picker) => Some(picker),
             Overlay::Settings { .. }
+            | Overlay::Preferences(_)
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
@@ -537,6 +543,7 @@ impl Overlay {
             // Help has its own key handling and runs a command, not a choice.
             Overlay::Help(_)
             | Overlay::Settings { .. }
+            | Overlay::Preferences(_)
             | Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
@@ -558,6 +565,8 @@ impl Overlay {
             | Overlay::Activity(picker)
             | Overlay::Help(picker) => picker.desired_width(),
             Overlay::Settings { form, .. } => form.desired_width(),
+            // It takes the whole body, and sizes itself inside it.
+            Overlay::Preferences(_) => u16::MAX,
             Overlay::OpenOn { prompt, .. }
             | Overlay::RenameTab { prompt, .. }
             | Overlay::CloseTab { prompt, .. } => prompt.desired_width(),
@@ -582,6 +591,7 @@ impl Overlay {
             | Overlay::Activity(picker)
             | Overlay::Help(picker) => picker.set_chrome(chrome),
             Overlay::Settings { form, .. } => form.set_chrome(chrome),
+            Overlay::Preferences(workspace) => workspace.view.set_chrome(chrome),
             Overlay::Browse(browser) => browser.set_chrome(chrome),
             Overlay::OpenOn { prompt, .. } => prompt.set_chrome(chrome),
             Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
@@ -787,23 +797,15 @@ pub struct App {
     /// them.
     ui_dir: Option<PathBuf>,
     /// Where `preferences.toml` is kept, when this client keeps it.
-    #[allow(dead_code, reason = "Settings applies through it, in a later task")]
     preferences_dir: Option<PathBuf>,
     /// What `preferences.toml` held when this client started or last applied.
-    #[allow(dead_code, reason = "Settings edits a copy of it, in a later task")]
     preferences: dispatch_config::preferences::Preferences,
     /// `config.toml`'s `[interface]`, kept to work out where a value came from.
-    #[allow(
-        dead_code,
-        reason = "Settings shows each value's source, in a later task"
-    )]
     interface_config: dispatch_config::InterfaceConfig,
     /// Which `[interface]` keys `config.toml` wrote.
-    #[allow(
-        dead_code,
-        reason = "Settings shows each value's source, in a later task"
-    )]
     interface_present: dispatch_config::InterfaceKeysPresent,
+    /// The category and field Settings reopens on.
+    settings_memory: (usize, usize),
     /// The appearance in force, kept so start-up can apply it once the
     /// terminal's own palette is known.
     appearance: AppearanceInForce,
@@ -1011,6 +1013,7 @@ impl App {
             preferences: dispatch_config::preferences::Preferences::default(),
             interface_config: dispatch_config::InterfaceConfig::default(),
             interface_present: dispatch_config::InterfaceKeysPresent::default(),
+            settings_memory: (0, 0),
             appearance: AppearanceInForce::default(),
             terminal_palette: Palette::FALLBACK,
             window: Rect::default(),
@@ -3308,6 +3311,7 @@ impl App {
                 }
             }
             Action::Help => self.open_help(),
+            Action::Settings => self.open_settings_workspace(),
         }
     }
 
@@ -3470,6 +3474,11 @@ impl App {
 
         if matches!(self.overlay, Some(Overlay::Approval { .. })) {
             self.handle_approval_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::Preferences(_))) {
+            self.settings_key(key);
             return Ok(());
         }
 
@@ -5044,6 +5053,7 @@ impl App {
                 );
             }
         }
+        self.push_settings_hits(&mut hits);
         if let Some(Overlay::Menu(menu)) = &self.overlay {
             let layout = menu.layout(self.window);
             hits.push(layout.rect, pointer::Target::Menu(pointer::MenuHit::Area));
@@ -5157,6 +5167,11 @@ impl App {
 
         if let Overlay::Settings { form, .. } = overlay {
             frame.render_widget(form, panes_area);
+            return;
+        }
+
+        if let Overlay::Preferences(workspace) = overlay {
+            frame.render_widget(&workspace.view, panes_area);
             return;
         }
 
@@ -14935,15 +14950,456 @@ args = ["--effort", "{value}"]
     }
 
     #[test]
-    fn the_footer_settings_button_is_inert_until_its_screen_exists() {
+    fn the_footer_settings_button_opens_settings() {
         let (mut app, project, daemon, _sent) = attached_app();
         spawn_several(&mut app, &daemon, project, 1);
         let mut terminal = a_wide_terminal();
         drawn(&mut app, &mut terminal);
         let y = terminal.size().expect("sized").height - 1;
         let row = bottom_row(&terminal);
-        click(&mut app, cell_of(&row, "[ Settings ]"), y);
+        click(&mut app, cell_of(&row, "[ Settings ]") + 2, y);
+        assert!(matches!(app.overlay, Some(Overlay::Preferences(_))));
+    }
+
+    /// Keeps preferences in a fresh directory, as a client that has one does.
+    fn with_preferences(app: &mut App) -> PathBuf {
+        let dir = scratch("settings");
+        app.keep_preferences_in(
+            &dir,
+            dispatch_config::InterfaceConfig::default(),
+            dispatch_config::InterfaceKeysPresent::default(),
+        );
+        dir
+    }
+
+    fn workspace(app: &App) -> &settings::SettingsWorkspace {
+        match &app.overlay {
+            Some(Overlay::Preferences(workspace)) => workspace,
+            _ => panic!("Settings should be open"),
+        }
+    }
+
+    /// The rectangle `[Apply]` and the like were drawn in.
+    fn settings_button(app: &App, id: pointer::ButtonId) -> Rect {
+        app.settings_layout()
+            .expect("Settings is open")
+            .buttons
+            .iter()
+            .find(|(_, own)| *own == id)
+            .unwrap_or_else(|| panic!("{id:?} is drawn"))
+            .0
+    }
+
+    /// Clicks a button of the open workspace, from the layout as drawn now.
+    fn click_settings_button(app: &mut App, id: pointer::ButtonId) {
+        let rect = settings_button(app, id);
+        click_rect(app, rect);
+    }
+
+    /// Clicks the first cell of `rect`.
+    fn click_rect(app: &mut App, rect: Rect) {
+        click(app, rect.x, rect.y);
+    }
+
+    /// Clicks the `›` of the field row at `row`, from the layout as drawn now.
+    fn click_forward(
+        app: &mut App,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        row: usize,
+    ) {
+        drawn(app, terminal);
+        let step = app
+            .settings_layout()
+            .expect("Settings is open")
+            .steps
+            .iter()
+            .find(|(_, index, forward)| *index == row && *forward)
+            .expect("the row has a forward step")
+            .0;
+        click_rect(app, step);
+    }
+
+    fn open_appearance_by_keys(app: &mut App) {
+        press_alt(app, ',');
+        press(app, KeyCode::Down);
+    }
+
+    #[test]
+    fn mouse_only_a_theme_change_is_applied_and_kept() {
+        use dispatch_config::preferences::ThemeChoice;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let y = terminal.size().expect("sized").height - 1;
+        let row = bottom_row(&terminal);
+        click(&mut app, cell_of(&row, "[ Settings ]") + 2, y);
+        drawn(&mut app, &mut terminal);
+
+        let layout = app.settings_layout().expect("Settings is open");
+        let appearance = layout
+            .categories
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .expect("Appearance is listed")
+            .0;
+        click_rect(&mut app, appearance);
+        // Theme is the first Appearance field: Follow terminal, Dark, Light.
+        for _ in 0..2 {
+            click_forward(&mut app, &mut terminal, 0);
+        }
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            app.theme.palette().background,
+            Palette::LIGHT.background,
+            "it previews at once"
+        );
+        click_settings_button(&mut app, pointer::ButtonId::Apply);
+        drawn(&mut app, &mut terminal);
+        let close = app.settings_layout().expect("still open").close;
+        click_rect(&mut app, close);
+
         assert!(app.overlay.is_none());
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(saved.appearance.theme, Some(ThemeChoice::Light));
+        assert_eq!(app.theme.palette().background, Palette::LIGHT.background);
+    }
+
+    #[test]
+    fn keyboard_only_the_same_change() {
+        use dispatch_config::preferences::ThemeChoice;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        open_appearance_by_keys(&mut app);
+        assert_eq!(workspace(&app).view.category(), 1);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            workspace(&app).view.focused_button(),
+            Some(pointer::ButtonId::Apply),
+            "Apply is the button Enter presses"
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.overlay.is_none());
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(saved.appearance.theme, Some(ThemeChoice::Light));
+        assert_eq!(app.theme.palette().background, Palette::LIGHT.background);
+    }
+
+    #[test]
+    fn discard_puts_the_previewed_theme_back() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        let before = app.theme.palette();
+        drawn(&mut app, &mut terminal);
+
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.theme.palette().background, Palette::LIGHT.background);
+        drawn(&mut app, &mut terminal);
+        click_settings_button(&mut app, pointer::ButtonId::Discard);
+
+        assert_eq!(app.theme.palette(), before);
+        assert!(
+            !dir.join(dispatch_config::preferences::FILE).exists(),
+            "nothing was written"
+        );
+        assert!(
+            workspace(&app)
+                .view
+                .selected_field()
+                .is_some_and(|f| !f.changed)
+        );
+    }
+
+    #[test]
+    fn discard_puts_glyphs_and_motion_back_too() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        let (glyphs, motion) = (app.glyphs, app.motion);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        // Down to Motion, flipped; down to Icons, stepped to Plain.
+        for key in [
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Down,
+            KeyCode::Right,
+        ] {
+            press(&mut app, key);
+        }
+        assert_ne!(app.motion, motion);
+        assert!(!std::ptr::eq(app.glyphs, glyphs));
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.motion, motion);
+        assert!(std::ptr::eq(app.glyphs, glyphs));
+    }
+
+    #[test]
+    fn closing_with_unapplied_changes_asks_and_discard_restores() {
+        use pointer::ButtonId;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        let before = app.theme.palette();
+        drawn(&mut app, &mut terminal);
+
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_some(), "it asks first");
+        drawn(&mut app, &mut terminal);
+        let ids: Vec<ButtonId> = app
+            .settings_layout()
+            .expect("open")
+            .buttons
+            .iter()
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            ids,
+            [ButtonId::KeepEditing, ButtonId::Discard, ButtonId::Apply]
+        );
+
+        click_settings_button(&mut app, ButtonId::Discard);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.theme.palette(), before);
+    }
+
+    #[test]
+    fn keep_editing_goes_back_to_the_rows_with_the_edit_intact() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Esc);
+
+        // The prompt holds the keys: a letter and an arrow do nothing, and
+        // Tab goes round its own buttons.
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            workspace(&app).view.focused_button(),
+            Some(pointer::ButtonId::Apply)
+        );
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(
+            workspace(&app).view.focused_button(),
+            Some(pointer::ButtonId::KeepEditing)
+        );
+        press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.overlay, Some(Overlay::Preferences(_))));
+        assert_eq!(
+            workspace(&app).view.focus(),
+            dispatch_tui::settings_view::Focus::Fields
+        );
+        assert!(
+            workspace(&app)
+                .view
+                .selected_field()
+                .is_some_and(|f| f.changed)
+        );
+    }
+
+    #[test]
+    fn changing_category_with_edits_asks_and_apply_goes_on() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(workspace(&app).view.category(), 1, "it asked instead");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(workspace(&app).view.category(), 2, "and Apply went on");
+        assert!(
+            dispatch_config::preferences::load(&dir)
+                .expect("it reads back")
+                .appearance
+                .theme
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_shown_and_nothing_is_written() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        // Behind its back, after the snapshot was taken.
+        std::fs::write(
+            dir.join(dispatch_config::preferences::FILE),
+            "[appearance]\ntheme = \"dark\"\n",
+        )
+        .expect("the file is written");
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.status.is_error());
+        assert!(app.status.text.contains("theme"), "{}", app.status.text);
+        assert!(
+            workspace(&app)
+                .view
+                .selected_field()
+                .is_some_and(|field| field.id == "theme" && field.conflict)
+        );
+        let on_disk = std::fs::read_to_string(dir.join(dispatch_config::preferences::FILE))
+            .expect("the file is still there");
+        assert!(on_disk.contains("dark"), "{on_disk}");
+        assert!(!on_disk.contains("light"), "{on_disk}");
+    }
+
+    #[test]
+    fn settings_reopens_where_it_was() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+
+        press_alt(&mut app, ',');
+        let reopened = workspace(&app);
+        assert_eq!(reopened.view.category(), 1);
+        assert_eq!(
+            reopened.view.selected_field().map(|field| field.id),
+            Some("accent")
+        );
+    }
+
+    #[test]
+    fn a_custom_accent_is_typed_in_place() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        // Terminal, then back round to Custom….
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|field| field.id),
+            Some("accent_custom")
+        );
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "ff8800".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(
+            saved.appearance.accent,
+            Some(dispatch_config::preferences::Accent::Custom(
+                dispatch_config::preferences::Rgb8(0xff, 0x88, 0x00)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_small_window_still_changes_category_and_steps_a_value() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        press_alt(&mut app, ',');
+        drawn(&mut app, &mut terminal);
+        let layout = app.settings_layout().expect("open");
+        assert!(layout.compact);
+
+        let next = layout
+            .steps
+            .iter()
+            .find(|(_, index, forward)| *index == usize::MAX && *forward)
+            .expect("the category switcher has a forward arrow")
+            .0;
+        click_rect(&mut app, next);
+        assert_eq!(workspace(&app).view.category(), 1);
+        click_forward(&mut app, &mut terminal, 0);
+        assert!(
+            workspace(&app)
+                .view
+                .selected_field()
+                .is_some_and(|f| f.changed)
+        );
+    }
+
+    #[test]
+    fn nothing_reaches_a_child_while_settings_is_open() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        track_mouse(&mut app, &daemon, pane);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        drain(&sent);
+
+        press_alt(&mut app, ',');
+        drawn(&mut app, &mut terminal);
+        // Into the search row, and typed.
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(workspace(&app).view.search(), "ab");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('q'));
+
+        let (x, y) = middle_of(&app, pane);
+        click(&mut app, x, y);
+        click(&mut app, 0, 1);
+        mouse_at(&mut app, MouseEventKind::ScrollDown, x, y);
+        mouse_at(&mut app, MouseEventKind::Moved, x, y);
+        app.handle(&Event::Paste("pasted".into()), Size::new(100, 30))
+            .expect("a paste is handled");
+
+        assert!(writes_by_pane(&sent).is_empty(), "the pane heard nothing");
+        assert!(matches!(app.overlay, Some(Overlay::Preferences(_))));
     }
 
     #[test]

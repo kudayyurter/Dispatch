@@ -312,6 +312,25 @@ impl SettingsView {
         }
     }
 
+    /// Gives `focus` to a part at once, as a click on it does.
+    pub fn set_focus(&mut self, focus: Focus) {
+        self.focus_on(focus);
+    }
+
+    /// Moves among the footer buttons and round again, which is how Tab goes
+    /// while a prompt holds the focus on them.
+    pub fn cycle_button(&mut self, forward: bool) {
+        let count = self.footer_buttons().len();
+        if count == 0 {
+            return;
+        }
+        self.button = if forward {
+            (self.button + 1) % count
+        } else {
+            (self.button + count - 1) % count
+        };
+    }
+
     /// Search, categories, fields, buttons, and round again.
     pub fn focus_next(&mut self) {
         self.focus_on(match self.focus {

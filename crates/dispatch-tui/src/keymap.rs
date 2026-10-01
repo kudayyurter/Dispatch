@@ -400,6 +400,8 @@ pub enum Command {
     SidebarWider,
     /// Open the searchable list of every command.
     Help,
+    /// Open Settings.
+    Settings,
     Quit,
 }
 
@@ -459,6 +461,7 @@ impl Command {
         (Command::SidebarNarrower, "sidebar_narrower"),
         (Command::SidebarWider, "sidebar_wider"),
         (Command::Help, "help"),
+        (Command::Settings, "settings"),
         (Command::Quit, "quit"),
     ];
 
@@ -541,6 +544,7 @@ impl Command {
             Command::SidebarNarrower => "narrower",
             Command::SidebarWider => "wider",
             Command::Help => "help",
+            Command::Settings => "settings",
             Command::Quit => "quit",
         }
     }
@@ -603,6 +607,7 @@ impl Command {
             Command::SidebarNarrower => "Make the sidebar narrower",
             Command::SidebarWider => "Make the sidebar wider",
             Command::Help => "Command help",
+            Command::Settings => "Open Settings",
             Command::Quit => "Quit",
         }
     }
@@ -714,6 +719,7 @@ impl Command {
             Command::SidebarNarrower => Action::ResizeSidebar(-2),
             Command::SidebarWider => Action::ResizeSidebar(2),
             Command::Help => Action::Help,
+            Command::Settings => Action::Settings,
             Command::Quit => Action::Quit,
         })
     }
@@ -763,6 +769,7 @@ impl Keymap {
             (Chord::alt('a'), Command::NextAttention),
             (Chord::alt('s'), Command::ToggleSidebar),
             (Chord::alt('/'), Command::Help),
+            (Chord::alt(','), Command::Settings),
         ];
 
         let mut prefix = vec![
@@ -785,6 +792,7 @@ impl Keymap {
             (Chord::char('w'), Command::NextAttention),
             (Chord::char('b'), Command::ToggleSidebar),
             (Chord::char('?'), Command::Help),
+            (Chord::char(','), Command::Settings),
         ];
         prefix.extend(digits(Command::GoToTab));
         prefix.push((Chord::key(Tab), Command::NextTab));
@@ -867,6 +875,7 @@ impl Keymap {
             (Chord::char('<'), Command::SidebarNarrower),
             (Chord::char('>'), Command::SidebarWider),
             (Chord::char('?'), Command::Help),
+            (Chord::char(','), Command::Settings),
             (Chord::key(Esc), Command::LeaveMode),
             (Chord::key(Enter), Command::LeaveMode),
         ];
