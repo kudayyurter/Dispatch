@@ -15332,6 +15332,257 @@ args = ["--effort", "{value}"]
         }
     }
 
+    /// Opens Settings on the category at `index`, with the fields focused.
+    fn open_category_by_keys(app: &mut App, index: usize) {
+        press_alt(app, ',');
+        for _ in 0..index {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Tab);
+    }
+
+    /// Whether the open workspace offers Apply, which it does only while
+    /// something is pending.
+    fn offers_apply(app: &App) -> bool {
+        app.settings_layout()
+            .expect("Settings is open")
+            .buttons
+            .iter()
+            .any(|(_, id)| *id == pointer::ButtonId::Apply)
+    }
+
+    #[test]
+    fn mouse_and_layout_applies_focus_and_hover_to_preferences() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let dir = with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        open_category_by_keys(&mut app, 0);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|f| f.id),
+            Some("focus_follows_pointer")
+        );
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            workspace(&app).view.focused_button(),
+            Some(pointer::ButtonId::Apply)
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(saved.interface.focus_follows_pointer, Some(true));
+        assert_eq!(saved.interface.hover_claims_panes, Some(true));
+        assert!(app.hover_claims_panes);
+
+        drawn(&mut app, &mut terminal);
+        app.focus_pane(panes[1]);
+        let (x, y) = middle_of(&app, panes[0]);
+        mouse_at(&mut app, MouseEventKind::Moved, x, y);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
+    }
+
+    #[test]
+    fn sidebar_fields_act_at_once_and_are_not_pending() {
+        use dispatch_config::ui_state::{self, DEFAULT_SIDEBAR};
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        app.keep_ui_in(&dir);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        open_category_by_keys(&mut app, 0);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|f| f.id),
+            Some("sidebar_width")
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR + 2);
+        assert_eq!(ui_state::load(&dir).sidebar_width, DEFAULT_SIDEBAR + 2);
+        assert!(!offers_apply(&app), "a sidebar field is never pending");
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        assert!(app.sidebar_collapsed);
+        assert!(ui_state::load(&dir).sidebar_collapsed);
+        press(&mut app, KeyCode::Right);
+        assert!(!app.sidebar_collapsed);
+        assert!(!offers_apply(&app));
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR);
+        assert_eq!(ui_state::load(&dir).sidebar_width, DEFAULT_SIDEBAR);
+        assert!(!offers_apply(&app));
+        assert!(
+            !dir.join(dispatch_config::preferences::FILE).exists(),
+            "none of it is Apply's to write"
+        );
+    }
+
+    #[test]
+    fn show_sidebar_in_a_narrow_window_toggles_the_drawer() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        app.keep_ui_in(&dir);
+        app.window.width = NARROW - 1;
+        let was = app.drawer_open;
+        open_category_by_keys(&mut app, 0);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.drawer_open, !was);
+        assert!(!app.sidebar_collapsed);
+    }
+
+    #[test]
+    fn advanced_shows_paths_read_only() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        app.keep_ui_in(&dir);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        open_category_by_keys(&mut app, 2);
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let field = workspace(&app).view.selected_field().expect("a row");
+            seen.push((field.label.clone(), field.value.clone(), field.applies));
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Down);
+        }
+        let labels: Vec<&str> = seen.iter().map(|(label, ..)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Configuration file",
+                "Preferences",
+                "ui.toml",
+                "Harnesses",
+                "Log file",
+                "Version",
+                "Mode"
+            ]
+        );
+        assert!(seen.iter().all(|(_, _, applies)| *applies == "Read only"));
+        let value = |label: &str| {
+            seen.iter()
+                .find(|(own, ..)| own == label)
+                .map(|(_, value, _)| value.as_str())
+                .expect("listed")
+        };
+        assert_eq!(value("Version"), env!("CARGO_PKG_VERSION"));
+        assert!(
+            value("Mode").starts_with("Attached to "),
+            "{}",
+            value("Mode")
+        );
+        assert!(value("Preferences").ends_with("preferences.toml"));
+        assert!(value("ui.toml").ends_with("ui.toml"));
+
+        assert!(!offers_apply(&app), "nothing became pending");
+        assert!(!dir.join(dispatch_config::preferences::FILE).exists());
+        assert!(!dir.join("ui.toml").exists());
+    }
+
+    #[test]
+    fn discard_keeps_what_was_committed_when_the_file_cannot_be_read() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = scratch("settings-unreadable");
+        let file = dir.join(dispatch_config::preferences::FILE);
+        std::fs::write(&file, "[interface]\nfocus_follows_pointer = true\n").expect("written");
+        app.keep_preferences_in(
+            &dir,
+            dispatch_config::InterfaceConfig::default(),
+            dispatch_config::InterfaceKeysPresent::default(),
+        );
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        std::fs::write(&file, "not toml [").expect("spoiled");
+
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        click_settings_button(&mut app, pointer::ButtonId::Discard);
+
+        assert_eq!(
+            workspace(&app).base.interface.focus_follows_pointer,
+            Some(true),
+            "what was committed is kept"
+        );
+        assert_eq!(app.preferences.interface.focus_follows_pointer, Some(true));
+        assert!(app.status.is_error());
+        assert!(app.status.contains("preferences.toml"), "{}", app.status);
+        assert!(workspace(&app).draft == workspace(&app).base);
+    }
+
+    #[test]
+    fn stepping_a_search_result_in_another_category_asks_before_leaving_edits() {
+        use dispatch_config::ui_state::DEFAULT_SIDEBAR;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        app.keep_ui_in(&dir);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::BackTab);
+        type_text(&mut app, "Sidebar width");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            workspace(&app).view.selected_field().map(|f| f.id),
+            Some("sidebar_width")
+        );
+        press(&mut app, KeyCode::Right);
+
+        drawn(&mut app, &mut terminal);
+        let ids: Vec<_> = app
+            .settings_layout()
+            .expect("open")
+            .buttons
+            .iter()
+            .map(|(_, id)| *id)
+            .collect();
+        for id in [
+            pointer::ButtonId::Apply,
+            pointer::ButtonId::Discard,
+            pointer::ButtonId::KeepEditing,
+        ] {
+            assert!(ids.contains(&id), "{id:?} in {ids:?}");
+        }
+        assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR, "not stepped yet");
+
+        click_settings_button(&mut app, pointer::ButtonId::Discard);
+        assert_eq!(
+            workspace(&app).view.category(),
+            0,
+            "it went on to the result"
+        );
+        assert_eq!(
+            app.sidebar_width, DEFAULT_SIDEBAR,
+            "the step was not replayed"
+        );
+    }
+
     #[test]
     fn after_a_conflict_apply_again_writes_the_users_choice() {
         use dispatch_config::preferences::ThemeChoice;

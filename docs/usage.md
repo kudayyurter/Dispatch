@@ -139,6 +139,47 @@ bring it back with `fg` -- so the key never reaches it. In a shell pane,
 `Ctrl z` reaches the shell as usual: it suspends the job the shell is running,
 and the shell and the pane carry on.
 
+## Settings
+
+`[ Settings ]` at the right of the footer opens Settings, and so does `Alt ,`
+(or `,` in session mode and after the prefix). It is a dialog over the grid:
+nothing you type reaches a pane while it is open.
+
+It has three categories, listed down the left (or as a `‹ Appearance ›`
+switcher in a window under 72 columns wide):
+
+- **Mouse & layout**: focus follows pointer, hover claims shared panes, the
+  sidebar's width, showing the sidebar, and a reset of its width.
+- **Appearance**: theme (follow the terminal, dark or light), accent (a preset
+  or your own `#rrggbb`), motion, and icons (Nerd Font or plain).
+- **Advanced**: where the configuration file, preferences, `ui.toml`, harnesses
+  and log file are, the version, and whether Dispatch is standalone or attached.
+  It is read-only.
+
+Each row shows its value between `‹` and `›` and where the value comes from
+(`Built-in`, `config.toml` or `Settings`). `Tab` and `Shift Tab` move between the
+search box, the categories, the rows and the buttons; the arrow keys move and
+change values, `Enter` toggles or activates, and `Esc` closes the innermost
+thing first. Everything is clickable too, and the wheel scrolls without
+changing a value.
+
+Appearance is previewed in this window as you edit it. Nothing is written until
+you press `[ Apply ]`, which writes only the section you changed to
+`preferences.toml`. `[ Discard ]` puts back what was last applied. Moving to
+another category, or closing, with changes pending asks whether to Apply,
+Discard or Keep editing. The footer counts the changes, as in
+`2 changes in Appearance`. If `preferences.toml` was changed by something else
+since Settings opened, Apply writes nothing, marks the fields concerned
+`changed elsewhere`, and shows the newer value; apply again to write yours.
+
+The sidebar rows are the exception: they act at once and are saved to
+`ui.toml`, as dragging the edge and `Alt s` do, and they are never pending. In
+a narrow window `Show sidebar` opens or closes the drawer, like the key.
+
+Typing in the search box filters every category by label, description and
+category name; `Enter` or a click on a result goes to it in its own category.
+Settings reopens on the row you left it on.
+
 ## The sidebar
 
 The project list is framed on the left. It is a tree: each project carries a

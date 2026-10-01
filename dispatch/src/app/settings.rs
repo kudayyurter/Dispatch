@@ -7,7 +7,7 @@
 //! and written, one section at a time, only when the user applies it.
 
 use dispatch_config::preferences::{
-    self, ApplyError, Effective, Preferences, Rgb8, Section, Source,
+    self, ApplyError, Effective, Preferences, Rgb8, Section, Source, Sourced,
 };
 use dispatch_tui::settings_view::{FieldKind, FieldView, Focus, SettingsLayout, SettingsView};
 
@@ -17,6 +17,7 @@ use pointer::ButtonId;
 /// Index of each category, in the order they are listed.
 const MOUSE: usize = 0;
 const APPEARANCE: usize = 1;
+const ADVANCED: usize = 2;
 const CATEGORIES: [&str; 3] = ["Mouse & layout", "Appearance", "Advanced"];
 
 const THEMES: [(ThemeChoice, &str); 3] = [
@@ -149,6 +150,37 @@ fn source_label(source: Source) -> &'static str {
         Source::ConfigFile => "config.toml",
         Source::Preferences => "Settings",
     }
+}
+
+/// A row outside Appearance, in `category`.
+#[allow(clippy::too_many_arguments)]
+fn plain_row(
+    category: usize,
+    id: &'static str,
+    label: &str,
+    description: &str,
+    kind: FieldKind,
+    value: String,
+    source: String,
+    applies: &'static str,
+) -> FieldView {
+    FieldView {
+        id,
+        label: label.to_string(),
+        description: description.to_string(),
+        category,
+        kind,
+        value,
+        source,
+        applies,
+        changed: false,
+        conflict: false,
+    }
+}
+
+/// A path as text, or `unknown` when it could not be worked out.
+fn shown_path<E>(path: Result<std::path::PathBuf, E>) -> String {
+    path.map_or_else(|_| "unknown".to_string(), |path| path.display().to_string())
 }
 
 fn on_off(on: bool) -> String {
@@ -310,7 +342,8 @@ impl App {
             .map_or("", |(_, name)| *name);
         let accent = accent_index(&effective.accent.value);
         let accent_name = PRESETS.get(accent).map_or(CUSTOM, |(_, name)| *name);
-        let mut fields = vec![
+        let mut fields = self.mouse_fields(workspace, &effective);
+        fields.extend([
             row(
                 "theme",
                 "Theme",
@@ -337,7 +370,7 @@ impl App {
                 base.appearance.accent != draft.appearance.accent,
                 "accent",
             ),
-        ];
+        ]);
         if let Accent::Custom(rgb) = effective.accent.value {
             fields.push(row(
                 "accent_custom",
@@ -374,7 +407,165 @@ impl App {
             base.appearance.icons != draft.appearance.icons,
             "icons",
         ));
+        fields.extend(self.advanced_fields());
         fields
+    }
+
+    /// The Mouse & layout rows. The two pointer toggles are the draft's, to be
+    /// applied; the sidebar's rows are read from the app and act at once, so
+    /// they are never changed against a base.
+    fn mouse_fields(&self, workspace: &SettingsWorkspace, effective: &Effective) -> Vec<FieldView> {
+        use dispatch_config::ui_state::{MAX_SIDEBAR, MIN_SIDEBAR};
+
+        let (base, draft) = (&workspace.base, &workspace.draft);
+        let toggle = |id, label: &str, description: &str, value: &Sourced<bool>, changed| {
+            let mut field = plain_row(
+                MOUSE,
+                id,
+                label,
+                description,
+                FieldKind::Toggle,
+                on_off(value.value),
+                source_label(value.source).to_string(),
+                "Applies now",
+            );
+            field.changed = changed;
+            field.conflict = workspace.conflicts.contains(&id);
+            field
+        };
+        let sidebar = |id, label: &str, description: &str, kind, value: String| {
+            plain_row(
+                MOUSE,
+                id,
+                label,
+                description,
+                kind,
+                value,
+                "ui.toml".to_string(),
+                "Applies now",
+            )
+        };
+        vec![
+            toggle(
+                "focus_follows_pointer",
+                "Focus follows pointer",
+                "Resting the pointer on a pane gives it the keyboard.",
+                &effective.focus_follows_pointer,
+                base.interface.focus_follows_pointer != draft.interface.focus_follows_pointer,
+            ),
+            toggle(
+                "hover_claims_panes",
+                "Hover claims shared panes",
+                "The window under the pointer sets the size of panes shared between windows.",
+                &effective.hover_claims_panes,
+                base.interface.hover_claims_panes != draft.interface.hover_claims_panes,
+            ),
+            sidebar(
+                "sidebar_width",
+                "Sidebar width",
+                "Columns the project sidebar takes; saved at once.",
+                FieldKind::Number {
+                    min: i64::from(MIN_SIDEBAR),
+                    max: i64::from(MAX_SIDEBAR),
+                },
+                self.sidebar_width.to_string(),
+            ),
+            sidebar(
+                "show_sidebar",
+                "Show sidebar",
+                "Fold the sidebar away and back; saved at once.",
+                FieldKind::Toggle,
+                on_off(!self.sidebar_collapsed),
+            ),
+            plain_row(
+                MOUSE,
+                "reset_sidebar",
+                "Reset sidebar width",
+                "Back to the default width.",
+                FieldKind::Action(ButtonId::ResetSidebar),
+                String::new(),
+                "ui.toml".to_string(),
+                "Applies now",
+            ),
+        ]
+    }
+
+    /// The Advanced rows: where things are, and what is running. None can be
+    /// edited here.
+    fn advanced_fields(&self) -> Vec<FieldView> {
+        use dispatch_os::paths;
+
+        let config_dir = paths::config_dir();
+        let beside = |name: &str| {
+            shown_path(
+                config_dir
+                    .as_ref()
+                    .map(|dir| dir.join(name))
+                    .map_err(|_| ()),
+            )
+        };
+        let mode = match self.attachments().len() {
+            0 => "Standalone".to_string(),
+            n => format!("Attached to {n} machine(s)"),
+        };
+        [
+            (
+                "config_file",
+                "Configuration file",
+                "Where config.toml is read from.",
+                shown_path(paths::config_file()),
+            ),
+            (
+                "preferences_file",
+                "Preferences",
+                "What Settings writes; config.toml is never rewritten.",
+                beside(preferences::FILE),
+            ),
+            (
+                "ui_file",
+                "ui.toml",
+                "The sidebar's width and fold.",
+                beside("ui.toml"),
+            ),
+            (
+                "harnesses_dir",
+                "Harnesses",
+                "One file for each agent.",
+                shown_path(paths::harnesses_dir()),
+            ),
+            (
+                "log_file",
+                "Log file",
+                "Where diagnostics go, since the screen is Dispatch's.",
+                shown_path(paths::log_file()),
+            ),
+            (
+                "version",
+                "Version",
+                "This build of Dispatch.",
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+            (
+                "mode",
+                "Mode",
+                "Whether this window runs its own agents or is attached to daemons.",
+                mode,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label, description, value)| {
+            plain_row(
+                ADVANCED,
+                id,
+                label,
+                description,
+                FieldKind::ReadOnly,
+                value,
+                String::new(),
+                "Read only",
+            )
+        })
+        .collect()
     }
 
     /// The footer's account of what is unapplied, or none.
@@ -460,6 +651,9 @@ impl App {
             // This section is now what is on disk, so a later section that
             // fails does not make it a conflict on the next try.
             adopt(section, &mut workspace.base, &workspace.draft);
+            if section == Section::Mouse {
+                self.commit_mouse(workspace);
+            }
         }
         workspace.conflicts.clear();
         self.preferences = workspace.base.clone();
@@ -469,13 +663,39 @@ impl App {
         true
     }
 
+    /// Makes the pointer settings of what is committed the ones in force. They
+    /// are not previewed, so only Apply and Discard touch them.
+    fn commit_mouse(&mut self, workspace: &SettingsWorkspace) {
+        let effective = preferences::effective(
+            &self.interface_config,
+            &self.interface_present,
+            &workspace.base,
+        );
+        self.set_focus_follows_pointer(effective.focus_follows_pointer.value);
+        self.set_hover_claims_panes(effective.hover_claims_panes.value);
+    }
+
     /// Puts the draft back to what was committed, and this window with it.
     pub(super) fn discard_settings(&mut self, workspace: &mut SettingsWorkspace) {
         // The file as it is now, so a change made elsewhere is not a
         // conflict on the next edit.
-        if let Some(dir) = &self.preferences_dir {
-            workspace.base = preferences::load_or_default(dir);
-            self.preferences = workspace.base.clone();
+        if let Some(dir) = self.preferences_dir.clone() {
+            // A file that cannot be read still holds the user's settings, so
+            // reading it as the defaults would throw them away here.
+            match preferences::load(&dir) {
+                Ok(fresh) => {
+                    workspace.base = fresh;
+                    self.preferences = workspace.base.clone();
+                    self.commit_mouse(workspace);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ignoring preferences that cannot be read");
+                    self.warn(format!(
+                        "{} cannot be read; keeping what Settings had",
+                        dir.join(preferences::FILE).display()
+                    ));
+                }
+            }
         }
         workspace.draft = workspace.base.clone();
         workspace.conflicts.clear();
@@ -580,7 +800,11 @@ impl App {
                 workspace.view.set_prompt(None);
             }
             ButtonId::ClearSearch => workspace.view.clear_search(),
-            // Task 10 gives the sidebar fields their actions.
+            ButtonId::ResetSidebar => {
+                self.sidebar_width = dispatch_config::ui_state::DEFAULT_SIDEBAR;
+                self.save_ui();
+                self.refresh_settings(workspace);
+            }
             _ => {}
         }
         Flow::Stay
@@ -670,6 +894,25 @@ impl App {
                         Accent::Custom(Rgb8(r, g, b))
                     }
                 });
+            }
+            "focus_follows_pointer" => {
+                draft.interface.focus_follows_pointer =
+                    Some(!effective.focus_follows_pointer.value);
+            }
+            "hover_claims_panes" => {
+                draft.interface.hover_claims_panes = Some(!effective.hover_claims_panes.value);
+            }
+            // The sidebar acts at once, as dragging and `Alt s` do, so it
+            // never touches the draft.
+            "sidebar_width" => {
+                self.resize_sidebar(if forward { 2 } else { -2 });
+                self.refresh_settings(workspace);
+                return;
+            }
+            "show_sidebar" => {
+                self.toggle_sidebar();
+                self.refresh_settings(workspace);
+                return;
             }
             "motion" => draft.interface.motion = Some(!effective.motion.value),
             "icons" => {

@@ -1,6 +1,6 @@
 # Configuring Dispatch
 
-Where settings live, the shell panes open, per-agent harness settings, status rules, and motion. Rebinding keys is under [Keys in usage.md](usage.md#keys).
+Where settings live, preferences, the shell panes open, per-agent harness settings, status rules, and motion. Rebinding keys is under [Keys in usage.md](usage.md#keys).
 
 ## The configuration directory
 
@@ -31,6 +31,36 @@ Dispatch writes it, when you fold the sidebar or finish dragging its edge, so
 `config.toml` keeps its comments. A width outside 20 to 60 is brought into
 range, and a value that is not a number, or a file that is not TOML, falls
 back to the default.
+
+## Preferences
+
+What you choose in Settings (see [Settings in usage.md](usage.md#settings)) is
+kept in `preferences.toml`, beside `config.toml`:
+
+```toml
+# ~/.config/dispatch/preferences.toml
+[interface]
+motion = false
+focus_follows_pointer = true
+hover_claims_panes = true
+
+[appearance]
+theme = "light"       # "terminal" (the default), "dark" or "light"
+accent = "teal"       # terminal, violet, blue, teal, green, amber, red, pink, or "#rrggbb"
+icons = "plain"       # "nerd" (the default) or "plain"
+```
+
+Every key is optional. A value is read as `preferences.toml` over
+`config.toml`'s `[interface]` over the built-in default, so a key you have never
+chosen in Settings keeps following `config.toml`. Settings writes only
+`preferences.toml`; `config.toml` is never rewritten, so its comments stay.
+Appearance has no `config.toml` setting.
+
+A value that is wrong, such as `theme = "sepia"`, costs only itself: it is
+logged and that setting falls back to the next layer, and the rest of the file
+still applies. A file that is not TOML at all is left as it is for you to mend,
+and Settings says so rather than overwriting it. Preferences are read when
+Dispatch starts, and again when Settings opens.
 
 ## Shell panes
 
@@ -224,6 +254,8 @@ motion = false   # default true
 Every change then shows at once, a working pane shows a still play glyph, and
 nothing pulses; every state is still shown.
 
+Settings can override this; see [Preferences](#preferences).
+
 ## Pointer
 
 A click on a pane gives it the keyboard, and a click on its header does too
@@ -242,5 +274,8 @@ This is separate from `hover_claims_panes`, which only decides whether the
 window under the pointer sets the size of panes shared between windows (see
 [daemon.md](daemon.md)). Neither implies the other. Scroll mode ignores
 `focus_follows_pointer`, since its keys act on the pane it was entered on.
+
+Both can also be set in Settings, which overrides `config.toml`; see
+[Preferences](#preferences).
 
 [Back to the README](../README.md)
