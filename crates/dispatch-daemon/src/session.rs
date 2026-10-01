@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use dispatch_config::{Choices, DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
+use dispatch_core::Handoff;
 use dispatch_core::{
     PaneId, PaneStatus, Placement, Project, ProjectId, ProjectSource, ProjectTabs, RequestId,
     TabError, TabId,
@@ -836,11 +837,11 @@ impl Daemon {
             ClientMessage::DelegateRequest {
                 parent,
                 harness,
-                task,
+                task: _,
                 size,
-                handoff: _,
-                interactive: _,
-            } => self.delegate_request(id, parent, harness, task, size),
+                handoff,
+                interactive,
+            } => self.delegate_request(id, parent, harness, handoff, interactive, size),
 
             // Task 5.
             ClientMessage::DelegateReport { .. } => {}
@@ -868,7 +869,8 @@ impl Daemon {
                     waiting.id,
                     waiting.parent,
                     &waiting.harness,
-                    &waiting.task,
+                    &waiting.handoff,
+                    waiting.interactive,
                     waiting.size,
                     waiting.caller,
                     blanket,
@@ -1376,13 +1378,19 @@ impl Daemon {
         env
     }
 
-    /// The one-shot run of `task` under `harness`, with the environment pane
+    /// The one-shot run of `brief` under `harness`, with the environment pane
     /// `pane` would start with, or `None` when the harness has no one-shot
-    /// form for this platform.
+    /// (or, when `interactive`, no interactive) form for this platform.
     ///
     /// One place builds it, so what is judged before a run starts is what
     /// starts.
-    fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
+    fn task_run(
+        &self,
+        harness: &str,
+        brief: &str,
+        pane: PaneId,
+        interactive: bool,
+    ) -> Option<TaskRun> {
         let def = self.harnesses.get(harness)?;
         // No client chose anything for a subagent: it gets what the user
         // saved, then the file's defaults. Nothing chosen is nothing to
@@ -1390,7 +1398,16 @@ impl Daemon {
         let values = def
             .resolve(&Choices::new(), &self.saved_settings(harness))
             .unwrap_or_default();
-        let mut run = def.task_launch_with(std::env::consts::OS, task, &values)?;
+        let mut run = if interactive {
+            // An interactive agent takes its brief as an argument: its
+            // standard input is its terminal.
+            TaskRun {
+                launch: def.interactive_launch_with(std::env::consts::OS, brief, &values)?,
+                input: TaskInput::Argument,
+            }
+        } else {
+            def.task_launch_with(std::env::consts::OS, brief, &values)?
+        };
         add_missing(&mut run.launch.env, self.pane_env(pane));
         if run.input == TaskInput::Argument {
             // Its task is in its arguments, so a task file named in its
@@ -1409,10 +1426,13 @@ impl Daemon {
 
     /// Why `run` must not start, if the form it came from puts the task where
     /// a shell parses it.
-    fn unsafe_task_form(&self, harness: &str, run: &TaskRun) -> Option<String> {
-        self.harnesses
-            .get(harness)?
-            .task_refusal_as(std::env::consts::OS, &run.launch)
+    fn unsafe_task_form(&self, harness: &str, run: &TaskRun, interactive: bool) -> Option<String> {
+        let def = self.harnesses.get(harness)?;
+        if interactive {
+            def.interactive_refusal_as(std::env::consts::OS, &run.launch)
+        } else {
+            def.task_refusal_as(std::env::consts::OS, &run.launch)
+        }
     }
 
     /// Refuses, approves, or asks about a request to delegate.
@@ -1421,7 +1441,8 @@ impl Daemon {
         caller: ClientId,
         parent: PaneId,
         harness: String,
-        task: String,
+        handoff: Option<Handoff>,
+        interactive: bool,
         size: (u16, u16),
     ) {
         // One id for the whole call: a refusal answers with the same id a
@@ -1448,16 +1469,44 @@ impl Daemon {
             harness
         };
 
+        // Checked again here, whatever the caller checked: anything that can
+        // reach the socket can send a request, and the parse is what the
+        // brief is built from.
+        let handoff = match handoff.map(|sent| Handoff::parse(&sent.text)) {
+            None => {
+                self.resolve(
+                    request,
+                    caller,
+                    DelegateOutcome::Refused {
+                        reason: crate::delegation::NO_HANDOFF.into(),
+                    },
+                );
+                return;
+            }
+            Some(Err(error)) => {
+                self.resolve(
+                    request,
+                    caller,
+                    DelegateOutcome::Refused {
+                        reason: error.to_string(),
+                    },
+                );
+                return;
+            }
+            Some(Ok(handoff)) => handoff,
+        };
+        let brief = handoff.brief(parent);
+
         // Built as `approve` will build it, environment and all: which file a
         // bare command names depends on `PATH`. The pane id is a stand-in,
         // since nothing is judged by it.
-        let run = self.task_run(&harness, &task, PaneId::new());
+        let run = self.task_run(&harness, &brief, PaneId::new(), interactive);
 
         // A form that would put the task on cmd.exe's command line is refused
         // whatever the caps say: approving it would not make it safe.
         if let Some(reason) = run
             .as_ref()
-            .and_then(|run| self.unsafe_task_form(&harness, run))
+            .and_then(|run| self.unsafe_task_form(&harness, run, interactive))
         {
             tracing::info!(%parent, %harness, %reason, "refused an unsafe task form");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
@@ -1472,9 +1521,14 @@ impl Daemon {
         // worse than refusing up front.
         let has_task_form = run.is_some();
 
-        if let Some(reason) =
-            crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
-        {
+        if let Some(reason) = crate::delegation::refusal(
+            depth,
+            live,
+            self.limits,
+            has_task_form,
+            &harness,
+            interactive,
+        ) {
             tracing::info!(%parent, %harness, %reason, "refused a delegation");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
@@ -1483,7 +1537,16 @@ impl Daemon {
         // A pane the user has already approved for everything does not ask
         // again, for as long as this daemon runs.
         if self.blanket.contains(&parent) {
-            self.approve(request, parent, &harness, &task, size, caller, true);
+            self.approve(
+                request,
+                parent,
+                &harness,
+                &handoff,
+                interactive,
+                size,
+                caller,
+                true,
+            );
             return;
         }
 
@@ -1492,10 +1555,10 @@ impl Daemon {
             parent,
             project,
             harness: harness.clone(),
-            task: task.clone(),
+            task: handoff.text.clone(),
             depth,
-            handoff: None,
-            interactive: false,
+            handoff: Some(handoff.clone()),
+            interactive,
         };
 
         self.pending.insert(
@@ -1504,7 +1567,8 @@ impl Daemon {
                 id: request,
                 parent,
                 harness,
-                task,
+                handoff,
+                interactive,
                 size,
                 caller,
                 asked: Instant::now(),
@@ -1544,7 +1608,8 @@ impl Daemon {
         request: RequestId,
         parent: PaneId,
         harness: &str,
-        task: &str,
+        handoff: &Handoff,
+        interactive: bool,
         size: (u16, u16),
         caller: ClientId,
         durable: bool,
@@ -1600,14 +1665,15 @@ impl Daemon {
         };
 
         let id = PaneId::new();
-        let run = self.task_run(harness, task, id);
+        let brief = handoff.brief(parent);
+        let run = self.task_run(harness, &brief, id, interactive);
 
         // Judged again on the run that is about to start, as the request
         // was when it arrived: which file a bare command names is decided
         // by the filesystem now, not then.
         if let Some(reason) = run
             .as_ref()
-            .and_then(|run| self.unsafe_task_form(harness, run))
+            .and_then(|run| self.unsafe_task_form(harness, run, interactive))
         {
             tracing::info!(%parent, %harness, %reason, "refused an unsafe task form on approval");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
@@ -1621,9 +1687,14 @@ impl Daemon {
         // request was first judged by, so the two can never disagree.
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
-        if let Some(reason) =
-            crate::delegation::refusal(depth, live, self.limits, run.is_some(), harness)
-        {
+        if let Some(reason) = crate::delegation::refusal(
+            depth,
+            live,
+            self.limits,
+            run.is_some(),
+            harness,
+            interactive,
+        ) {
             tracing::info!(%parent, %harness, %reason, "refused an approved delegation");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
@@ -1645,7 +1716,7 @@ impl Daemon {
         let task_file = match run.input {
             TaskInput::Argument => None,
             TaskInput::File => {
-                match TaskFile::write(&self.task_dir, request, task, &self.leftovers) {
+                match TaskFile::write(&self.task_dir, request, &brief, &self.leftovers) {
                     Ok(file) => {
                         // Last, and in place of any spelling of it the
                         // harness set: the file Dispatch wrote is the one

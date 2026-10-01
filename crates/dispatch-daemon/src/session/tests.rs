@@ -24,13 +24,45 @@ use dispatch_core::Placement;
 /// fixture for the difference between `task.is_some()` and
 /// `task_launch(..).is_some()`.
 fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
-    let body = if cfg!(windows) {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
-    } else {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
-    };
-
     std::fs::create_dir_all(dir).expect("temp dir is writable");
+    // The subagent is handed a brief: a preamble, then the handoff. These
+    // runners pull the Goal section out of it and run that as a script, so
+    // a test still says what the subagent does as a shell command.
+    let runner = if cfg!(windows) {
+        let path = dir.join("run-goal.ps1");
+        std::fs::write(
+            &path,
+            "$brief = Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')\n\
+             $m = [regex]::Match($brief, '(?ms)^## Goal\\s*\\r?\\n(.*?)(?=^## |\\z)')\n\
+             Invoke-Expression $m.Groups[1].Value.Trim()\n",
+        )
+        .expect("temp dir is writable");
+        path
+    } else {
+        let path = dir.join("run-goal.sh");
+        std::fs::write(
+            &path,
+            "goal=$(printf '%s\\n' \"$1\" | awk '/^## Goal[[:space:]]*$/{f=1;next} /^## /{f=0} f')\n\
+             eval \"$goal\"\n",
+        )
+        .expect("temp dir is writable");
+        path
+    };
+    let body = if cfg!(windows) {
+        format!(
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\n\
+             args = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \
+             \"-ExecutionPolicy\", \"Bypass\", \"-File\", '{}']\ninput = \"file\"\n",
+            runner.display()
+        )
+    } else {
+        format!(
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\n\
+             args = ['{}', \"{{task}}\"]\n\n[task.interactive]\nargs = ['{}', \"{{task}}\"]\n",
+            runner.display(),
+            runner.display()
+        )
+    };
     std::fs::write(dir.join("shell.toml"), body).expect("temp dir is writable");
 
     let no_task_args = if cfg!(windows) {
@@ -1266,6 +1298,16 @@ fn m_is_child(message: &ServerMessage) -> bool {
     )
 }
 
+/// A complete handoff whose Goal is `goal`, which the test harness runs as a
+/// script.
+fn handoff_for(goal: &str) -> dispatch_core::Handoff {
+    dispatch_core::Handoff::parse(&format!(
+        "## Goal\n{goal}\n\n## Context\nA test.\n\n## Constraints\nNone.\n\n\
+         ## Done when\nIt has run.\n\n## Report back\nNothing.\n"
+    ))
+    .expect("a complete handoff")
+}
+
 /// Attaches a delegate caller and asks for a subagent.
 fn ask(daemon: &mut Daemon, parent: PaneId, task: &str) -> Inbox {
     ask_as(daemon, 9, parent, task)
@@ -1291,7 +1333,7 @@ fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Inbox {
             harness: "shell".into(),
             task: task.into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for(task)),
             interactive: false,
         },
     );
@@ -1321,12 +1363,159 @@ fn a_delegation_request_is_put_to_the_user() {
     assert!(
         matches!(
             seen.iter().find(|m| matches!(m, ServerMessage::DelegatePending { .. })),
-            Some(ServerMessage::DelegatePending { task, .. }) if task == "echo delegated"
+            Some(ServerMessage::DelegatePending { handoff: Some(handoff), .. })
+                if handoff.goal == "echo delegated"
         ),
         "the whole task travels, got {seen:#?}"
     );
     assert_eq!(daemon.pane_count(), 1, "nothing runs before an answer");
     let _ = request;
+}
+
+#[test]
+fn a_request_without_a_handoff_is_refused_without_asking() {
+    let (mut daemon, project, _dir) = daemon("delegate-bare");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "old delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: "echo bare".into(),
+            size: (80, 24),
+            handoff: None,
+            interactive: false,
+        },
+    );
+
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("--handoff"), "{reason}");
+    assert!(pending(&drain(&ui)).is_none(), "nobody is asked");
+}
+
+#[test]
+fn a_handoff_with_problems_is_refused_even_when_the_caller_skipped_the_check() {
+    let (mut daemon, project, _dir) = daemon("delegate-broken");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let mut broken = handoff_for("echo x");
+    broken.text = "## Goal\necho x\n".into();
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "careless".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(broken),
+            interactive: false,
+        },
+    );
+
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("Context is missing"), "{reason}");
+}
+
+#[test]
+fn the_subagent_is_handed_the_brief_not_the_bare_goal() {
+    let (mut daemon, project, _dir) = daemon("delegate-brief");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    // The Goal prints the subagent's own first argument (Unix) or task file
+    // (Windows): the brief exactly as the harness received it.
+    let goal = if cfg!(windows) {
+        "Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')"
+    } else {
+        "printf '%s\\n' \"$1\""
+    };
+    let caller = ask(&mut daemon, parent, goal);
+    let request = pending(&drain(&ui)).expect("asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let tail = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateFinished { tail, .. } => {
+                Some(String::from_utf8_lossy(tail).into_owned())
+            }
+            _ => None,
+        })
+        .expect("finished");
+    assert!(
+        tail.contains("You are a subagent started by Dispatch"),
+        "{tail}"
+    );
+    assert!(tail.contains("## Report back"), "{tail}");
+}
+
+#[test]
+fn the_prompt_carries_the_handoff() {
+    let (mut daemon, project, _dir) = daemon("delegate-prompt-handoff");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let _caller = ask(&mut daemon, parent, "echo shown");
+
+    let seen = drain(&ui);
+    let shown = seen.iter().find_map(|m| match m {
+        ServerMessage::DelegatePending {
+            handoff,
+            task,
+            interactive,
+            ..
+        } => Some((handoff.clone(), task.clone(), *interactive)),
+        _ => None,
+    });
+    let (handoff, task, interactive) = shown.expect("asked");
+    let handoff = handoff.expect("the handoff travels");
+    assert_eq!(handoff.goal, "echo shown");
+    assert_eq!(
+        task, handoff.text,
+        "an older client is shown the whole handoff"
+    );
+    assert!(!interactive);
 }
 
 #[test]
@@ -1556,7 +1745,7 @@ fn a_pane_the_daemon_does_not_own_cannot_delegate() {
             harness: "shell".into(),
             task: "echo hello".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("echo hello")),
             interactive: false,
         },
     );
@@ -2025,7 +2214,7 @@ fn an_interface_client_that_delegates_is_not_told_twice() {
             harness: "shell".into(),
             task: "echo self".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("echo self")),
             interactive: false,
         },
     );
@@ -2079,7 +2268,7 @@ fn a_harness_with_an_empty_task_form_is_refused_without_asking() {
             harness: "no-task-args".into(),
             task: "echo never".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("echo never")),
             interactive: false,
         },
     );
@@ -3897,7 +4086,7 @@ fn assert_a_task_reaches_the_capture_exactly(
             harness: "capture".into(),
             task: task.into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for(task)),
             interactive: false,
         },
     );
@@ -3921,10 +4110,14 @@ fn assert_a_task_reaches_the_capture_exactly(
         "the capture ran and succeeded: {seen:#?}"
     );
 
-    assert_eq!(
-        std::fs::read(&captured).expect("the agent recorded its input"),
-        task.as_bytes(),
-        "the task arrived changed"
+    // The agent is handed the brief, which carries the handoff verbatim after
+    // its preamble, so the task arrives intact exactly when that text does.
+    let received = std::fs::read(&captured).expect("the agent recorded its input");
+    let handoff = handoff_for(task).text.into_bytes();
+    assert!(
+        received.ends_with(&handoff),
+        "the task arrived changed: {}",
+        String::from_utf8_lossy(&received)
     );
     assert!(
         !dir.0.join("marker.txt").exists(),
@@ -4027,7 +4220,7 @@ fn delegating_to(
             harness: harness.into(),
             task: task.into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for(task)),
             interactive: false,
         },
     );
@@ -4334,7 +4527,7 @@ fn a_harness_spelling_of_a_daemon_variable_is_the_one_its_agent_gets() {
     );
 
     let run = daemon
-        .task_run("spelled", "anything", PaneId::new())
+        .task_run("spelled", "anything", PaneId::new(), false)
         .expect("the harness has a task form");
     let spellings: Vec<_> = run
         .launch
@@ -4406,7 +4599,7 @@ fn an_argument_form_is_never_handed_a_task_file() {
     );
 
     let run = daemon
-        .task_run("argue", "anything", PaneId::new())
+        .task_run("argue", "anything", PaneId::new(), false)
         .expect("the harness has a task form");
     assert_eq!(run.input, TaskInput::Argument);
     assert!(
@@ -4460,7 +4653,7 @@ fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
             harness: "mixed".into(),
             task: "anything".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("anything")),
             interactive: false,
         },
     );
@@ -4523,7 +4716,7 @@ fn a_task_form_that_would_put_the_task_on_cmds_command_line_is_refused() {
             harness: "old".into(),
             task: "x & echo DISPATCH_AUDIT_MARKER".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("x & echo DISPATCH_AUDIT_MARKER")),
             interactive: false,
         },
     );
@@ -5692,7 +5885,7 @@ fn a_subagent_starts_with_the_saved_settings() {
             harness: "record".into(),
             task: "anything".into(),
             size: (80, 24),
-            handoff: None,
+            handoff: Some(handoff_for("anything")),
             interactive: false,
         },
     );
