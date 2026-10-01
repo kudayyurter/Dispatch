@@ -282,3 +282,27 @@ fn an_accent_replaces_the_palettes() {
         Rgb(9, 8, 7)
     );
 }
+
+#[test]
+fn a_surface_fills_only_what_was_left_to_the_terminal() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let followed = Theme::new(Palette::LIGHT, Depth::TrueColor);
+    assert_eq!(followed.surface, None, "a followed palette paints nothing");
+    let theme = followed.with_surface();
+    assert_eq!(theme.surface, Some(Color::Rgb(0xfa, 0xfa, 0xfa)));
+
+    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+    buf[(1, 0)].set_style(Style::default().bg(Color::Red).fg(Color::Blue));
+    theme.paint_surface(&mut buf, Rect::new(0, 0, 4, 1));
+
+    assert_eq!(buf[(0, 0)].bg, Color::Rgb(0xfa, 0xfa, 0xfa));
+    assert_eq!(buf[(0, 0)].fg, theme.text);
+    assert_eq!(
+        (buf[(1, 0)].bg, buf[(1, 0)].fg),
+        (Color::Red, Color::Blue),
+        "a colour a widget chose is kept"
+    );
+    assert_eq!(buf[(0, 1)].bg, Color::Reset, "outside the rectangle");
+}

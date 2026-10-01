@@ -1185,7 +1185,14 @@ impl App {
         // Slot 5 only stands for the accent when both the palette and the
         // accent are the terminal's own.
         let terminal_accent = theme == ThemeChoice::Terminal && *accent == Accent::Terminal;
-        self.theme = Theme::with_accent(palette, self.theme.depth(), terminal_accent);
+        let mixed = Theme::with_accent(palette, self.theme.depth(), terminal_accent);
+        // A preset is not the terminal's palette, so its background is
+        // painted behind the chrome; followed, the terminal's own stays.
+        self.theme = if theme == ThemeChoice::Terminal {
+            mixed
+        } else {
+            mixed.with_surface()
+        };
         self.set_glyphs(match icons {
             IconSet::Plain => &dispatch_tui::glyphs::Glyphs::PLAIN,
             IconSet::Nerd => &dispatch_tui::glyphs::Glyphs::NERD,
@@ -5031,8 +5038,21 @@ impl App {
             }
         }
         self.draw_footer(frame, area, &mut hits);
+        // A preset's background behind Dispatch's own surfaces, painted once
+        // they are drawn. The panes are left alone: a child's output keeps
+        // the terminal's colours.
+        let buf = frame.buffer_mut();
+        self.theme.paint_surface(buf, top);
+        self.theme.paint_surface(buf, sidebar_area);
+        if area.height > 0 {
+            let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            self.theme.paint_surface(buf, footer);
+        }
 
         self.draw_overlay(frame, panes_area, body);
+        if let Some(rect) = self.overlay_box() {
+            self.theme.paint_surface(frame.buffer_mut(), rect);
+        }
         if let Some(layout) = self.dialog_layout() {
             hits.push(
                 layout.rect,
@@ -5136,6 +5156,15 @@ impl App {
             area,
         );
         self.motion && sidebar::spins(&self.state, area, &self.sidebar_scroll)
+    }
+
+    /// The box the open overlay was drawn in, as the last frame left it.
+    fn overlay_box(&self) -> Option<Rect> {
+        match self.overlay.as_ref()? {
+            Overlay::Menu(menu) => Some(menu.layout(self.window).rect),
+            Overlay::Preferences(_) => self.settings_layout().map(|layout| layout.rect),
+            _ => self.dialog_layout().map(|layout| layout.rect),
+        }
     }
 
     /// Draws whichever overlay is open, if any.
@@ -6333,11 +6362,147 @@ mod tests {
             accent: Rgb(0xe0, 0x6c, 0x75),
             ..Palette::LIGHT
         };
-        assert_eq!(app.theme, Theme::new(palette, depth));
+        assert_eq!(app.theme, Theme::new(palette, depth).with_surface());
         // By the flag rather than by address: a `const` is not promised one
         // address at every use.
         assert!(!app.glyphs.nerd);
         assert_eq!(app.glyphs.default_icon, Glyphs::PLAIN.default_icon);
+    }
+
+    /// The 24-bit colour of a cell's `colour`, which a preset at full depth
+    /// always is.
+    fn rgb_of(colour: Color) -> dispatch_tui::theme::Rgb {
+        match colour {
+            Color::Rgb(r, g, b) => dispatch_tui::theme::Rgb(r, g, b),
+            other => panic!("{other:?} is not a 24-bit colour"),
+        }
+    }
+
+    /// The cells of `rect` in the last-drawn frame.
+    fn cells_in(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        rect: Rect,
+    ) -> Vec<ratatui::buffer::Cell> {
+        let buf = terminal.backend().buffer();
+        rect.positions()
+            .filter_map(|position| buf.cell(position).cloned())
+            .collect()
+    }
+
+    /// Asserts no cell of `rect` is left on the terminal's own background or
+    /// in its own foreground, and that what is written there is readable on
+    /// what it is written on; and that most of it is the light background,
+    /// a highlight or the active tab being the rest.
+    fn assert_painted_light(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        rect: Rect,
+        what: &str,
+    ) {
+        use dispatch_tui::theme::{READABLE, contrast};
+        let cells = cells_in(terminal, rect);
+        for cell in &cells {
+            let background = rgb_of(cell.bg);
+            // A state glyph's ANSI colour is the terminal's own, and means
+            // something, so it is not the theme's to mix or measure.
+            if cell.symbol().trim().is_empty() || !matches!(cell.fg, Color::Rgb(..)) {
+                assert_ne!(cell.fg, Color::Reset, "{what}: {cell:?}");
+                continue;
+            }
+            let ratio = contrast(rgb_of(cell.fg), background);
+            assert!(ratio >= READABLE, "{what}: {cell:?} at {ratio}");
+        }
+        let light = cells
+            .iter()
+            .filter(|cell| rgb_of(cell.bg) == Palette::LIGHT.background)
+            .count();
+        assert!(
+            light * 2 > cells.len(),
+            "{what}: {light} of {}",
+            cells.len()
+        );
+    }
+
+    #[test]
+    fn a_light_preset_paints_dispatchs_own_surfaces_on_a_dark_terminal() {
+        use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.terminal_palette = Palette::FALLBACK;
+        app.apply_appearance(ThemeChoice::Light, &Accent::Terminal, IconSet::Nerd);
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let size = terminal.size().expect("sized");
+        let width = size.width;
+
+        let footer = Rect::new(0, size.height - 1, width, 1);
+        assert_painted_light(&terminal, footer, "footer");
+        assert_eq!(
+            rgb_of(cells_in(&terminal, footer)[0].bg),
+            Palette::LIGHT.background
+        );
+        assert_painted_light(&terminal, Rect::new(0, 0, width, 1), "tab row");
+        assert_painted_light(&terminal, app.sidebar_area, "sidebar");
+
+        press_alt(&mut app, ',');
+        drawn(&mut app, &mut terminal);
+        let rect = app.settings_layout().expect("open").rect;
+        assert_painted_light(&terminal, rect, "Settings");
+        let search = cells_in(&terminal, Rect::new(rect.x + 2, rect.y + 1, 1, 1));
+        assert_eq!(rgb_of(search[0].bg), Palette::LIGHT.background);
+    }
+
+    #[test]
+    fn follow_terminal_paints_no_background() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_wide_terminal();
+        press_alt(&mut app, ',');
+        drawn(&mut app, &mut terminal);
+        let size = terminal.size().expect("sized");
+        let footer = cells_in(&terminal, Rect::new(0, size.height - 1, size.width, 1));
+        assert!(
+            footer.iter().all(|cell| cell.bg == Color::Reset),
+            "{footer:?}"
+        );
+        let rect = app.settings_layout().expect("open").rect;
+        let search = cells_in(
+            &terminal,
+            Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, 1),
+        );
+        assert!(
+            search.iter().all(|cell| cell.bg == Color::Reset),
+            "{search:?}"
+        );
+    }
+
+    #[test]
+    fn a_preset_never_repaints_a_panes_interior() {
+        use dispatch_config::preferences::{Accent, IconSet, ThemeChoice};
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        print(
+            &mut app,
+            &daemon,
+            pane,
+            b"plain text\r\n\x1b[31mred\x1b[0m\r\n",
+        );
+        let mut terminal = a_wide_terminal();
+        drawn(&mut app, &mut terminal);
+        let interior = app
+            .layout
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("the pane is drawn");
+        let before = cells_in(&terminal, interior);
+
+        app.apply_appearance(ThemeChoice::Light, &Accent::Terminal, IconSet::Nerd);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            cells_in(&terminal, interior),
+            before,
+            "the child's output is its own"
+        );
     }
 
     #[test]

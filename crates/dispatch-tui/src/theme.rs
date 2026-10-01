@@ -7,6 +7,8 @@
 //! gets a built-in dark palette in the same spirit.
 
 use dispatch_config::preferences::Accent;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
 /// A colour as three 8-bit channels.
@@ -93,8 +95,11 @@ impl Palette {
         accent: Rgb(0xb4, 0xa0, 0xf0),
     };
 
-    /// A light palette, for a terminal left on its own dark one or for a
-    /// user who wants Dispatch's chrome light whatever the terminal is.
+    /// A light palette, for a user who wants Dispatch's chrome light.
+    ///
+    /// Chosen as a preset, its background is painted behind Dispatch's own
+    /// surfaces (see [`Theme::with_surface`]), so it reads the same on a dark
+    /// terminal as on a light one. Pane contents keep the terminal's colours.
     pub const LIGHT: Palette = Palette {
         background: Rgb(0xfa, 0xfa, 0xfa),
         foreground: Rgb(0x38, 0x3a, 0x42),
@@ -145,9 +150,11 @@ impl Depth {
 
 /// What Dispatch's chrome is drawn in.
 ///
-/// Ordinary text is not here: it stays the terminal's own foreground, and only
-/// what is written over `tint` or `tab` takes `text`. Nor are the state
-/// glyphs' colours, which are ANSI and so already the theme's.
+/// Following the terminal, ordinary text is not here: it stays the terminal's
+/// own foreground on its own background, and only what is written over `tint`
+/// or `tab` takes `text`. A preset palette is not the terminal's, so its
+/// `surface` is painted behind the chrome and ordinary text there takes
+/// `text`. The state glyphs' colours are ANSI and so already the theme's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     /// Secondary text: branches, the app name, inactive tabs, unfocused
@@ -167,6 +174,13 @@ pub struct Theme {
     /// when it did not, the tint is the fallback's dark one, and the
     /// terminal's text on it could be a light theme's dark text.
     pub text: Color,
+    /// The background painted behind Dispatch's own surfaces (sidebar, tab
+    /// row, footer, dialogs and menus), or none to leave the terminal's.
+    ///
+    /// Set only for a preset palette: the terminal's own background is what
+    /// a followed palette was read from, and painting the fallback's guess at
+    /// it would show as a box on any other background.
+    pub surface: Option<Color>,
     /// What everything above was mixed from, kept so an animation can blend
     /// between roles at the theme's own depth rather than carrying the
     /// palette and depth around separately.
@@ -205,8 +219,40 @@ impl Theme {
             tab: colour(palette.background.mix(palette.accent, 0.30)),
             accent,
             text: colour(palette.foreground),
+            surface: None,
             palette,
             depth,
+        }
+    }
+
+    /// This theme with its palette's background painted behind the chrome:
+    /// what a Dark or Light preset needs, since its text is mixed for its
+    /// own background and not for whatever the terminal's is.
+    #[must_use]
+    pub fn with_surface(self) -> Theme {
+        Theme {
+            surface: Some(at_depth(self.palette.background, self.depth)),
+            ..self
+        }
+    }
+
+    /// Paints this theme's surface over `rect` of `buf`, once what sits there
+    /// has been drawn: a cell left on the terminal's background takes the
+    /// surface, and one left in the terminal's foreground takes `text`.
+    /// Colours a widget chose are kept. Does nothing without a surface.
+    pub fn paint_surface(&self, buf: &mut Buffer, rect: Rect) {
+        let Some(surface) = self.surface else {
+            return;
+        };
+        for position in rect.intersection(buf.area).positions() {
+            if let Some(cell) = buf.cell_mut(position) {
+                if cell.bg == Color::Reset {
+                    cell.bg = surface;
+                }
+                if cell.fg == Color::Reset {
+                    cell.fg = self.text;
+                }
+            }
         }
     }
 
