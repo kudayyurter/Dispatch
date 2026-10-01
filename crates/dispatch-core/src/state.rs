@@ -639,6 +639,13 @@ impl AppState {
         };
     }
 
+    /// Marks an interactive subagent as having reported, or clears the mark.
+    pub fn set_reported(&mut self, id: PaneId, reported: bool) {
+        if let Some(pane) = self.panes.iter_mut().find(|p| p.id == id) {
+            pane.reported = reported;
+        }
+    }
+
     /// Records a new status for a pane.
     pub fn set_pane_status(&mut self, id: PaneId, status: PaneStatus) -> Result<(), StateError> {
         let pane = self

@@ -710,7 +710,7 @@ fn every_state_has_a_glyph_of_its_own() {
     // The dot said only "something is happening" and the outcome column said
     // the rest. One glyph per state is one place to look.
     let glyphs = [
-        STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED, BLOCKED, UNSEEN,
+        STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED, BLOCKED, UNSEEN, REPORTED,
     ];
 
     for (i, glyph) in glyphs.iter().enumerate() {
@@ -1484,6 +1484,19 @@ fn a_machines_name_stays_full_strength_while_its_hidden_above_count_is_faded() {
     let up_x = u16::try_from(column_of(&lines[divider], "↑")).expect("inside the sidebar");
     let up = buf.cell((up_x, y)).expect("cell exists");
     assert_eq!(up.fg, Theme::fallback().faded, "{lines:#?}");
+}
+
+#[test]
+fn a_reported_subagent_is_marked_in_bold() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state.set_reported(pane, true);
+
+    let buf = render(&state, WIDTH, 6);
+    let cell = buf.cell((WIDTH - 3, TOP + 1)).expect("cell exists");
+
+    assert_eq!(cell.symbol(), REPORTED);
+    assert!(cell.modifier.contains(Modifier::BOLD));
 }
 
 #[test]

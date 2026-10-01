@@ -44,6 +44,8 @@ pub const IDLE: &str = "\u{f04c}";
 
 /// Waiting on a decision only the user can make.
 pub const BLOCKED: &str = "\u{f071}";
+/// An interactive subagent that has reported and waits on the user.
+pub const REPORTED: &str = "\u{f0e0}";
 
 /// Exited cleanly.
 pub const DONE: &str = "\u{f00c}";
@@ -304,6 +306,17 @@ fn state_glyph(
         return (CLOSED, Style::default().fg(theme.faded));
     }
 
+    // Ahead of the status: a reported subagent is usually idle, and an idle
+    // glyph would hide that it is waiting on the user's answer.
+    if pane.reported {
+        return (
+            REPORTED,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
     match pane.status {
         PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
         PaneStatus::Running => Rollup::Working.glyph(spinner, theme),
@@ -338,6 +351,7 @@ impl Rollup {
             .into_iter()
             .filter(|pane| !pane.closed)
             .filter_map(|pane| match pane.status {
+                _ if pane.reported => Some(Rollup::Done),
                 PaneStatus::Blocked => Some(Rollup::Blocked),
                 PaneStatus::Idle if state.is_unseen(pane.id) => Some(Rollup::Done),
                 PaneStatus::Running => Some(Rollup::Working),
