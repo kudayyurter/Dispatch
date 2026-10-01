@@ -27,6 +27,27 @@ use crate::pane::DaemonPane;
 use crate::sizing::Sizes;
 use crate::task_file::{Leftovers, TaskFile};
 
+/// The largest report passed on, in bytes.
+///
+/// Far past anything an agent should write for another to read, and far
+/// short of the protocol's 64 MiB frame limit.
+const MAX_REPORT_BYTES: usize = 1024 * 1024;
+
+/// `report`, cut at [`MAX_REPORT_BYTES`] on a character boundary, with a
+/// line saying so.
+fn cut_report(mut report: String) -> String {
+    if report.len() <= MAX_REPORT_BYTES {
+        return report;
+    }
+    let mut end = MAX_REPORT_BYTES;
+    while !report.is_char_boundary(end) {
+        end -= 1;
+    }
+    report.truncate(end);
+    report.push_str("\n[dispatch] the report was cut at 1 MiB\n");
+    report
+}
+
 /// How much of a subagent's output its caller is given.
 ///
 /// Enough for an agent to act on, far short of a session: the pane keeps the
@@ -843,8 +864,7 @@ impl Daemon {
                 interactive,
             } => self.delegate_request(id, parent, harness, handoff, interactive, size),
 
-            // Task 5.
-            ClientMessage::DelegateReport { .. } => {}
+            ClientMessage::DelegateReport { pane, report } => self.report(id, pane, report),
 
             ClientMessage::DelegateDecision {
                 request,
@@ -1155,6 +1175,8 @@ impl Daemon {
             exited_at: None,
             task_file: None,
             branch: None,
+            interactive: false,
+            reported: false,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -1592,13 +1614,76 @@ impl Daemon {
         depth
     }
 
-    /// How many of a pane's subagents are still running.
+    /// How many of a pane's subagents are still working for it: their
+    /// request is open. Counted by request rather than by process, since an
+    /// interactive pane that has reported may stay open, at the user's
+    /// choice, for as long as they like.
     fn live_children(&self, parent: PaneId) -> usize {
         self.panes
             .values()
-            .filter(|p| p.parent == Some(parent))
-            .filter(|p| matches!(p.session.state(), RunState::Running))
+            .filter(|p| p.parent == Some(parent) && p.request.is_some())
             .count()
+    }
+
+    /// Delivers a subagent's report to the caller waiting on it.
+    ///
+    /// The caller is answered at once: the report is the work, and the
+    /// process may go on for a moment after sending it. The pane's request
+    /// and caller are both cleared, so neither its exit nor its caller
+    /// leaving does anything more to it: a one-shot pane stays to be read,
+    /// as one that exited does.
+    fn report(&mut self, client: ClientId, pane: PaneId, report: String) {
+        use dispatch_proto::ReportOutcome;
+
+        let answer = |outcome| ServerMessage::ReportAnswered { outcome };
+
+        let Some(target) = self.panes.get_mut(&pane) else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+
+        if target.parent.is_none() {
+            let reason = format!(
+                "pane {pane} is not a subagent: only a pane started by `dispatch delegate` \
+                 has anyone to report to"
+            );
+            self.send(client, answer(ReportOutcome::Refused { reason }));
+            return;
+        }
+        if target.reported {
+            let reason = format!("pane {pane} has already reported");
+            self.send(client, answer(ReportOutcome::Refused { reason }));
+            return;
+        }
+        let (Some(request), Some(caller)) = (target.request, target.caller) else {
+            let reason = "the agent that asked is no longer waiting".to_string();
+            self.send(client, answer(ReportOutcome::NotWaiting { reason }));
+            return;
+        };
+
+        target.request = None;
+        target.caller = None;
+        target.reported = true;
+        let interactive = target.interactive;
+
+        self.send(
+            caller,
+            ServerMessage::DelegateFinished {
+                request,
+                exit: 0,
+                tail: Vec::new(),
+                report: Some(cut_report(report)),
+            },
+        );
+        self.send(client, answer(ReportOutcome::Delivered));
+
+        // What an interactive pane does next is Task 6.
+        let _ = interactive;
     }
 
     /// Starts an approved subagent and tells everyone.
@@ -1776,6 +1861,8 @@ impl Daemon {
                 exited_at: None,
                 task_file,
                 branch: None,
+                interactive,
+                reported: false,
             },
         );
 

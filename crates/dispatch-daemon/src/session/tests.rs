@@ -6242,3 +6242,208 @@ fn a_shell_whose_job_is_stopped_stays_open() {
     );
     assert_eq!(daemon.pane_count(), 1);
 }
+
+/// Approves the one request pending on `ui` and returns the subagent's pane.
+fn approve_and_spawn(daemon: &mut Daemon, ui: &Inbox) -> PaneId {
+    let request = pending(&drain(ui)).expect("asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    let seen = wait_for(daemon, ui, |m| m.iter().any(m_is_child));
+    seen.iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned {
+                pane,
+                parent: Some(_),
+                ..
+            } => Some(*pane),
+            _ => None,
+        })
+        .expect("checked by wait_for")
+}
+
+/// Sends a report from `pane` over a fresh delegate connection, and returns
+/// that connection's inbox.
+fn report_from(daemon: &mut Daemon, id: u64, pane: PaneId, report: &str) -> Inbox {
+    let reporter = daemon.attach_for_test(id);
+    daemon.request_for_test(
+        id,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "report".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        id,
+        ClientMessage::DelegateReport {
+            pane,
+            report: report.into(),
+        },
+    );
+    reporter
+}
+
+fn report_outcome(messages: &[ServerMessage]) -> Option<dispatch_proto::ReportOutcome> {
+    messages.iter().find_map(|m| match m {
+        ServerMessage::ReportAnswered { outcome } => Some(outcome.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_report_answers_the_caller_at_once() {
+    let (mut daemon, project, _dir) = daemon("report-delivered");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let reporter = report_from(&mut daemon, 20, child, "the findings");
+
+    assert_eq!(
+        report_outcome(&drain(&reporter)),
+        Some(dispatch_proto::ReportOutcome::Delivered)
+    );
+    let finished = drain(&caller).into_iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { exit, report, .. } => Some((exit, report)),
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some((0, Some("the findings".to_string()))),
+        "answered before the still-running subagent exits"
+    );
+}
+
+#[test]
+fn a_one_shot_subagent_that_reported_is_not_killed_when_its_caller_leaves() {
+    let (mut daemon, project, _dir) = daemon("report-keeps-pane");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    // `dispatch delegate` exits the moment it has its answer.
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "its pane stays for a person to read"
+    );
+}
+
+#[test]
+fn a_second_report_is_refused() {
+    let (mut daemon, project, _dir) = daemon("report-twice");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "first");
+
+    let second = report_from(&mut daemon, 21, child, "second");
+    assert!(matches!(
+        report_outcome(&drain(&second)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("already reported")
+    ));
+}
+
+#[test]
+fn a_pane_that_is_not_a_subagent_cannot_report() {
+    let (mut daemon, project, _dir) = daemon("report-not-subagent");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let top = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let reporter = report_from(&mut daemon, 20, top, "unasked");
+    assert!(matches!(
+        report_outcome(&drain(&reporter)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("not a subagent")
+    ));
+}
+
+#[test]
+fn a_report_nobody_is_waiting_for_says_so() {
+    let (mut daemon, project, _dir) = daemon("report-no-caller");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, "echo quick");
+    let child = approve_and_spawn(&mut daemon, &ui);
+    // The one-shot exits and its caller is answered with the tail.
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter().any(|m| matches!(m, ServerMessage::PaneChanged { pane, update: PaneUpdate::Status { .. } } if *pane == child))
+    });
+    for _ in 0..50 {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let late = report_from(&mut daemon, 20, child, "too late");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+}
+
+#[test]
+fn a_report_from_an_unknown_pane_is_an_error() {
+    let (mut daemon, _project, _dir) = daemon("report-unknown");
+    let reporter = report_from(&mut daemon, 20, PaneId::new(), "who");
+    assert!(drain(&reporter).iter().any(|m| matches!(
+        m,
+        ServerMessage::Error {
+            error: ProtocolError::NoSuchPane(_)
+        }
+    )));
+}
+
+#[test]
+fn a_report_over_the_limit_is_cut_on_a_character_boundary() {
+    // Three-byte characters, so the limit falls inside one.
+    let report = "€".repeat(MAX_REPORT_BYTES / 3 + 10);
+    let cut = cut_report(report);
+    assert!(cut.len() <= MAX_REPORT_BYTES + 200);
+    assert!(cut.ends_with("[dispatch] the report was cut at 1 MiB\n"));
+    assert!(cut.starts_with('€'));
+}
+
+#[test]
+fn the_cap_counts_requests_still_open_not_processes_still_running() {
+    let limits = DelegationLimits {
+        max_live_per_parent: 1,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, _dir) = daemon_with_limits("report-cap", limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _first = ask_as(&mut daemon, 9, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    // The first is still running, but its request is finished.
+    let _second = ask_as(&mut daemon, 10, parent, "echo second");
+    assert!(
+        pending(&drain(&ui)).is_some(),
+        "a reported subagent no longer holds its parent's slot"
+    );
+}
