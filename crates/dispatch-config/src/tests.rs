@@ -612,6 +612,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/claude-5.toml"),
                 include_str!("../harnesses/superseded/claude-6.toml"),
                 include_str!("../harnesses/superseded/claude-7.toml"),
+                include_str!("../harnesses/superseded/claude-8.toml"),
             ],
         ),
         (
@@ -624,6 +625,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/codex-5.toml"),
                 include_str!("../harnesses/superseded/codex-6.toml"),
                 include_str!("../harnesses/superseded/codex-7.toml"),
+                include_str!("../harnesses/superseded/codex-8.toml"),
             ],
         ),
         (
@@ -632,6 +634,7 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/agy-1.toml"),
                 include_str!("../harnesses/superseded/agy-2.toml"),
                 include_str!("../harnesses/superseded/agy-3.toml"),
+                include_str!("../harnesses/superseded/agy-4.toml"),
             ],
         ),
         (
@@ -1251,8 +1254,22 @@ fn every_built_in_skips_permission_prompts_by_default() {
     let (_dir, registry) = shipped();
 
     for (id, flags) in [
-        ("claude", vec!["--permission-mode", "bypassPermissions"]),
-        ("codex", vec!["--dangerously-bypass-approvals-and-sandbox"]),
+        (
+            "claude",
+            vec!["--permission-mode", "bypassPermissions", "--verbose"],
+        ),
+        (
+            "codex",
+            vec![
+                "-c",
+                "model_verbosity=high",
+                "-c",
+                "model_reasoning_summary=detailed",
+                "-c",
+                "web_search=live",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+        ),
         ("agy", vec!["--dangerously-skip-permissions"]),
         ("opencode", vec!["--auto"]),
     ] {
@@ -1390,6 +1407,59 @@ fn the_picker_names_agys_choices_by_label() {
 }
 
 #[test]
+fn agy_starts_in_its_default_mode_unless_another_is_chosen() {
+    // agy's own default mode asks before acting; Plan only plans. Neither is
+    // passed unless chosen, and choosing one names it.
+    let (_dir, registry) = shipped();
+    let agy = registry.get("agy").expect("it ships");
+    let args = |pairs: &[(&str, &str)]| {
+        let values = agy
+            .resolve(&chosen(pairs), &Choices::new())
+            .expect("fitted");
+        agy.launch_with("linux", &values).args
+    };
+
+    assert!(!args(&[]).contains(&"--mode".to_string()));
+    assert_eq!(
+        args(&[("mode", "plan")]),
+        ["--mode", "plan", "--dangerously-skip-permissions"]
+    );
+    assert_eq!(
+        args(&[("mode", "accept-edits")]),
+        ["--mode", "accept-edits", "--dangerously-skip-permissions"]
+    );
+}
+
+#[test]
+fn codex_verbosity_summary_and_search_can_be_chosen() {
+    let (_dir, registry) = shipped();
+    let codex = registry.get("codex").expect("it ships");
+    let values = codex
+        .resolve(
+            &chosen(&[
+                ("verbosity", "low"),
+                ("summary", "none"),
+                ("search", "disabled"),
+            ]),
+            &Choices::new(),
+        )
+        .expect("fitted");
+
+    assert_eq!(
+        codex.launch_with("linux", &values).args,
+        [
+            "-c",
+            "model_verbosity=low",
+            "-c",
+            "model_reasoning_summary=none",
+            "-c",
+            "web_search=disabled",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+}
+
+#[test]
 fn built_in_models_and_efforts_ship_unset() {
     // Each agent keeps its own default, and whatever its own configuration
     // says, until the user saves one.
@@ -1434,11 +1504,27 @@ fn a_delegated_built_in_skips_its_prompts_too() {
     for (id, expected) in [
         (
             "claude",
-            vec!["-p", "x", "--permission-mode", "bypassPermissions"],
+            vec![
+                "-p",
+                "x",
+                "--permission-mode",
+                "bypassPermissions",
+                "--verbose",
+            ],
         ),
         (
             "codex",
-            vec!["exec", "x", "--dangerously-bypass-approvals-and-sandbox"],
+            vec![
+                "exec",
+                "x",
+                "-c",
+                "model_verbosity=high",
+                "-c",
+                "model_reasoning_summary=detailed",
+                "-c",
+                "web_search=live",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
         ),
     ] {
         let def = registry.get(id).expect("it ships");
@@ -1459,11 +1545,12 @@ fn a_delegated_built_in_skips_its_prompts_too() {
         .task_launch_with("windows", "x", &values)
         .expect("it can be delegated to on Windows");
     assert_eq!(
-        windows.launch.args[windows.launch.args.len() - 3..],
+        windows.launch.args[windows.launch.args.len() - 4..],
         [
             "<%DISPATCH_TASK_FILE%",
             "--permission-mode",
-            "bypassPermissions"
+            "bypassPermissions",
+            "--verbose"
         ]
     );
 }

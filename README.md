@@ -17,7 +17,7 @@ Dispatch is a terminal interface for Claude Code, Codex, agy, opencode, or your 
 - **Tiled live terminals:** up to four panes per tab, as many tabs as you like, with zellij-style keys.
 - **State at a glance:** each pane is marked working, idle, done, or blocked, and the footer counts the ones waiting on you.
 - **Agents that outlive the window:** with `--attach`, a daemon owns the agents, so you can close the interface and come back, or watch from several windows.
-- **Per-agent settings:** pick the model, effort and permission mode before a pane opens.
+- **Per-agent settings:** pick the model, effort, permission mode and the agent's other options (agy's mode, Codex's verbosity, reasoning summary and web search, Claude's verbose output) before a pane opens.
 - **Delegation and other machines:** an agent can hand a task to a second agent once you approve it, and agents on other machines show up over ssh.
 
 > [!NOTE]

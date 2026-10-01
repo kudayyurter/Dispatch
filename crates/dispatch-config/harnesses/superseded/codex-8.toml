@@ -50,45 +50,6 @@ options = [
 ]
 args = ["-c", "model_reasoning_effort={value}"]
 
-# How long its answers run, and how much of its reasoning it shows: the same
-# keys as ~/.codex/config.toml, passed with -c like the effort.
-[[settings]]
-key = "verbosity"
-label = "Verbosity"
-kind = "choice"
-options = [
-  { value = "low", label = "Low" },
-  { value = "medium", label = "Medium" },
-  { value = "high", label = "High" },
-]
-default = "high"
-args = ["-c", "model_verbosity={value}"]
-
-[[settings]]
-key = "summary"
-label = "Reasoning summary"
-kind = "choice"
-options = [
-  { value = "auto", label = "Auto" },
-  { value = "concise", label = "Concise" },
-  { value = "detailed", label = "Detailed" },
-  { value = "none", label = "None" },
-]
-default = "detailed"
-args = ["-c", "model_reasoning_summary={value}"]
-
-[[settings]]
-key = "search"
-label = "Web search"
-kind = "choice"
-options = [
-  { value = "live", label = "Live" },
-  { value = "cached", label = "Cached" },
-  { value = "disabled", label = "Off" },
-]
-default = "live"
-args = ["-c", "web_search={value}"]
-
 # Codex's only way to skip every prompt also drops its sandbox.
 [[settings]]
 key = "bypass"
