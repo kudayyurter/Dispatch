@@ -127,3 +127,23 @@ fn an_error_lists_every_problem_in_words() {
     assert!(words.contains("Goal is empty"), "{words}");
     assert!(words.contains("Report back is missing"), "{words}");
 }
+
+#[test]
+fn text_before_the_first_heading_is_the_preamble_trimmed() {
+    let text = format!(
+        "\n  # Handoff for the tests\nRead this first.\n\n{}",
+        complete()
+    );
+    let handoff = Handoff::parse(&text).expect("complete");
+    assert_eq!(
+        handoff.preamble,
+        "# Handoff for the tests\nRead this first."
+    );
+    assert_eq!(
+        handoff.goal, "Write the tests.",
+        "the preamble is not the goal"
+    );
+
+    let handoff = Handoff::parse(&complete()).expect("complete");
+    assert_eq!(handoff.preamble, "", "no text before the first heading");
+}

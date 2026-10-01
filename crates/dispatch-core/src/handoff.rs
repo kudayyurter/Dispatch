@@ -166,6 +166,15 @@ pub struct Handoff {
     pub done_when: String,
     /// What the report should contain.
     pub report_back: String,
+    /// Text before the first required heading, trimmed; empty when there is
+    /// none. It belongs to no section but still reaches the subagent inside
+    /// [`Handoff::text`], so the approval prompt must show it too: approving
+    /// words you were never shown is not approval.
+    ///
+    /// Defaulted so a handoff from a build that predates it still decodes;
+    /// the daemon re-parses the text rather than trusting this from the wire.
+    #[serde(default)]
+    pub preamble: String,
     /// The whole file, exactly as written: the subagent gets this, not a
     /// reassembly of the sections.
     pub text: String,
@@ -176,9 +185,10 @@ impl Handoff {
     ///
     /// A section runs from its heading to the next required heading, so a
     /// parent may structure a long section with headings of its own. Text
-    /// before the first required heading belongs to no section and is kept
-    /// in [`Handoff::text`]. Headings inside fenced code blocks are content:
-    /// a parent pasting an example handoff must not trip over its `## Goal`.
+    /// before the first required heading belongs to no section: it is kept
+    /// in [`Handoff::text`] and, trimmed, in [`Handoff::preamble`]. Headings
+    /// inside fenced code blocks are content: a parent pasting an example
+    /// handoff must not trip over its `## Goal`.
     ///
     /// # Errors
     ///
@@ -191,6 +201,7 @@ impl Handoff {
         }
 
         let mut bodies: [Option<String>; 5] = Default::default();
+        let mut preamble = String::new();
         let mut problems = Vec::new();
         let mut current: Option<Section> = None;
         let mut fenced = false;
@@ -219,11 +230,17 @@ impl Handoff {
             if fence {
                 fenced = !fenced;
             }
-            if let Some(section) = current
-                && let Some(body) = bodies[section.index()].as_mut()
-            {
-                body.push_str(line);
-                body.push('\n');
+            match current {
+                Some(section) => {
+                    if let Some(body) = bodies[section.index()].as_mut() {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                }
+                None => {
+                    preamble.push_str(line);
+                    preamble.push('\n');
+                }
             }
         }
 
@@ -257,6 +274,7 @@ impl Handoff {
             constraints,
             done_when,
             report_back,
+            preamble: preamble.trim().to_string(),
             text: text.to_string(),
         })
     }
