@@ -70,7 +70,7 @@ pub(super) struct SettingsWorkspace {
     /// The keys an apply found changed on disk since `base`.
     pub(super) conflicts: Vec<&'static str>,
     /// A custom accent being typed, until Enter or Esc.
-    text: Option<String>,
+    pub(super) text: Option<String>,
     /// What the leave-with-edits prompt will go on to do.
     leaving: Option<Leave>,
 }
@@ -114,6 +114,31 @@ fn adopt(section: Section, into: &mut Preferences, from: &Preferences) {
         Section::Appearance => {
             into.interface.motion = from.interface.motion;
             into.appearance = from.appearance.clone();
+        }
+    }
+}
+
+/// Takes `fresh`'s values of `section` as what is committed. A field the draft
+/// had not edited follows it, so only the user's own edits stay pending.
+fn rebase(section: Section, base: &mut Preferences, draft: &mut Preferences, fresh: &Preferences) {
+    macro_rules! follow {
+        ($($path:ident).+) => {
+            if draft.$($path).+ == base.$($path).+ {
+                draft.$($path).+ = fresh.$($path).+.clone();
+            }
+            base.$($path).+ = fresh.$($path).+.clone();
+        };
+    }
+    match section {
+        Section::Mouse => {
+            follow!(interface.focus_follows_pointer);
+            follow!(interface.hover_claims_panes);
+        }
+        Section::Appearance => {
+            follow!(interface.motion);
+            follow!(appearance.theme);
+            follow!(appearance.accent);
+            follow!(appearance.icons);
         }
     }
 }
@@ -235,16 +260,15 @@ impl App {
             return;
         };
         let (id, category) = (field.id, field.category);
-        let position = Self::field_ids(category).iter().position(|own| *own == id);
+        // A place among the rows shown now: the custom accent's row is
+        // there only while that accent is chosen, so a fixed list of ids
+        // would put a later row on the wrong one.
+        let position = self
+            .settings_fields(workspace)
+            .iter()
+            .filter(|own| own.category == category)
+            .position(|own| own.id == id);
         self.settings_memory = (category, position.unwrap_or(0));
-    }
-
-    /// The ids of a category's fields, in the order they are shown.
-    fn field_ids(category: usize) -> &'static [&'static str] {
-        match category {
-            APPEARANCE => &["theme", "accent", "accent_custom", "motion", "icons"],
-            _ => &[],
-        }
     }
 
     /// What the draft makes of each setting.
@@ -406,12 +430,18 @@ impl App {
                 match preferences::apply(&dir, section, &workspace.base, &workspace.draft) {
                     Ok(()) => {}
                     Err(ApplyError::Conflict(fields)) => {
+                        // What is on disk is now the committed value, with
+                        // the user's edit still pending over it, so applying
+                        // again writes their choice knowingly.
+                        let fresh = preferences::load_or_default(&dir);
+                        rebase(section, &mut workspace.base, &mut workspace.draft, &fresh);
                         self.warn(format!(
-                            "changed elsewhere since you opened Settings: {}",
+                            "changed elsewhere since you opened Settings: {}; \
+                             it now shows the newer value",
                             fields.join(", ")
                         ));
                         workspace.conflicts = fields;
-                        self.refresh_settings(workspace);
+                        self.preview(workspace);
                         return false;
                     }
                     Err(ApplyError::Unreadable(path)) => {
@@ -441,6 +471,12 @@ impl App {
 
     /// Puts the draft back to what was committed, and this window with it.
     pub(super) fn discard_settings(&mut self, workspace: &mut SettingsWorkspace) {
+        // The file as it is now, so a change made elsewhere is not a
+        // conflict on the next edit.
+        if let Some(dir) = &self.preferences_dir {
+            workspace.base = preferences::load_or_default(dir);
+            self.preferences = workspace.base.clone();
+        }
         workspace.draft = workspace.base.clone();
         workspace.conflicts.clear();
         workspace.text = None;
@@ -591,6 +627,14 @@ impl App {
 
     /// Steps the highlighted field's value, or flips it.
     fn step_selected(&mut self, workspace: &mut SettingsWorkspace, forward: bool) {
+        // A search result belongs to its own category: go there first, so
+        // edits never span sections without the leave prompt having a say.
+        if !workspace.view.search().is_empty() {
+            Self::request_jump(workspace);
+            if workspace.leaving.is_some() {
+                return;
+            }
+        }
         let Some(field) = workspace.view.selected_field() else {
             return;
         };
@@ -622,8 +666,7 @@ impl App {
                     // Starts from the colour in force, so choosing Custom
                     // changes nothing until it is edited.
                     None => {
-                        let dispatch_tui::theme::Rgb(r, g, b) =
-                            accent_rgb(&effective.accent.value, self.terminal_palette.accent);
+                        let dispatch_tui::theme::Rgb(r, g, b) = self.theme.palette().accent;
                         Accent::Custom(Rgb8(r, g, b))
                     }
                 });
@@ -820,6 +863,17 @@ impl App {
             Some(pointer::Target::Dialog(hit)) => Some(hit),
             _ => None,
         };
+        // A press anywhere ends an inline edit, so keys never go on to one
+        // that can no longer be seen.
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.in_settings(|app, workspace| {
+                if workspace.text.take().is_some() {
+                    workspace.view.set_editing(false);
+                    app.refresh_settings(workspace);
+                }
+                Flow::Stay
+            });
+        }
         match mouse.kind {
             MouseEventKind::Moved => {
                 let row = match hit {

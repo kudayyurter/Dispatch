@@ -15305,6 +15305,173 @@ args = ["--effort", "{value}"]
         );
     }
 
+    /// Opens Settings on Appearance, Fields focused, with `downs` rows below
+    /// Theme selected, and closes it again.
+    fn leave_on_row(app: &mut App, downs: usize) {
+        open_appearance_by_keys(app);
+        press(app, KeyCode::Tab);
+        for _ in 0..downs {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn settings_reopens_on_motion_and_on_icons_with_the_default_accent() {
+        for (downs, id) in [(2, "motion"), (3, "icons")] {
+            let (mut app, project, daemon, _sent) = attached_app();
+            spawn_several(&mut app, &daemon, project, 1);
+            with_preferences(&mut app);
+            leave_on_row(&mut app, downs);
+            press_alt(&mut app, ',');
+            assert_eq!(
+                workspace(&app).view.selected_field().map(|field| field.id),
+                Some(id)
+            );
+        }
+    }
+
+    #[test]
+    fn after_a_conflict_apply_again_writes_the_users_choice() {
+        use dispatch_config::preferences::ThemeChoice;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        std::fs::write(
+            dir.join(dispatch_config::preferences::FILE),
+            "[appearance]\ntheme = \"dark\"\n",
+        )
+        .expect("the file is written");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.is_error());
+        assert!(
+            app.status.text.contains("newer value"),
+            "{}",
+            app.status.text
+        );
+
+        // Their value is the committed one now; the user's edit is still
+        // pending over it.
+        assert_eq!(
+            workspace(&app).base.appearance.theme,
+            Some(ThemeChoice::Dark)
+        );
+        assert_eq!(
+            workspace(&app).draft.appearance.theme,
+            Some(ThemeChoice::Light)
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.status.is_error(), "{}", app.status.text);
+        let saved = dispatch_config::preferences::load(&dir).expect("it reads back");
+        assert_eq!(saved.appearance.theme, Some(ThemeChoice::Light));
+    }
+
+    #[test]
+    fn after_a_conflict_discard_shows_what_is_on_disk() {
+        use dispatch_config::preferences::ThemeChoice;
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let dir = with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        std::fs::write(
+            dir.join(dispatch_config::preferences::FILE),
+            "[appearance]\ntheme = \"dark\"\n",
+        )
+        .expect("the file is written");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        // Discard is the button before Apply.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            workspace(&app).draft.appearance.theme,
+            Some(ThemeChoice::Dark)
+        );
+        assert_eq!(workspace(&app).base, workspace(&app).draft);
+        assert!(workspace(&app).conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_press_ends_an_inline_edit() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        let mut terminal = a_wide_terminal();
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(workspace(&app).text.is_some());
+
+        drawn(&mut app, &mut terminal);
+        let search = app.settings_layout().expect("open").search;
+        click_rect(&mut app, search);
+
+        assert!(workspace(&app).text.is_none(), "the edit ended");
+        // Typing now is the search's, not an invisible edit's.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(workspace(&app).view.search(), "a");
+    }
+
+    #[test]
+    fn stepping_a_search_result_goes_to_its_category_first() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        press_alt(&mut app, ',');
+        assert_eq!(workspace(&app).view.category(), 0);
+        press(&mut app, KeyCode::BackTab);
+        for c in "motion".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+
+        let open = workspace(&app);
+        assert_eq!(open.view.category(), 1, "it jumped first");
+        assert!(open.view.search().is_empty());
+        assert_eq!(open.draft.interface.motion, Some(false));
+    }
+
+    #[test]
+    fn custom_accent_starts_from_the_accent_in_force_on_the_light_theme() {
+        use dispatch_config::preferences::{Accent, Rgb8};
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        with_preferences(&mut app);
+        open_appearance_by_keys(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let before = app.theme.palette().accent;
+        press(&mut app, KeyCode::Down);
+        // Back from Terminal wraps to Custom….
+        press(&mut app, KeyCode::Left);
+
+        let dispatch_tui::theme::Rgb(r, g, b) = before;
+        assert_eq!(
+            workspace(&app).draft.appearance.accent,
+            Some(Accent::Custom(Rgb8(r, g, b)))
+        );
+        assert_eq!(
+            app.theme.palette().accent,
+            before,
+            "nothing visibly changed"
+        );
+    }
+
     #[test]
     fn a_custom_accent_is_typed_in_place() {
         let (mut app, project, daemon, _sent) = attached_app();
