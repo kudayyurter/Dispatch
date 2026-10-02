@@ -564,7 +564,7 @@ impl PtySession {
     pub fn spawn(launch: &Launch, cwd: &Path, size: Size) -> Result<Self, PtyError> {
         Ok(Self {
             pty: Pty::spawn(launch, cwd, size)?,
-            terminal: VtTerminal::new(size)?,
+            terminal: VtTerminal::answering(size)?,
         })
     }
 
@@ -588,7 +588,22 @@ impl PtySession {
     pub fn drain_output(&mut self) -> Vec<u8> {
         let output = self.pty.drain();
         self.terminal.feed(&output);
+        self.answer();
         output
+    }
+
+    /// Writes back whatever the program asked its terminal, so it is not
+    /// left waiting for an answer that never comes.
+    fn answer(&mut self) {
+        let replies = self.terminal.take_replies();
+        if replies.is_empty() {
+            return;
+        }
+        if let Err(error) = self.pty.write(&replies) {
+            // A program not reading its input cannot be answered; a
+            // terminal has nothing better to do with the reply.
+            tracing::debug!(%error, "dropped a terminal reply");
+        }
     }
 
     /// Feeds output for up to `timeout`, returning once the child exits.
@@ -596,9 +611,28 @@ impl PtySession {
     /// Intended for tests and for short-lived commands; the application loop
     /// uses [`PtySession::drain`].
     pub fn drain_until_exit(&mut self, timeout: Duration) -> RunState {
-        let (state, output) = self.pty.drain_until_exit(timeout);
-        self.terminal.feed(&output);
-        state
+        // How long output still in flight is waited for once the child has
+        // exited, as `Pty::drain_until_exit` does.
+        const EXIT_GRACE: Duration = Duration::from_millis(50);
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut exited_at = None;
+        // Drained a little at a time, with the program's questions answered
+        // between: one that waits for its answer would never exit otherwise.
+        while std::time::Instant::now() < deadline {
+            self.drain_output();
+            if self.pty.is_finished() {
+                break;
+            }
+            if self.pty.state() != RunState::Running {
+                let since = *exited_at.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= EXIT_GRACE {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.pty.state()
     }
 
     /// Sends bytes to the child, as if typed.
@@ -613,6 +647,8 @@ impl PtySession {
     pub fn resize(&mut self, size: Size) -> Result<(), PtyError> {
         self.pty.resize(size)?;
         self.terminal.resize(size)?;
+        // With in-band resize reports on, resizing is itself answered.
+        self.answer();
         Ok(())
     }
 
