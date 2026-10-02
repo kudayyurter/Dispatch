@@ -1,6 +1,6 @@
 # Terminal replies: answer the questions programs ask their terminal
 
-Status: design, approved option 1 on 2026-10-02. Not yet implemented.
+Status: implemented on branch `terminal-replies`; hands-on check with fish and yazi pending.
 Date: 2026-10-02.
 Branch: `terminal-replies`, cut from local `main` at ef9e7a9.
 
