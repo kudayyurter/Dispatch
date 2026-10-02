@@ -199,7 +199,33 @@ impl VtTerminal {
                     report_size as sys::SizeFn as *const c_void,
                 ),
             )?;
+            VtError::check(
+                "ghostty_terminal_set(XTVERSION)",
+                sys::ghostty_terminal_set(
+                    terminal.handle,
+                    sys::OPT_XTVERSION,
+                    report_version as sys::XtversionFn as *const c_void,
+                ),
+            )?;
         }
+
+        // Dispatch draws no images, so the kitty graphics protocol is switched
+        // off: a program that asks whether it is supported hears nothing and
+        // falls back to something Dispatch can show, and the answerer never
+        // stores images it would only hold in memory. This matches
+        // `HOST_TERMINAL` in `session.rs`, which keeps Ghostty and kitty out
+        // of the child's environment for the same reason.
+        let no_images: u64 = 0;
+        // SAFETY: the handle is live, and this option takes a `const
+        // uint64_t*`, which `no_images` outlives for the call.
+        let code = unsafe {
+            sys::ghostty_terminal_set(
+                terminal.handle,
+                sys::OPT_KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw const no_images).cast(),
+            )
+        };
+        VtError::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", code)?;
 
         Ok(terminal)
     }
@@ -501,6 +527,26 @@ unsafe extern "C" fn write_pty(
         )
     };
     answers.replies.extend_from_slice(bytes);
+}
+
+/// What XTVERSION reports: Dispatch, not the library it is built on.
+///
+/// Programs pick features by the terminal's name, and libghostty's default
+/// would have them assume Ghostty's, kitty graphics among them.
+const XTVERSION: &str = concat!("dispatch ", env!("CARGO_PKG_VERSION"));
+
+/// Names the terminal for XTVERSION.
+///
+/// Returns a `'static` string, so the memory outlives the call as the library
+/// requires; touches neither the userdata nor the terminal.
+unsafe extern "C" fn report_version(
+    _terminal: sys::Terminal,
+    _userdata: *mut c_void,
+) -> sys::GhosttyString {
+    sys::GhosttyString {
+        ptr: XTVERSION.as_ptr(),
+        len: XTVERSION.len(),
+    }
 }
 
 /// Reports the size in cells; zero pixels, since nothing here renders glyphs.
@@ -984,5 +1030,25 @@ mod answer_tests {
         }
         terminal.feed(b"\x1b[c");
         assert_eq!(terminal.take_replies(), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn a_kitty_graphics_query_goes_unanswered() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+        assert!(terminal.take_replies().is_empty());
+        terminal.feed(b"\x1b[c");
+        assert_eq!(terminal.take_replies(), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn xtversion_names_dispatch() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[>q");
+        let reply = String::from_utf8(terminal.take_replies()).expect("utf-8");
+        assert_eq!(
+            reply,
+            concat!("\x1bP>|dispatch ", env!("CARGO_PKG_VERSION"), "\x1b\\")
+        );
     }
 }

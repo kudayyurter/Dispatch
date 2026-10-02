@@ -163,8 +163,14 @@ impl FormatterTerminalOptions {
 pub const OPT_USERDATA: i32 = 0;
 /// `GHOSTTY_TERMINAL_OPT_WRITE_PTY`: replies the terminal writes back.
 pub const OPT_WRITE_PTY: i32 = 1;
+/// `GHOSTTY_TERMINAL_OPT_XTVERSION`: the name and version reported to
+/// XTVERSION (`CSI > q`).
+pub const OPT_XTVERSION: i32 = 4;
 /// `GHOSTTY_TERMINAL_OPT_SIZE`: the size reported to XTWINOPS and mode 2048.
 pub const OPT_SIZE: i32 = 6;
+/// `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT`: a `const uint64_t*`, in
+/// bytes. Zero disables the kitty graphics protocol, queries included.
+pub const OPT_KITTY_IMAGE_STORAGE_LIMIT: i32 = 15;
 /// `GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES`: a `const size_t*`.
 pub const OPT_SCROLLBACK_MAX_BYTES: i32 = 27;
 
@@ -177,6 +183,23 @@ pub struct SizeReportSize {
     pub cell_width: u32,
     pub cell_height: u32,
 }
+
+/// Mirrors `GhosttyString` in `types.h`: a borrowed byte string.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyString {
+    /// The bytes. Valid for as long as the API producing them documents.
+    pub ptr: *const u8,
+    /// Length in bytes.
+    pub len: usize,
+}
+
+/// `GhosttyTerminalXtversionFn`.
+///
+/// The returned string must stay valid until the callback returns; an empty
+/// one makes the library report its own default.
+pub type XtversionFn =
+    unsafe extern "C" fn(terminal: Terminal, userdata: *mut c_void) -> GhosttyString;
 
 /// `GhosttyTerminalWritePtyFn`.
 pub type WritePtyFn =
