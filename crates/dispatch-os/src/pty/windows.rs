@@ -150,7 +150,14 @@ pub(super) fn spawn(
     answer_inherit_cursor(&mut writer);
 
     Ok(super::PtyProcess {
-        reader: Box::new(std::fs::File::from(output_read)),
+        // ConPTY's inherit-cursor question arrives as the first bytes of its
+        // output. It is answered above, blind, and must not reach the pane's
+        // answering emulator too: a second, unrequested `CSI 1;1R` reads as
+        // F3 to the console.
+        reader: Box::new(super::skip_leading::SkipLeading::new(
+            std::fs::File::from(output_read),
+            INHERIT_CURSOR_QUERY,
+        )),
         writer: Box::new(writer),
         terminal: super::Terminal(terminal),
         child: super::Child(Child {
@@ -240,6 +247,10 @@ fn start(command: &super::PtyCommand<'_>, console: HPCON) -> std::io::Result<(Ow
     Ok((process, info.dwProcessId))
 }
 
+/// The cursor position query `PSEUDOCONSOLE_INHERIT_CURSOR` makes ConPTY
+/// write ahead of everything else it prints.
+const INHERIT_CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
 /// Answers the pseudoconsole's inherit-cursor question.
 ///
 /// `PSEUDOCONSOLE_INHERIT_CURSOR` makes ConPTY ask its host where the cursor
@@ -247,6 +258,9 @@ fn start(command: &super::PtyCommand<'_>, console: HPCON) -> std::io::Result<(Ow
 /// answers because it is one; Dispatch hosts the pseudoconsole instead, so
 /// without this the child starts, prints nothing, and never exits. Row 1,
 /// column 1. A failure is not fatal on its own, so it is logged.
+///
+/// The question itself is dropped from the output (see `spawn`), so this is
+/// the only answer it gets.
 fn answer_inherit_cursor(writer: &mut std::fs::File) {
     use std::io::Write;
 
