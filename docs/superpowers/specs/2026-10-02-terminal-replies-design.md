@@ -66,9 +66,18 @@ With it on:
 - `GHOSTTY_TERMINAL_OPT_SIZE` answers XTWINOPS size queries and mode 2048 with
   the size in cells, and zero for pixels: the daemon renders no glyphs, so it
   does not know them, and zero is what a terminal that does not know says.
-- Device status (`CSI 5n`, `CSI 6n` cursor position), mode reports (DECRQM),
-  the kitty keyboard query and XTVERSION (the library's default
-  "libghostty") need no callback beyond `WRITE_PTY`.
+- Device status (`CSI 5n`, `CSI 6n` cursor position), mode reports (DECRQM)
+  and the kitty keyboard query need no callback beyond `WRITE_PTY`.
+- `GHOSTTY_TERMINAL_OPT_XTVERSION` makes XTVERSION (`CSI > q`) report
+  `dispatch <version>` rather than the library's default `libghostty`: a
+  program choosing features by the terminal's name would otherwise assume
+  Ghostty's.
+- `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT` is set to zero, which turns
+  the kitty graphics protocol off: a graphics query (`ESC _ G … a=q …`) goes
+  unanswered, so a program such as yazi falls back to something Dispatch can
+  draw instead of sending images that never show, and the answerer stores no
+  images. This matches `HOST_TERMINAL` in `session.rs`, which keeps Ghostty
+  and kitty variables out of a pane's environment for the same reason.
 - Not answered, on purpose: colour scheme (`CSI ? 996 n`), clipboard reads
   (OSC 52 `?`), and colour queries (OSC 10/11) — the daemon does not know the
   user's colours or clipboard, and an invented answer is worse than none.
@@ -76,6 +85,23 @@ With it on:
 
 A drawing emulator (every window's, in `--attach` mode) never answers: its
 replies would duplicate the daemon's.
+
+libghostty's defaults also answer some questions that promise more than
+Dispatch delivers. They are left as known follow-ups, not fixed here: OSC 4
+palette queries are answered with libghostty's default palette, not the
+user's; XTGETTCAP reports `Ms`, advertising OSC 52 clipboard writes that
+Dispatch does not forward; DECRQM reports modes 1016 (pixel mouse) and 2031
+(colour-scheme notifications) as supported; and since the kitty keyboard
+query (`CSI ? u`) is now answered, programs may push kitty keyboard flags.
+
+On Windows the pseudoconsole is created with `PSEUDOCONSOLE_INHERIT_CURSOR`,
+which makes ConPTY write `ESC [ 6 n` before anything else and wait for the
+answer. The spawn answers it blind (`ESC [ 1 ; 1 R`), and the reader drops
+that one leading `ESC [ 6 n` (`SkipLeading` in
+`crates/dispatch-os/src/pty/skip_leading.rs`) before any emulator sees it, so
+the answerer does not answer a second time: an unrequested `CSI 1;1R` reads
+as F3 to the console. A `CSI 6n` anywhere later in the stream is the child's
+own and is answered as usual.
 
 ## Where it runs
 
