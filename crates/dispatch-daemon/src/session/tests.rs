@@ -6447,6 +6447,9 @@ fn the_cap_counts_requests_still_open_not_processes_still_running() {
 }
 
 /// Attaches a delegate caller and asks for an interactive subagent.
+///
+/// Unix only, like every test that uses it: on Windows it would be dead code.
+#[cfg(unix)]
 fn ask_interactive(daemon: &mut Daemon, parent: PaneId, goal: &str) -> Inbox {
     let caller = daemon.attach_for_test(9);
     daemon.request_for_test(

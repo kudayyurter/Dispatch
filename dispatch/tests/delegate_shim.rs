@@ -38,8 +38,11 @@ impl Config {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
 
+        // Short, because the daemon's socket lives in it: macOS's temporary
+        // directory is already about fifty characters deep, and a Unix socket
+        // path must fit in 104.
         let dir = std::env::temp_dir().join(format!(
-            "dispatch-delegate-shim-{}-{label}-{}",
+            "dds-{}-{label}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
