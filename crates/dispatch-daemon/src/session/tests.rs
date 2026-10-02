@@ -148,13 +148,16 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
         )
         .expect("temp dir is writable");
 
-        // Turns on in-band size reports, then shows what it is sent over the
-        // next three seconds, so the report a resize causes can be seen
-        // arriving. `tr` buffers its output until its input ends, and `head`
-        // reading under `VTIME` is what ends it.
+        // Waits for one byte of input, turns on in-band size reports, then
+        // shows what it is sent over the next three seconds, so the report a
+        // resize causes can be seen arriving. The wait is so a test sees the
+        // mode go on: output printed at once can land in the batch that
+        // carries `PaneSpawned`, which `spawn_harness` discards. `tr` buffers
+        // its output until its input ends, and `head` reading under `VTIME`
+        // is what ends it.
         std::fs::write(
             dir.join("reporter.toml"),
-            "id = \"reporter\"\ndisplay_name = \"Reporter\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; printf '\\\\033[?2048h'; stty min 0 time 30; head -c 64 | tr '\\\\033' E; sleep 30\"]\n",
+            "id = \"reporter\"\ndisplay_name = \"Reporter\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; head -c 1 >/dev/null; printf '\\\\033[?2048h'; stty min 0 time 30; head -c 64 | tr '\\\\033' E; sleep 30\"]\n",
         )
         .expect("temp dir is writable");
     }
@@ -6993,6 +6996,14 @@ fn a_resize_report_the_answerer_produces_reaches_the_program() {
     daemon.request_for_test(1, hello());
     daemon.request_for_test(1, ClientMessage::Subscribe);
     let pane = spawn_harness(&mut daemon, &ui, project, "reporter");
+    // The byte it waits for, so the mode goes on after the spawn's batch.
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"x".to_vec(),
+        },
+    );
     // The mode has to be on, and seen to be, before the resize.
     wait_for(&mut daemon, &ui, |m| output_of(m, pane).contains("[?2048h"));
 
