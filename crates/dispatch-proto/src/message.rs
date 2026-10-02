@@ -130,6 +130,28 @@ pub enum DelegateOutcome {
     Unknown,
 }
 
+/// What became of a report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReportOutcome {
+    /// The caller has it.
+    Delivered,
+    /// Nobody is waiting for it any more. Asking again will not help, but the
+    /// work is not wrong: the caller went away.
+    NotWaiting {
+        /// Why, in words.
+        reason: String,
+    },
+    /// This pane cannot report: it is not a subagent, or it already has.
+    Refused {
+        /// Why, in words.
+        reason: String,
+    },
+    /// An outcome this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Something a client asks of the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -249,10 +271,19 @@ pub enum ClientMessage {
         parent: PaneId,
         /// Which harness should run the task.
         harness: String,
-        /// What to do, verbatim.
+        /// The handoff's text, for an older daemon that knows nothing of handoffs.
         task: String,
         /// Initial size in cells.
         size: (u16, u16),
+        /// The handoff, checked by the caller and checked again here. An
+        /// older client sends none and is refused: a bare task is no longer
+        /// enough to delegate with.
+        #[serde(default)]
+        handoff: Option<dispatch_core::Handoff>,
+        /// Whether to run the subagent in its harness's own interface rather
+        /// than its one-shot form.
+        #[serde(default)]
+        interactive: bool,
     },
 
     /// Answers a [`ServerMessage::DelegatePending`].
@@ -265,6 +296,31 @@ pub enum ClientMessage {
         /// as long as this daemon runs.
         #[serde(default)]
         blanket: bool,
+    },
+
+    /// A subagent's report, sent by `dispatch report` from inside its pane.
+    ///
+    /// The report is what the parent asked for: delivering it answers the
+    /// waiting `dispatch delegate` at once, without waiting for the process
+    /// to exit.
+    DelegateReport {
+        /// The reporting pane, from `DISPATCH_PANE` in its environment.
+        pane: PaneId,
+        /// The report.
+        report: String,
+    },
+
+    /// The user chose to keep an interactive subagent that reported, rather
+    /// than close it.
+    ///
+    /// Told to the daemon rather than settled in the one window that asked:
+    /// the daemon replays [`ServerMessage::SubagentReported`] to every client
+    /// that subscribes, so a choice kept locally would come back on the next
+    /// reconnect and in every other window. An older daemon skips it as
+    /// `Unknown`, and the question returns there as it always did.
+    KeepReported {
+        /// Which pane.
+        pane: PaneId,
     },
 
     /// Moves a top-level pane to another tab, or onto a new one.
@@ -473,6 +529,13 @@ pub enum ServerMessage {
         /// How deep the parent already is, for display.
         #[serde(default)]
         depth: u8,
+        /// The handoff, for showing its sections. `task` carries its text
+        /// for an older client.
+        #[serde(default)]
+        handoff: Option<dispatch_core::Handoff>,
+        /// Whether the subagent would run in its own interface.
+        #[serde(default)]
+        interactive: bool,
     },
 
     /// A request will not be asked about again.
@@ -492,6 +555,38 @@ pub enum ServerMessage {
         /// The tail of what it printed, for the caller to hand to its agent.
         #[serde(with = "serde_bytes_compat")]
         tail: Vec<u8>,
+        /// The subagent's report, when it sent one. The caller prints this
+        /// rather than the tail.
+        #[serde(default)]
+        report: Option<String>,
+    },
+
+    /// Answers a [`ClientMessage::DelegateReport`].
+    ReportAnswered {
+        /// What became of it.
+        outcome: ReportOutcome,
+    },
+
+    /// An interactive subagent has reported and waits for the user to close
+    /// it, under `interactive_on_done = "ask"`.
+    ///
+    /// Its own message rather than a new [`PaneStatus`]: an older client
+    /// skips an unknown message, and loses only the mark.
+    SubagentReported {
+        /// Which pane.
+        pane: PaneId,
+    },
+
+    /// A reported subagent is to be kept: some window answered
+    /// [`ServerMessage::SubagentReported`] with [`ClientMessage::KeepReported`].
+    ///
+    /// Sent to every subscriber so the mark, and any question still open
+    /// about the pane, clears in every window and not only the one that
+    /// answered. An older client skips it as `Unknown` and keeps its mark
+    /// until it next reconnects.
+    SubagentKept {
+        /// Which pane.
+        pane: PaneId,
     },
 
     /// What a project's tabs are now.

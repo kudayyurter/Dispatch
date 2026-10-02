@@ -56,6 +56,7 @@ enum Slot {
     Working,
     Attention,
     Delegations,
+    Reported,
     Activity,
 }
 
@@ -364,6 +365,25 @@ impl App {
                 Some(FooterHit::Delegations),
             );
         }
+        // An interactive subagent that has reported waits for the user to
+        // close it or keep it; while a delegation request is queued, that
+        // comes first, so this count only asks once the queue is empty.
+        let reported = order
+            .iter()
+            .filter(|id| {
+                self.state
+                    .pane(**id)
+                    .is_some_and(|pane| !pane.closed && pane.reported)
+            })
+            .count();
+        if reported > 0 && !matches!(self.overlay, Some(Overlay::Reported { .. })) {
+            push(
+                Slot::Reported,
+                format!("{reported} reported"),
+                chrome.accent,
+                Some(FooterHit::Reported),
+            );
+        }
         if !locked {
             push(
                 Slot::Activity,
@@ -402,7 +422,7 @@ impl App {
             }
         }
         // Last, the counts that need the user, never below their first word.
-        for slot in [Slot::Delegations, Slot::Attention] {
+        for slot in [Slot::Reported, Slot::Delegations, Slot::Attention] {
             if !fits(&items)
                 && let Some(at) = items.iter().position(|item| item.slot == slot)
             {
@@ -424,6 +444,13 @@ impl App {
         match hit {
             FooterHit::Attention => self.open_attention_picker(),
             FooterHit::Delegations => self.open_next_approval(),
+            FooterHit::Reported => {
+                if self.pending.is_empty() {
+                    self.open_next_reported();
+                } else {
+                    self.open_next_approval();
+                }
+            }
             FooterHit::Message => {
                 if self.status.is_error() {
                     self.clear_status();

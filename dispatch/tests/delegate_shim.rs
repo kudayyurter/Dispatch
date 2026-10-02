@@ -47,12 +47,43 @@ impl Config {
         std::fs::create_dir_all(&harnesses).expect("temp dir is writable");
 
         // Delegable: has a `[task]` form, so a request against it can be asked
-        // about at all. On Windows the task is a PowerShell script read from
-        // its file: `cmd.exe /c {task}` is a form the daemon refuses there.
-        let shell = if cfg!(windows) {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
+        // about at all. The task is now a whole handoff, so the harness runs a
+        // small script that pulls the Goal section out of it and runs that as
+        // a script; a test still says what the subagent does as a command.
+        let runner = if cfg!(windows) {
+            let path = harnesses.join("run-goal.ps1");
+            std::fs::write(
+                &path,
+                "$brief = Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')\n\
+                 $m = [regex]::Match($brief, '(?ms)^## Goal\\s*\\r?\\n(.*?)(?=^## |\\z)')\n\
+                 Invoke-Expression $m.Groups[1].Value.Trim()\n",
+            )
+            .expect("temp dir is writable");
+            path
         } else {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
+            let path = harnesses.join("run-goal.sh");
+            std::fs::write(
+                &path,
+                "goal=$(printf '%s\\n' \"$1\" | awk '/^## Goal[[:space:]]*$/{f=1;next} /^## /{f=0} f')\n\
+                 eval \"$goal\"\n",
+            )
+            .expect("temp dir is writable");
+            path
+        };
+        let shell = if cfg!(windows) {
+            format!(
+                "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\n\
+                 args = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \
+                 \"-ExecutionPolicy\", \"Bypass\", \"-File\", '{}']\ninput = \"file\"\n",
+                runner.display()
+            )
+        } else {
+            format!(
+                "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\n\
+                 args = ['{}', \"{{task}}\"]\n\n[task.interactive]\nargs = ['{}', \"{{task}}\"]\n",
+                runner.display(),
+                runner.display()
+            )
         };
         std::fs::write(harnesses.join("shell.toml"), shell).expect("temp dir is writable");
 
@@ -297,8 +328,16 @@ fn spawn_parent_pane(
         .expect("checked by wait_for")
 }
 
-/// Runs `dispatch delegate` against `config`'s daemon, from `parent`, on
-/// `harness` (empty for the parent's own), and waits for it to exit.
+/// A complete handoff whose Goal the test harness runs as a script.
+fn handoff_for(goal: &str) -> String {
+    format!(
+        "## Goal\n{goal}\n\n## Context\nA test.\n\n## Constraints\nNone.\n\n\
+         ## Done when\nIt has run.\n\n## Report back\nNothing.\n"
+    )
+}
+
+/// Runs `dispatch delegate --handoff -` with `handoff` on its standard input,
+/// plus `extra` arguments, and waits for it to exit.
 ///
 /// A refusal is decided the instant the daemon receives the request, with no
 /// prompt and nobody to answer it, so a blocking wait is safe here: there is
@@ -309,23 +348,50 @@ fn run_delegate_shim(
     config: &Config,
     parent: dispatch_core::PaneId,
     harness: &str,
-    task: &str,
+    handoff: &str,
+    extra: &[&str],
 ) -> std::process::Output {
+    let child = start_delegate_shim(config, parent, harness, handoff, extra);
+    finish(child)
+}
+
+/// Starts `dispatch delegate --handoff -` without waiting for it.
+fn start_delegate_shim(
+    config: &Config,
+    parent: dispatch_core::PaneId,
+    harness: &str,
+    handoff: &str,
+    extra: &[&str],
+) -> std::process::Child {
+    use std::io::Write;
+
     let (key, value) = config.env();
     let mut command = Command::new(env!("CARGO_BIN_EXE_dispatch"));
     command
         .arg("delegate")
-        .arg(task)
+        .arg("--handoff")
+        .arg("-")
+        .args(extra)
         .env("DISPATCH_PANE", parent.to_string())
         .env(key, value)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !harness.is_empty() {
         command.arg("--harness").arg(harness);
     }
-
     let mut child = command.spawn().expect("the dispatch binary can be started");
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(handoff.as_bytes())
+        .expect("the shim reads its handoff");
+    child
+}
 
+/// Waits for a started shim to exit, and returns what it produced.
+fn finish(mut child: std::process::Child) -> std::process::Output {
     // Bounded, because the shim's own backstop is twenty-four hours: it is built
     // to wait for a person, and a person is not coming. An unbounded wait here
     // turned a Windows transport failure into a CI job that ran for an hour
@@ -359,16 +425,13 @@ fn a_denied_delegate_call_exits_77_with_nothing_on_stdout() {
     let (ui, mut ui_writer) = attach(&config);
     let parent = spawn_parent_pane(&ui, &mut ui_writer);
 
-    let (key, value) = config.env();
-    let child = Command::new(env!("CARGO_BIN_EXE_dispatch"))
-        .arg("delegate")
-        .arg("echo should-not-run")
-        .env("DISPATCH_PANE", parent.to_string())
-        .env(key, value)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the dispatch binary can be started");
+    let child = start_delegate_shim(
+        &config,
+        parent,
+        "",
+        &handoff_for("echo should-not-run"),
+        &[],
+    );
 
     let asked = wait_for(&ui, "the pending request", |m| {
         m.iter()
@@ -419,7 +482,13 @@ fn a_refused_delegate_call_exits_78_with_nothing_on_stdout() {
     let (ui, mut ui_writer) = attach(&config);
     let parent = spawn_parent_pane(&ui, &mut ui_writer);
 
-    let output = run_delegate_shim(&config, parent, "no-task", "echo should-not-run");
+    let output = run_delegate_shim(
+        &config,
+        parent,
+        "no-task",
+        &handoff_for("echo should-not-run"),
+        &[],
+    );
 
     assert_eq!(
         output.status.code(),
@@ -449,7 +518,13 @@ fn an_unanswered_delegate_call_exits_75_when_the_deadline_passes() {
 
     // Run the shim without answering the pending request. The daemon will ask
     // on the interface connection we hold, but we do not answer it.
-    let output = run_delegate_shim(&config, parent, "", "echo should-not-run");
+    let output = run_delegate_shim(
+        &config,
+        parent,
+        "",
+        &handoff_for("echo should-not-run"),
+        &[],
+    );
 
     assert_eq!(
         output.status.code(),
@@ -489,7 +564,8 @@ fn a_stale_dispatch_pane_exits_75_rather_than_blaming_the_configuration() {
         &config,
         dispatch_core::PaneId::new(),
         "shell",
-        "echo should-not-run",
+        &handoff_for("echo should-not-run"),
+        &[],
     );
 
     assert_eq!(
@@ -502,5 +578,129 @@ fn a_stale_dispatch_pane_exits_75_rather_than_blaming_the_configuration() {
         output.stdout.is_empty(),
         "nothing ran, so stdout must be empty, got {:?}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Runs `dispatch` with `args` and no daemon involved, with `stdin`.
+fn run_plain(args: &[&str], stdin: &[u8], pane: Option<&str>) -> std::process::Output {
+    use std::io::Write;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dispatch"));
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(pane) = pane {
+        command.env("DISPATCH_PANE", pane);
+    }
+    let mut child = command.spawn().expect("starts");
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(stdin)
+        .expect("writes");
+    child.wait_with_output().expect("exits")
+}
+
+#[test]
+fn the_template_is_printed_without_a_daemon() {
+    let output = run_plain(&["delegate", "--template"], b"", None);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.starts_with("## Goal"), "{text}");
+}
+
+#[test]
+fn a_bare_task_is_refused_with_the_template() {
+    let output = run_plain(
+        &["delegate", "do the thing"],
+        b"",
+        Some(&dispatch_core::PaneId::new().to_string()),
+    );
+    assert_eq!(output.status.code(), Some(64));
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        errors.contains("--handoff") && errors.contains("## Report back"),
+        "{errors}"
+    );
+}
+
+#[test]
+fn an_incomplete_handoff_is_refused_naming_what_is_missing() {
+    let output = run_plain(
+        &["delegate", "--handoff", "-"],
+        b"## Goal\nsomething\n",
+        Some(&dispatch_core::PaneId::new().to_string()),
+    );
+    assert_eq!(output.status.code(), Some(64));
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(errors.contains("Context is missing"), "{errors}");
+}
+
+#[test]
+fn an_unreadable_handoff_file_is_66() {
+    let output = run_plain(
+        &["delegate", "--handoff", "/nonexistent/dispatch/handoff.md"],
+        b"",
+        Some(&dispatch_core::PaneId::new().to_string()),
+    );
+    assert_eq!(output.status.code(), Some(66));
+}
+
+#[test]
+fn an_empty_report_is_64() {
+    let output = run_plain(
+        &["report", "-"],
+        b"  \n",
+        Some(&dispatch_core::PaneId::new().to_string()),
+    );
+    assert_eq!(output.status.code(), Some(64));
+}
+
+#[test]
+fn the_subagents_report_reaches_the_callers_stdout() {
+    let config = Config::new("report-e2e");
+    let project = std::env::temp_dir();
+    let _daemon = Daemon::start(&config, &project);
+    let (ui, mut ui_writer) = attach(&config);
+    let parent = spawn_parent_pane(&ui, &mut ui_writer);
+
+    // The report holds a byte that is not UTF-8: it is still delivered.
+    let goal = if cfg!(windows) {
+        "[byte[]](0x66,0x6f,0x75,0x6e,0x64,0xff) | dispatch report -"
+    } else {
+        "printf 'found\\377' | dispatch report -"
+    };
+    let child = start_delegate_shim(&config, parent, "", &handoff_for(goal), &[]);
+
+    let asked = wait_for(&ui, "the prompt", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegatePending { .. }))
+    });
+    let request = asked
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .expect("checked");
+    Frame::write(
+        &mut ui_writer,
+        &ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    )
+    .expect("writing succeeds");
+
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("found"),
+        "the report, not the tail: {stdout:?}"
     );
 }

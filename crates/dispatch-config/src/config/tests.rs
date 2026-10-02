@@ -384,3 +384,33 @@ fn interface_present_is_all_false_without_a_file_or_a_section() {
     let loaded = Config::load_reporting(&path).expect("loads");
     assert_eq!(loaded.interface_present, InterfaceKeysPresent::default());
 }
+
+#[test]
+fn interactive_subagents_close_on_report_by_default() {
+    assert_eq!(
+        DelegationLimits::default().interactive_on_done,
+        OnDone::Close
+    );
+}
+
+#[test]
+fn interactive_on_done_can_ask_instead() {
+    let config: Config =
+        toml::from_str("[delegation]\ninteractive_on_done = \"ask\"\n").expect("valid");
+    assert_eq!(config.delegation.interactive_on_done, OnDone::Ask);
+}
+
+#[test]
+fn an_unknown_on_done_value_is_an_error_naming_both_choices() {
+    let error = toml::from_str::<Config>("[delegation]\ninteractive_on_done = \"keep\"\n")
+        .expect_err("not a choice");
+    let words = error.to_string();
+    assert!(words.contains("close") && words.contains("ask"), "{words}");
+}
+
+#[test]
+fn interactive_on_done_is_a_known_key() {
+    let raw: toml::Table =
+        toml::from_str("[delegation]\ninteractive_on_done = \"ask\"\n").expect("valid");
+    assert!(unknown_keys(&raw).is_empty());
+}

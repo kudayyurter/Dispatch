@@ -172,6 +172,7 @@ fn label(id: ButtonId) -> &'static str {
         ButtonId::Later => "Later",
         ButtonId::Ok => "OK",
         ButtonId::Close => "Close",
+        ButtonId::Keep => "Keep",
         ButtonId::Apply => "Apply",
         ButtonId::Discard => "Discard",
         ButtonId::KeepEditing => "Keep editing",

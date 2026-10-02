@@ -100,6 +100,10 @@ pub struct Pane {
     /// Whether this pane is closed but kept as a row for live children.
     #[serde(default)]
     pub closed: bool,
+    /// Whether this interactive subagent has sent its report and waits for
+    /// the user to close it or keep it.
+    #[serde(default)]
+    pub reported: bool,
     /// The git branch the pane's foreground program is working on, while it
     /// is inside a repository.
     ///
@@ -124,6 +128,7 @@ impl Pane {
             parent: None,
             durable: false,
             closed: false,
+            reported: false,
             branch: None,
         }
     }

@@ -39,12 +39,45 @@ impl Endpoint {
         // rather than whichever agents happen to be installed. The `[task]`
         // form is what lets a delegation request against it succeed: without
         // one, the daemon refuses before ever asking anybody. On Windows the
-        // task is a PowerShell script read from its file: `cmd.exe /c {task}`
-        // is a form the daemon refuses there.
-        let shell = if cfg!(windows) {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
+        // brief is read from its file: `cmd.exe /c {task}` is a form the
+        // daemon refuses there.
+        // The subagent is handed a brief: a preamble, then the handoff. These
+        // runners pull the Goal section out of it and run that as a script, so
+        // a test still says what the subagent does as a shell command.
+        let runner = if cfg!(windows) {
+            let path = dir.join("run-goal.ps1");
+            std::fs::write(
+                &path,
+                "$brief = Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')\n\
+                 $m = [regex]::Match($brief, '(?ms)^## Goal\\s*\\r?\\n(.*?)(?=^## |\\z)')\n\
+                 Invoke-Expression $m.Groups[1].Value.Trim()\n",
+            )
+            .expect("temp dir is writable");
+            path
         } else {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
+            let path = dir.join("run-goal.sh");
+            std::fs::write(
+                &path,
+                "goal=$(printf '%s\\n' \"$1\" | awk '/^## Goal[[:space:]]*$/{f=1;next} /^## /{f=0} f')\n\
+                 eval \"$goal\"\n",
+            )
+            .expect("temp dir is writable");
+            path
+        };
+        let shell = if cfg!(windows) {
+            format!(
+                "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\n\
+                 args = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \
+                 \"-ExecutionPolicy\", \"Bypass\", \"-File\", '{}']\ninput = \"file\"\n",
+                runner.display()
+            )
+        } else {
+            format!(
+                "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\n\
+                 args = ['{}', \"{{task}}\"]\n\n[task.interactive]\nargs = ['{}', \"{{task}}\"]\n",
+                runner.display(),
+                runner.display()
+            )
         };
         std::fs::write(dir.join("harnesses").join("shell.toml"), shell)
             .expect("temp dir is writable");
@@ -100,6 +133,16 @@ impl Drop for RunningDaemon {
 }
 
 /// Connects, retrying until the daemon has bound the endpoint.
+/// A complete handoff whose Goal is `goal`, which the test harness runs as a
+/// script.
+fn handoff_for(goal: &str) -> dispatch_core::Handoff {
+    dispatch_core::Handoff::parse(&format!(
+        "## Goal\n{goal}\n\n## Context\nA test.\n\n## Constraints\nNone.\n\n\
+         ## Done when\nIt has run.\n\n## Report back\nNothing.\n"
+    ))
+    .expect("a complete handoff")
+}
+
 fn connect() -> Connection {
     let deadline = Instant::now() + PATIENCE;
 
@@ -731,6 +774,8 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
             // from the subagent running, whatever a shell echoes of its input.
             task: "echo delegated-$((6*7))".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("echo delegated-$((6*7))")),
+            interactive: false,
         },
     )
     .expect("writing succeeds");

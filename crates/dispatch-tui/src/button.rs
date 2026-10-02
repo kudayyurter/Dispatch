@@ -24,6 +24,8 @@ pub enum ButtonId {
     Later,
     Ok,
     Close,
+    /// Keep a reported subagent's pane as an ordinary one.
+    Keep,
     /// Settings: write the pending edits.
     Apply,
     /// Settings: drop the pending edits.

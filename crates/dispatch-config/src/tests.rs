@@ -613,6 +613,8 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/claude-6.toml"),
                 include_str!("../harnesses/superseded/claude-7.toml"),
                 include_str!("../harnesses/superseded/claude-8.toml"),
+                include_str!("../harnesses/superseded/claude-9.toml"),
+                include_str!("../harnesses/superseded/claude-10.toml"),
             ],
         ),
         (
@@ -626,6 +628,8 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/codex-6.toml"),
                 include_str!("../harnesses/superseded/codex-7.toml"),
                 include_str!("../harnesses/superseded/codex-8.toml"),
+                include_str!("../harnesses/superseded/codex-9.toml"),
+                include_str!("../harnesses/superseded/codex-10.toml"),
             ],
         ),
         (
@@ -635,11 +639,16 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
                 include_str!("../harnesses/superseded/agy-2.toml"),
                 include_str!("../harnesses/superseded/agy-3.toml"),
                 include_str!("../harnesses/superseded/agy-4.toml"),
+                include_str!("../harnesses/superseded/agy-5.toml"),
+                include_str!("../harnesses/superseded/agy-6.toml"),
             ],
         ),
         (
             "opencode",
-            vec![include_str!("../harnesses/superseded/opencode-1.toml")],
+            vec![
+                include_str!("../harnesses/superseded/opencode-1.toml"),
+                include_str!("../harnesses/superseded/opencode-2.toml"),
+            ],
         ),
     ];
 
@@ -1590,4 +1599,92 @@ fn opencodes_model_reaches_it_through_a_private_server() {
         vec!["--auto"],
         "with no model chosen, the pane uses the shared service"
     );
+}
+
+fn interactive_harness() -> HarnessDef {
+    toml::from_str(
+        "id = \"agent\"\ndisplay_name = \"Agent\"\ncommand = \"agent\"\n\n\
+         [platform.windows]\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"agent\"]\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\n\n\
+         [task.interactive]\nargs = [\"-i\", \"{task}\"]\n\n\
+         [task.interactive.platform.windows]\nargs = [\"/c\", \"agent\", \"-i\", \"{task}\"]\n",
+    )
+    .expect("valid")
+}
+
+#[test]
+fn an_interactive_form_puts_the_task_in_its_arguments() {
+    let launch = interactive_harness()
+        .interactive_launch_for("linux", "the brief")
+        .expect("has a form");
+    assert_eq!(launch.command, "agent");
+    assert_eq!(launch.args, vec!["-i".to_string(), "the brief".to_string()]);
+}
+
+#[test]
+fn a_harness_without_an_interactive_form_has_none() {
+    let mut def = interactive_harness();
+    def.task.as_mut().expect("has [task]").interactive = None;
+    assert!(def.interactive_launch_for("linux", "x").is_none());
+}
+
+#[test]
+fn an_interactive_form_that_never_names_the_task_is_no_form() {
+    let mut def = interactive_harness();
+    def.task.as_mut().expect("has [task]").interactive = Some(InteractiveLaunch {
+        args: vec!["-i".into()],
+        platform: Default::default(),
+    });
+    assert!(
+        def.interactive_launch_for("linux", "x").is_none(),
+        "the handoff would never reach the agent"
+    );
+}
+
+#[test]
+fn an_interactive_form_through_cmd_is_refused_on_windows() {
+    let def = interactive_harness();
+    let launch = def
+        .interactive_launch_for("windows", "x & y")
+        .expect("has a windows form");
+    let reason = def
+        .interactive_refusal_as("windows", &launch)
+        .expect("refused");
+    assert!(reason.contains("cmd.exe"), "{reason}");
+    assert!(def.interactive_refusal_as("linux", &launch).is_none());
+}
+
+#[test]
+fn every_shipped_harness_has_an_interactive_form() {
+    for built_in in crate::defaults::BUILT_INS {
+        let def: HarnessDef = toml::from_str(built_in.toml).expect("ships valid");
+        assert!(
+            def.interactive_launch_for("linux", "the brief").is_some(),
+            "{} ships no [task.interactive]",
+            built_in.id
+        );
+    }
+}
+
+#[test]
+fn an_interactive_form_does_not_give_agy_or_opencode_a_one_shot_form() {
+    // Both ship a `[task.interactive]`, which needs a `[task]` table to live
+    // in. That table must not turn into a one-shot form by accident: their
+    // one-shot flags are unknown, and a guess would run them with flags that
+    // mean something else.
+    let dir = TempDir::new("interactive-without-one-shot");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    for id in ["agy", "opencode"] {
+        let harness = registry.get(id).expect("the built-in exists");
+        assert!(
+            harness.interactive_launch_for("linux", "x").is_some(),
+            "{id} ships an interactive form"
+        );
+        assert!(
+            harness.task_launch_for("linux", "x").is_none(),
+            "{id} has no one-shot form"
+        );
+    }
 }

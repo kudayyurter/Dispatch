@@ -35,6 +35,8 @@ pub const BUILT_INS: &[BuiltIn] = &[
             include_str!("../harnesses/superseded/claude-6.toml"),
             include_str!("../harnesses/superseded/claude-7.toml"),
             include_str!("../harnesses/superseded/claude-8.toml"),
+            include_str!("../harnesses/superseded/claude-9.toml"),
+            include_str!("../harnesses/superseded/claude-10.toml"),
         ],
     },
     BuiltIn {
@@ -49,6 +51,8 @@ pub const BUILT_INS: &[BuiltIn] = &[
             include_str!("../harnesses/superseded/codex-6.toml"),
             include_str!("../harnesses/superseded/codex-7.toml"),
             include_str!("../harnesses/superseded/codex-8.toml"),
+            include_str!("../harnesses/superseded/codex-9.toml"),
+            include_str!("../harnesses/superseded/codex-10.toml"),
         ],
     },
     BuiltIn {
@@ -59,11 +63,16 @@ pub const BUILT_INS: &[BuiltIn] = &[
             include_str!("../harnesses/superseded/agy-2.toml"),
             include_str!("../harnesses/superseded/agy-3.toml"),
             include_str!("../harnesses/superseded/agy-4.toml"),
+            include_str!("../harnesses/superseded/agy-5.toml"),
+            include_str!("../harnesses/superseded/agy-6.toml"),
         ],
     },
     BuiltIn {
         id: "opencode",
         toml: include_str!("../harnesses/opencode.toml"),
-        superseded: &[include_str!("../harnesses/superseded/opencode-1.toml")],
+        superseded: &[
+            include_str!("../harnesses/superseded/opencode-1.toml"),
+            include_str!("../harnesses/superseded/opencode-2.toml"),
+        ],
     },
 ];

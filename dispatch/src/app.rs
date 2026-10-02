@@ -254,8 +254,22 @@ struct PendingRequest {
     harness: String,
     /// What it would be asked to do, verbatim.
     task: String,
+    /// The structured handoff, when the request carries one.
+    handoff: Option<dispatch_core::Handoff>,
+    /// Whether the subagent would run in its own interface.
+    interactive: bool,
     /// How deep the asking pane already is.
     depth: u8,
+}
+
+impl PendingRequest {
+    /// The text the subagent's row is named from: the handoff's Goal, which
+    /// is short by design, rather than the whole handoff text.
+    fn title_source(&self) -> String {
+        self.handoff
+            .as_ref()
+            .map_or_else(|| self.task.clone(), |handoff| handoff.goal.clone())
+    }
 }
 
 /// A title with the agent's own mark taken off the front.
@@ -453,6 +467,13 @@ enum Overlay {
         /// The question, as a prompt with nothing to type.
         prompt: Prompt,
     },
+    /// An interactive subagent has reported: close it, or keep it.
+    Reported {
+        /// The subagent's pane.
+        pane: PaneId,
+        /// The question.
+        prompt: Prompt,
+    },
     /// A delegation request, shown from the front of `App::pending`.
     Approval {
         /// First line of the task text on screen, for a long one.
@@ -481,6 +502,7 @@ impl Overlay {
             Overlay::OpenOn { .. } => "open_on",
             Overlay::RenameTab { .. } => "rename_tab",
             Overlay::CloseTab { .. } => "close_tab",
+            Overlay::Reported { .. } => "reported",
             Overlay::Approval { .. } => "approval",
             Overlay::Menu(_) => "menu",
         }
@@ -503,6 +525,7 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
+            | Overlay::Reported { .. }
             | Overlay::Approval { .. }
             | Overlay::Menu(_) => None,
         }
@@ -525,6 +548,7 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
+            | Overlay::Reported { .. }
             | Overlay::Approval { .. }
             | Overlay::Menu(_) => None,
         }
@@ -549,6 +573,7 @@ impl Overlay {
             | Overlay::OpenOn { .. }
             | Overlay::RenameTab { .. }
             | Overlay::CloseTab { .. }
+            | Overlay::Reported { .. }
             | Overlay::Approval { .. }
             | Overlay::Menu(_) => None,
         }
@@ -569,7 +594,8 @@ impl Overlay {
             Overlay::Preferences(_) => u16::MAX,
             Overlay::OpenOn { prompt, .. }
             | Overlay::RenameTab { prompt, .. }
-            | Overlay::CloseTab { prompt, .. } => prompt.desired_width(),
+            | Overlay::CloseTab { prompt, .. }
+            | Overlay::Reported { prompt, .. } => prompt.desired_width(),
             Overlay::AddMachine(add) => add.prompt().desired_width(),
             // It shows as much of the directory as it has room for.
             Overlay::Browse(_) => 30,
@@ -594,15 +620,24 @@ impl Overlay {
             Overlay::Preferences(workspace) => workspace.view.set_chrome(chrome),
             Overlay::Browse(browser) => browser.set_chrome(chrome),
             Overlay::OpenOn { prompt, .. } => prompt.set_chrome(chrome),
-            Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
-                prompt.set_chrome(chrome)
-            }
+            Overlay::RenameTab { prompt, .. }
+            | Overlay::CloseTab { prompt, .. }
+            | Overlay::Reported { prompt, .. } => prompt.set_chrome(chrome),
             Overlay::AddMachine(add) => add.prompt_mut().set_chrome(chrome),
             Overlay::Menu(menu) => menu.set_chrome(chrome),
             // Built fresh each frame, with the theme's border already on it.
             Overlay::Approval { .. } => {}
         }
     }
+}
+
+/// The question put to the user once an interactive subagent has reported.
+fn reported_prompt() -> Prompt {
+    Prompt::new(
+        "Subagent finished and sent its report. Close this pane? y/n",
+        "y closes it, n keeps it as an ordinary pane",
+    )
+    .with_buttons(crate::pointer::buttons::keep_close())
 }
 
 /// What to call the machine Dispatch is running on.
@@ -2625,6 +2660,8 @@ impl App {
                 harness,
                 task,
                 depth,
+                handoff,
+                interactive,
             } => {
                 self.pending.push_back(PendingRequest {
                     request,
@@ -2632,6 +2669,8 @@ impl App {
                     project,
                     harness,
                     task,
+                    handoff,
+                    interactive,
                     depth,
                 });
 
@@ -2804,7 +2843,22 @@ impl App {
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
+            | ServerMessage::ReportAnswered { .. }
             | ServerMessage::Unknown => false,
+            ServerMessage::SubagentReported { pane } => {
+                self.state.set_reported(pane, true);
+                true
+            }
+            // Some window, perhaps this one, kept the pane: the mark goes
+            // everywhere, along with a question about it still open here.
+            ServerMessage::SubagentKept { pane } => {
+                self.state.set_reported(pane, false);
+                if matches!(self.overlay, Some(Overlay::Reported { pane: asked, .. }) if asked == pane)
+                {
+                    self.overlay = None;
+                }
+                true
+            }
         }
     }
 
@@ -3299,7 +3353,13 @@ impl App {
             Action::HarnessManager => self.open_harness_manager(),
             Action::SelectTab(index) => self.select_tab(index),
             Action::NextTab => self.select_tab(self.current_tab() + 1),
-            Action::Approvals => self.open_next_approval(),
+            Action::Approvals => {
+                if self.pending.is_empty() {
+                    self.open_next_reported();
+                } else {
+                    self.open_next_approval();
+                }
+            }
             Action::ToggleFold => self.toggle_fold(),
             Action::NextAttention => self.next_attention(),
             Action::AttentionPicker => self.open_attention_picker(),
@@ -3371,6 +3431,64 @@ impl App {
             .is_some_and(|pane| pane.parent.is_some())
         {
             self.expanded.insert(id);
+        }
+        // A reported pane is not asked about here: focus can follow the
+        // pointer (`focus_follows_pointer`), so passing over the pane would
+        // open a question one `y` from killing it. The footer's "reported"
+        // count, or the approvals key, asks instead.
+    }
+
+    /// Asks about the first reported subagent, if there is one.
+    fn open_next_reported(&mut self) {
+        let Some(pane) = self
+            .state
+            .projects()
+            .iter()
+            .flat_map(|project| self.state.panes_for(project.id))
+            .find(|pane| pane.reported && !pane.closed)
+            .map(|pane| pane.id)
+        else {
+            return;
+        };
+        self.overlay = Some(Overlay::Reported {
+            pane,
+            prompt: reported_prompt(),
+        });
+    }
+
+    /// Acts on one key while a reported subagent waits on an answer.
+    fn handle_reported_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::Reported { pane, .. }) = &self.overlay else {
+            return;
+        };
+        let pane = *pane;
+
+        match key.code {
+            KeyCode::Char('y') => self.close_reported(pane),
+            KeyCode::Char('n') | KeyCode::Esc => self.keep_reported(pane),
+            _ => {}
+        }
+    }
+
+    /// Closes a reported subagent's pane: `y`, or the `[ Close ]` button.
+    pub(super) fn close_reported(&mut self, pane: PaneId) {
+        self.overlay = None;
+        self.close_pane(pane);
+    }
+
+    /// Keeps a reported subagent as an ordinary pane: `n`, Esc, or the
+    /// `[ Keep ]` button.
+    ///
+    /// Told to the daemon, which would otherwise mark the pane again in every
+    /// window that next subscribes, this one included.
+    pub(super) fn keep_reported(&mut self, pane: PaneId) {
+        self.overlay = None;
+        self.state.set_reported(pane, false);
+        if let Some(daemon) = self
+            .attachment_for_pane(pane)
+            .map(|attachment| attachment.client.handle())
+        {
+            daemon.send(ClientMessage::KeepReported { pane });
         }
     }
 
@@ -3530,6 +3648,11 @@ impl App {
 
         if matches!(self.overlay, Some(Overlay::CloseTab { .. })) {
             self.handle_close_tab_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::Reported { .. })) {
+            self.handle_reported_key(key);
             return Ok(());
         }
 
@@ -3897,7 +4020,8 @@ impl App {
         // leaves the queue here, one round trip before the daemon says whether
         // a pane came of it.
         if approve {
-            self.answered.insert(waiting.request, waiting.task.clone());
+            self.answered
+                .insert(waiting.request, waiting.title_source());
         }
 
         let message = ClientMessage::DelegateDecision {
@@ -3935,7 +4059,7 @@ impl App {
         self.pending
             .iter()
             .find(|waiting| waiting.request == request)
-            .map(|waiting| waiting.task.clone())
+            .map(PendingRequest::title_source)
     }
 
     /// Records a scroll of the task text of the request currently shown.
@@ -3982,6 +4106,8 @@ impl App {
             project,
             depth: request.depth,
             task: &request.task,
+            handoff: request.handoff.as_ref(),
+            interactive: request.interactive,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
             chrome: self.theme.chrome(),
@@ -5229,7 +5355,8 @@ impl App {
 
         if let Overlay::OpenOn { prompt, .. }
         | Overlay::RenameTab { prompt, .. }
-        | Overlay::CloseTab { prompt, .. } = overlay
+        | Overlay::CloseTab { prompt, .. }
+        | Overlay::Reported { prompt, .. } = overlay
         {
             frame.render_widget(prompt, panes_area);
             return;
@@ -8154,6 +8281,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests for the http client".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         for message in [
@@ -8278,6 +8407,43 @@ mod tests {
     }
 
     #[test]
+    fn a_subagent_is_titled_by_its_handoffs_goal() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let handoff = dispatch_core::Handoff::parse(
+            "## Context\nlong background first\n## Goal\nWrite the http client tests\n\
+             ## Constraints\nNone.\n## Done when\nthey pass\n## Report back\nwhich tests\n",
+        )
+        .expect("complete");
+        let request = RequestId::new();
+        let child = PaneId::new();
+
+        for message in [
+            ServerMessage::DelegatePending {
+                request,
+                parent,
+                project,
+                harness: "claude".into(),
+                task: handoff.text.clone(),
+                depth: 0,
+                handoff: Some(handoff.clone()),
+                interactive: false,
+            },
+            ServerMessage::DelegateResolved {
+                request,
+                outcome: DelegateOutcome::Approved { pane: child },
+            },
+            spawned(child, project, "claude", Some(parent), false),
+        ] {
+            daemon.send(message).expect("the app is listening");
+        }
+        app.poll_daemon();
+
+        let title = &app.state.pane(child).expect("adopted").title;
+        assert!(title.starts_with("Write the http"), "{title:?}");
+    }
+
+    #[test]
     fn a_task_title_keeps_whole_words_and_says_when_it_cut() {
         assert_eq!(
             task_title("write the tests"),
@@ -8320,6 +8486,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         app.overlay = Some(Overlay::Approval { scroll: 0 });
 
@@ -9645,6 +9813,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
@@ -9696,6 +9866,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         let mut terminal = a_terminal();
         drawn(app, &mut terminal);
@@ -11039,6 +11211,8 @@ mod tests {
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -11236,6 +11410,8 @@ mod tests {
             harness: "claude".into(),
             task: "a second task".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
 
         app.apply(ServerMessage::DelegateResolved {
@@ -13037,6 +13213,133 @@ mod tests {
         assert!(tab_commands(&sent).is_empty());
     }
 
+    /// An attached app with one parent and one interactive child that has
+    /// reported, with whatever the app sent so far drained.
+    fn app_with_a_reported_child() -> (App, PaneId, Sender<ServerMessage>, Receiver<ClientMessage>)
+    {
+        let (mut app, project, daemon, sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "claude");
+        daemon
+            .send(ServerMessage::SubagentReported { pane: child })
+            .expect("the app is listening");
+        app.poll_daemon();
+        while sent.try_recv().is_ok() {}
+        (app, child, daemon, sent)
+    }
+
+    #[test]
+    fn a_reported_subagent_is_counted_and_asks_before_it_closes() {
+        let (mut app, child, _daemon, sent) = app_with_a_reported_child();
+        assert!(app.state.pane(child).expect("listed").reported);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        let row = bottom_row(&terminal);
+        assert!(row.contains("1 reported"), "{row:?}");
+
+        app.open_next_reported();
+        let Some(Overlay::Reported { pane, prompt }) = &app.overlay else {
+            panic!("the question is open");
+        };
+        assert_eq!(*pane, child);
+        assert_eq!(
+            prompt.title(),
+            "Subagent finished and sent its report. Close this pane? y/n"
+        );
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.overlay.is_none());
+        let closed: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            closed.contains(&ClientMessage::ClosePane { pane: child }),
+            "{closed:#?}"
+        );
+    }
+
+    #[test]
+    fn keeping_a_reported_subagent_clears_its_mark() {
+        let (mut app, child, _daemon, sent) = app_with_a_reported_child();
+
+        app.open_next_reported();
+        press(&mut app, KeyCode::Char('n'));
+
+        assert!(app.overlay.is_none());
+        assert!(!app.state.pane(child).expect("still listed").reported);
+        let told: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            !told
+                .iter()
+                .any(|m| matches!(m, ClientMessage::ClosePane { .. })),
+            "nothing is closed"
+        );
+        assert!(
+            told.contains(&ClientMessage::KeepReported { pane: child }),
+            "the daemon is told, or the question comes back on reconnect: {told:#?}"
+        );
+    }
+
+    #[test]
+    fn the_reported_question_answers_by_its_buttons_too() {
+        // [ Keep ] does what `n` does: the mark goes and the daemon is told.
+        let (mut app, child, _daemon, sent) = app_with_a_reported_child();
+        let mut terminal = a_wide_terminal();
+        app.open_next_reported();
+        drawn(&mut app, &mut terminal);
+        click_button(&mut app, pointer::ButtonId::Keep);
+
+        assert!(app.overlay.is_none());
+        assert!(!app.state.pane(child).expect("still listed").reported);
+        assert!(
+            sent.try_iter()
+                .any(|m| m == ClientMessage::KeepReported { pane: child }),
+            "the daemon is told"
+        );
+
+        // [ Close ] does what `y` does.
+        let (mut app, child, _daemon, sent) = app_with_a_reported_child();
+        app.open_next_reported();
+        drawn(&mut app, &mut terminal);
+        click_button(&mut app, pointer::ButtonId::Close);
+
+        assert!(app.overlay.is_none());
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::ClosePane { pane } if pane == child)),
+            "the pane is closed"
+        );
+    }
+
+    #[test]
+    fn focusing_a_reported_subagent_does_not_ask() {
+        // Focus follows the pointer, so a pane is focused by passing over
+        // it: a question one `y` from killing the pane must not open that way.
+        let (mut app, child, _daemon, _sent) = app_with_a_reported_child();
+
+        app.focus_pane(child);
+
+        assert!(app.overlay.is_none(), "no question opens on focus");
+        assert!(app.state.pane(child).expect("listed").reported);
+    }
+
+    #[test]
+    fn a_subagent_kept_in_another_window_loses_its_mark_here() {
+        let (mut app, child, daemon, _sent) = app_with_a_reported_child();
+        app.open_next_reported();
+
+        daemon
+            .send(ServerMessage::SubagentKept { pane: child })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(!app.state.pane(child).expect("still listed").reported);
+        assert!(
+            app.overlay.is_none(),
+            "the question another window answered is withdrawn"
+        );
+    }
+
     #[test]
     fn closing_a_tab_asks_first() {
         let (mut app, project, daemon, sent) = attached_app();
@@ -14504,6 +14807,8 @@ args = ["--effort", "{value}"]
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         drawn(&mut app, &mut terminal);
 
@@ -15165,6 +15470,8 @@ args = ["--effort", "{value}"]
             harness: "claude".into(),
             task: "write the tests".into(),
             depth: 0,
+            handoff: None,
+            interactive: false,
         });
         drawn(&mut app, &mut terminal);
         let row = bottom_row(&terminal);
@@ -17749,6 +18056,8 @@ args = ["--effort", "{value}"]
             harness: first.harness.clone(),
             task: "and the docs".into(),
             depth: first.depth,
+            handoff: None,
+            interactive: false,
         };
         app.pending.push_back(second);
         let mut terminal = a_wide_terminal();

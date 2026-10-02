@@ -24,13 +24,45 @@ use dispatch_core::Placement;
 /// fixture for the difference between `task.is_some()` and
 /// `task_launch(..).is_some()`.
 fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
-    let body = if cfg!(windows) {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
-    } else {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
-    };
-
     std::fs::create_dir_all(dir).expect("temp dir is writable");
+    // The subagent is handed a brief: a preamble, then the handoff. These
+    // runners pull the Goal section out of it and run that as a script, so
+    // a test still says what the subagent does as a shell command.
+    let runner = if cfg!(windows) {
+        let path = dir.join("run-goal.ps1");
+        std::fs::write(
+            &path,
+            "$brief = Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')\n\
+             $m = [regex]::Match($brief, '(?ms)^## Goal\\s*\\r?\\n(.*?)(?=^## |\\z)')\n\
+             Invoke-Expression $m.Groups[1].Value.Trim()\n",
+        )
+        .expect("temp dir is writable");
+        path
+    } else {
+        let path = dir.join("run-goal.sh");
+        std::fs::write(
+            &path,
+            "goal=$(printf '%s\\n' \"$1\" | awk '/^## Goal[[:space:]]*$/{f=1;next} /^## /{f=0} f')\n\
+             eval \"$goal\"\n",
+        )
+        .expect("temp dir is writable");
+        path
+    };
+    let body = if cfg!(windows) {
+        format!(
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\n\
+             args = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \
+             \"-ExecutionPolicy\", \"Bypass\", \"-File\", '{}']\ninput = \"file\"\n",
+            runner.display()
+        )
+    } else {
+        format!(
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\n\
+             args = ['{}', \"{{task}}\"]\n\n[task.interactive]\nargs = ['{}', \"{{task}}\"]\n",
+            runner.display(),
+            runner.display()
+        )
+    };
     std::fs::write(dir.join("shell.toml"), body).expect("temp dir is writable");
 
     let no_task_args = if cfg!(windows) {
@@ -1266,6 +1298,16 @@ fn m_is_child(message: &ServerMessage) -> bool {
     )
 }
 
+/// A complete handoff whose Goal is `goal`, which the test harness runs as a
+/// script.
+fn handoff_for(goal: &str) -> dispatch_core::Handoff {
+    dispatch_core::Handoff::parse(&format!(
+        "## Goal\n{goal}\n\n## Context\nA test.\n\n## Constraints\nNone.\n\n\
+         ## Done when\nIt has run.\n\n## Report back\nNothing.\n"
+    ))
+    .expect("a complete handoff")
+}
+
 /// Attaches a delegate caller and asks for a subagent.
 fn ask(daemon: &mut Daemon, parent: PaneId, task: &str) -> Inbox {
     ask_as(daemon, 9, parent, task)
@@ -1291,6 +1333,8 @@ fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Inbox {
             harness: "shell".into(),
             task: task.into(),
             size: (80, 24),
+            handoff: Some(handoff_for(task)),
+            interactive: false,
         },
     );
     caller
@@ -1319,12 +1363,159 @@ fn a_delegation_request_is_put_to_the_user() {
     assert!(
         matches!(
             seen.iter().find(|m| matches!(m, ServerMessage::DelegatePending { .. })),
-            Some(ServerMessage::DelegatePending { task, .. }) if task == "echo delegated"
+            Some(ServerMessage::DelegatePending { handoff: Some(handoff), .. })
+                if handoff.goal == "echo delegated"
         ),
         "the whole task travels, got {seen:#?}"
     );
     assert_eq!(daemon.pane_count(), 1, "nothing runs before an answer");
     let _ = request;
+}
+
+#[test]
+fn a_request_without_a_handoff_is_refused_without_asking() {
+    let (mut daemon, project, _dir) = daemon("delegate-bare");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "old delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: "echo bare".into(),
+            size: (80, 24),
+            handoff: None,
+            interactive: false,
+        },
+    );
+
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("--handoff"), "{reason}");
+    assert!(pending(&drain(&ui)).is_none(), "nobody is asked");
+}
+
+#[test]
+fn a_handoff_with_problems_is_refused_even_when_the_caller_skipped_the_check() {
+    let (mut daemon, project, _dir) = daemon("delegate-broken");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let mut broken = handoff_for("echo x");
+    broken.text = "## Goal\necho x\n".into();
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "careless".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(broken),
+            interactive: false,
+        },
+    );
+
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("Context is missing"), "{reason}");
+}
+
+#[test]
+fn the_subagent_is_handed_the_brief_not_the_bare_goal() {
+    let (mut daemon, project, _dir) = daemon("delegate-brief");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    // The Goal prints the subagent's own first argument (Unix) or task file
+    // (Windows): the brief exactly as the harness received it.
+    let goal = if cfg!(windows) {
+        "Get-Content -Raw -LiteralPath $env:DISPATCH_TASK_FILE.Trim('\"')"
+    } else {
+        "printf '%s\\n' \"$1\""
+    };
+    let caller = ask(&mut daemon, parent, goal);
+    let request = pending(&drain(&ui)).expect("asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let tail = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateFinished { tail, .. } => {
+                Some(String::from_utf8_lossy(tail).into_owned())
+            }
+            _ => None,
+        })
+        .expect("finished");
+    assert!(
+        tail.contains("You are a subagent started by Dispatch"),
+        "{tail}"
+    );
+    assert!(tail.contains("## Report back"), "{tail}");
+}
+
+#[test]
+fn the_prompt_carries_the_handoff() {
+    let (mut daemon, project, _dir) = daemon("delegate-prompt-handoff");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let _caller = ask(&mut daemon, parent, "echo shown");
+
+    let seen = drain(&ui);
+    let shown = seen.iter().find_map(|m| match m {
+        ServerMessage::DelegatePending {
+            handoff,
+            task,
+            interactive,
+            ..
+        } => Some((handoff.clone(), task.clone(), *interactive)),
+        _ => None,
+    });
+    let (handoff, task, interactive) = shown.expect("asked");
+    let handoff = handoff.expect("the handoff travels");
+    assert_eq!(handoff.goal, "echo shown");
+    assert_eq!(
+        task, handoff.text,
+        "an older client is shown the whole handoff"
+    );
+    assert!(!interactive);
 }
 
 #[test]
@@ -1554,6 +1745,8 @@ fn a_pane_the_daemon_does_not_own_cannot_delegate() {
             harness: "shell".into(),
             task: "echo hello".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("echo hello")),
+            interactive: false,
         },
     );
 
@@ -2021,6 +2214,8 @@ fn an_interface_client_that_delegates_is_not_told_twice() {
             harness: "shell".into(),
             task: "echo self".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("echo self")),
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");
@@ -2073,6 +2268,8 @@ fn a_harness_with_an_empty_task_form_is_refused_without_asking() {
             harness: "no-task-args".into(),
             task: "echo never".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("echo never")),
+            interactive: false,
         },
     );
 
@@ -2383,6 +2580,7 @@ fn approving_more_requests_than_the_cap_allows_starts_only_what_fits() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -2444,6 +2642,7 @@ fn approvals_from_two_interfaces_do_not_share_one_slot() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -2497,6 +2696,7 @@ fn a_blanket_approved_pane_at_its_cap_is_refused_rather_than_started() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = daemon.attach_for_test(1);
@@ -3886,6 +4086,8 @@ fn assert_a_task_reaches_the_capture_exactly(
             harness: "capture".into(),
             task: task.into(),
             size: (80, 24),
+            handoff: Some(handoff_for(task)),
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");
@@ -3908,10 +4110,14 @@ fn assert_a_task_reaches_the_capture_exactly(
         "the capture ran and succeeded: {seen:#?}"
     );
 
-    assert_eq!(
-        std::fs::read(&captured).expect("the agent recorded its input"),
-        task.as_bytes(),
-        "the task arrived changed"
+    // The agent is handed the brief, which carries the handoff verbatim after
+    // its preamble, so the task arrives intact exactly when that text does.
+    let received = std::fs::read(&captured).expect("the agent recorded its input");
+    let handoff = handoff_for(task).text.into_bytes();
+    assert!(
+        received.ends_with(&handoff),
+        "the task arrived changed: {}",
+        String::from_utf8_lossy(&received)
     );
     assert!(
         !dir.0.join("marker.txt").exists(),
@@ -4014,6 +4220,8 @@ fn delegating_to(
             harness: harness.into(),
             task: task.into(),
             size: (80, 24),
+            handoff: Some(handoff_for(task)),
+            interactive: false,
         },
     );
 
@@ -4319,7 +4527,7 @@ fn a_harness_spelling_of_a_daemon_variable_is_the_one_its_agent_gets() {
     );
 
     let run = daemon
-        .task_run("spelled", "anything", PaneId::new())
+        .task_run("spelled", "anything", PaneId::new(), false)
         .expect("the harness has a task form");
     let spellings: Vec<_> = run
         .launch
@@ -4391,7 +4599,7 @@ fn an_argument_form_is_never_handed_a_task_file() {
     );
 
     let run = daemon
-        .task_run("argue", "anything", PaneId::new())
+        .task_run("argue", "anything", PaneId::new(), false)
         .expect("the harness has a task form");
     assert_eq!(run.input, TaskInput::Argument);
     assert!(
@@ -4445,6 +4653,8 @@ fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
             harness: "mixed".into(),
             task: "anything".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("anything")),
+            interactive: false,
         },
     );
 
@@ -4506,6 +4716,8 @@ fn a_task_form_that_would_put_the_task_on_cmds_command_line_is_refused() {
             harness: "old".into(),
             task: "x & echo DISPATCH_AUDIT_MARKER".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("x & echo DISPATCH_AUDIT_MARKER")),
+            interactive: false,
         },
     );
 
@@ -5370,6 +5582,7 @@ fn a_pane_placed_on_a_tab_delegates_under_the_same_cap() {
             max_depth: 1,
             max_live_per_parent: 1,
             request_timeout_secs: 600,
+            ..DelegationLimits::default()
         },
     );
     let ui = subscribed(&mut daemon, 1);
@@ -5672,6 +5885,8 @@ fn a_subagent_starts_with_the_saved_settings() {
             harness: "record".into(),
             task: "anything".into(),
             size: (80, 24),
+            handoff: Some(handoff_for("anything")),
+            interactive: false,
         },
     );
     let request = pending(&drain(&ui)).expect("the interface is asked");
@@ -6026,4 +6241,574 @@ fn a_shell_whose_job_is_stopped_stays_open() {
         "the shell's own stopped job must not close the pane"
     );
     assert_eq!(daemon.pane_count(), 1);
+}
+
+/// Approves the one request pending on `ui` and returns the subagent's pane.
+fn approve_and_spawn(daemon: &mut Daemon, ui: &Inbox) -> PaneId {
+    let request = pending(&drain(ui)).expect("asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    let seen = wait_for(daemon, ui, |m| m.iter().any(m_is_child));
+    seen.iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned {
+                pane,
+                parent: Some(_),
+                ..
+            } => Some(*pane),
+            _ => None,
+        })
+        .expect("checked by wait_for")
+}
+
+/// Sends a report from `pane` over a fresh delegate connection, and returns
+/// that connection's inbox.
+fn report_from(daemon: &mut Daemon, id: u64, pane: PaneId, report: &str) -> Inbox {
+    let reporter = daemon.attach_for_test(id);
+    daemon.request_for_test(
+        id,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "report".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        id,
+        ClientMessage::DelegateReport {
+            pane,
+            report: report.into(),
+        },
+    );
+    reporter
+}
+
+fn report_outcome(messages: &[ServerMessage]) -> Option<dispatch_proto::ReportOutcome> {
+    messages.iter().find_map(|m| match m {
+        ServerMessage::ReportAnswered { outcome } => Some(outcome.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_report_answers_the_caller_at_once() {
+    let (mut daemon, project, _dir) = daemon("report-delivered");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let reporter = report_from(&mut daemon, 20, child, "the findings");
+
+    assert_eq!(
+        report_outcome(&drain(&reporter)),
+        Some(dispatch_proto::ReportOutcome::Delivered)
+    );
+    let finished = drain(&caller).into_iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { exit, report, .. } => Some((exit, report)),
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some((0, Some("the findings".to_string()))),
+        "answered before the still-running subagent exits"
+    );
+}
+
+#[test]
+fn a_one_shot_subagent_that_reported_is_not_killed_when_its_caller_leaves() {
+    let (mut daemon, project, _dir) = daemon("report-keeps-pane");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    // `dispatch delegate` exits the moment it has its answer.
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "its pane stays for a person to read"
+    );
+}
+
+#[test]
+fn a_second_report_is_refused() {
+    let (mut daemon, project, _dir) = daemon("report-twice");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "first");
+
+    let second = report_from(&mut daemon, 21, child, "second");
+    assert!(matches!(
+        report_outcome(&drain(&second)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("already reported")
+    ));
+}
+
+#[test]
+fn a_pane_that_is_not_a_subagent_cannot_report() {
+    let (mut daemon, project, _dir) = daemon("report-not-subagent");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let top = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let reporter = report_from(&mut daemon, 20, top, "unasked");
+    assert!(matches!(
+        report_outcome(&drain(&reporter)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("not a subagent")
+    ));
+}
+
+#[test]
+fn a_report_nobody_is_waiting_for_says_so() {
+    let (mut daemon, project, _dir) = daemon("report-no-caller");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo quick");
+    let child = approve_and_spawn(&mut daemon, &ui);
+    // The one-shot exits and its caller is answered with the tail: the point
+    // at which nobody is waiting any more.
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    let late = report_from(&mut daemon, 20, child, "too late");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+}
+
+#[test]
+fn a_report_from_an_unknown_pane_is_an_error() {
+    let (mut daemon, _project, _dir) = daemon("report-unknown");
+    let reporter = report_from(&mut daemon, 20, PaneId::new(), "who");
+    assert!(drain(&reporter).iter().any(|m| matches!(
+        m,
+        ServerMessage::Error {
+            error: ProtocolError::NoSuchPane(_)
+        }
+    )));
+}
+
+#[test]
+fn a_report_over_the_limit_is_cut_on_a_character_boundary() {
+    // Three-byte characters, so the limit falls inside one.
+    let report = "€".repeat(MAX_REPORT_BYTES / 3 + 10);
+    let cut = cut_report(report);
+    assert!(cut.len() <= MAX_REPORT_BYTES + 200);
+    assert!(cut.ends_with("[dispatch] the report was cut at 1 MiB\n"));
+    assert!(cut.starts_with('€'));
+}
+
+#[test]
+fn the_cap_counts_requests_still_open_not_processes_still_running() {
+    let limits = DelegationLimits {
+        max_live_per_parent: 1,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, _dir) = daemon_with_limits("report-cap", limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _first = ask_as(&mut daemon, 9, parent, long_task());
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    // The first is still running, but its request is finished.
+    let _second = ask_as(&mut daemon, 10, parent, "echo second");
+    assert!(
+        pending(&drain(&ui)).is_some(),
+        "a reported subagent no longer holds its parent's slot"
+    );
+}
+
+/// Attaches a delegate caller and asks for an interactive subagent.
+fn ask_interactive(daemon: &mut Daemon, parent: PaneId, goal: &str) -> Inbox {
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(handoff_for(goal)),
+            interactive: true,
+        },
+    );
+    caller
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_closes_once_it_has_reported() {
+    let (mut daemon, project, _dir) = daemon("interactive-close");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let _ = report_from(&mut daemon, 20, child, "interactive findings");
+
+    let answer = drain(&caller).into_iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { report, .. } => report,
+        _ => None,
+    });
+    assert_eq!(answer.as_deref(), Some("interactive findings"));
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane } if *pane == child)),
+        "closed after the caller had its answer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn under_ask_a_reported_interactive_subagent_stays_and_is_marked() {
+    let limits = DelegationLimits {
+        interactive_on_done: dispatch_config::OnDone::Ask,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, _dir) = daemon_with_limits("interactive-ask", limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    let _ = report_from(&mut daemon, 20, child, "done");
+
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+    assert_eq!(daemon.pane_count(), 2, "kept for the user to close");
+
+    // A window attaching later is told too.
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    assert!(
+        drain(&late)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_outlives_a_caller_that_left_before_it_reported() {
+    let (mut daemon, project, _dir) = daemon("interactive-orphan");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.detach_for_test(9);
+    daemon.tick();
+    assert_eq!(daemon.pane_count(), 2, "never ended under the user");
+
+    let late = report_from(&mut daemon, 20, child, "nobody");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "and not closed by a report nobody wanted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_that_exits_without_reporting_answers_with_no_tail() {
+    let (mut daemon, project, _dir) = daemon("interactive-no-report");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "echo screen-noise");
+    let _child = approve_and_spawn(&mut daemon, &ui);
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let finished = seen.iter().find_map(|m| match m {
+        ServerMessage::DelegateFinished { tail, report, .. } => {
+            Some((tail.clone(), report.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some((Vec::new(), None)),
+        "a full-screen tail is not output"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_an_interactive_subagent_before_it_reports_answers_its_caller() {
+    let (mut daemon, project, _dir) = daemon("interactive-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: child });
+
+    assert!(
+        drain(&caller)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { exit: -1, .. }))
+    );
+}
+
+#[test]
+fn a_harness_without_an_interactive_form_refuses_interactive() {
+    let (mut daemon, project, _dir) = daemon("interactive-none");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "no-task-args".into(),
+            task: String::new(),
+            size: (80, 24),
+            handoff: Some(handoff_for("echo x")),
+            interactive: true,
+        },
+    );
+    let reason = refusal(&drain(&caller)).expect("refused");
+    assert!(reason.contains("[task.interactive]"), "{reason}");
+}
+
+/// A daemon under `interactive_on_done = "ask"` with a window subscribed as
+/// client 1, an interactive subagent that has reported, and the window's
+/// inbox drained.
+#[cfg(unix)]
+fn reported_under_ask(label: &str) -> (Daemon, TempDir, Inbox, PaneId) {
+    let limits = DelegationLimits {
+        interactive_on_done: dispatch_config::OnDone::Ask,
+        ..DelegationLimits::default()
+    };
+    let (mut daemon, project, dir) = daemon_with_limits(label, limits);
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+    let _ = report_from(&mut daemon, 20, child, "done");
+    assert!(
+        drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { pane } if *pane == child))
+    );
+    (daemon, dir, ui, child)
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_reported_subagent_tells_every_window() {
+    let (mut daemon, _dir, ui, child) = reported_under_ask("keep-reported");
+    let other = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let _ = drain(&other);
+
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: child });
+
+    for inbox in [&ui, &other] {
+        assert!(
+            drain(inbox)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::SubagentKept { pane } if *pane == child)),
+            "every window hears it was kept"
+        );
+    }
+    assert_eq!(daemon.pane_count(), 2, "kept, not closed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_window_attaching_after_a_keep_is_not_asked_again() {
+    let (mut daemon, _dir, _ui, child) = reported_under_ask("keep-then-attach");
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: child });
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    assert!(
+        !drain(&late)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::SubagentReported { .. })),
+        "the user already answered"
+    );
+
+    // Kept for good: a second report is still refused.
+    let again = report_from(&mut daemon, 21, child, "again");
+    assert!(matches!(
+        report_outcome(&drain(&again)),
+        Some(dispatch_proto::ReportOutcome::Refused { reason }) if reason.contains("already reported")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_pane_that_is_not_waiting_is_ignored() {
+    let (mut daemon, project, _dir) = daemon("keep-not-waiting");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let top = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(1, ClientMessage::KeepReported { pane: top });
+
+    assert!(
+        !drain(&ui).iter().any(|m| matches!(
+            m,
+            ServerMessage::SubagentKept { .. } | ServerMessage::Error { .. }
+        )),
+        "nothing to keep, and nothing wrong with asking"
+    );
+}
+
+#[test]
+fn keeping_an_unknown_pane_is_an_error() {
+    let (mut daemon, _project, _dir) = daemon("keep-unknown");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::KeepReported {
+            pane: PaneId::new(),
+        },
+    );
+
+    assert!(drain(&ui).iter().any(|m| matches!(
+        m,
+        ServerMessage::Error {
+            error: ProtocolError::NoSuchPane(_)
+        }
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_report_to_a_caller_that_has_gone_leaves_the_pane_alone() {
+    let (mut daemon, project, _dir) = daemon("report-caller-gone");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    // The caller's connection ends, and a reply to it fails before its
+    // detach is handled: the daemon forgets the client without abandoning
+    // what it asked for, so the pane still names it.
+    drop(caller);
+    daemon.request_for_test(9, ClientMessage::Ping { token: 1 });
+
+    let late = report_from(&mut daemon, 20, child, "nobody");
+    assert!(matches!(
+        report_outcome(&drain(&late)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+    assert_eq!(daemon.pane_count(), 2, "not closed by a report nobody got");
+    let _ = drain(&ui);
+
+    // Not marked reported either: once the detach is handled, a report it
+    // sends is told the same, not that it already reported.
+    daemon.detach_for_test(9);
+    daemon.tick();
+    let again = report_from(&mut daemon, 21, child, "still nobody");
+    assert!(matches!(
+        report_outcome(&drain(&again)),
+        Some(dispatch_proto::ReportOutcome::NotWaiting { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_subagent_outlives_its_parents_pane() {
+    let (mut daemon, project, _dir) = daemon("interactive-parent-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask_interactive(&mut daemon, parent, "sleep 30");
+    let child = approve_and_spawn(&mut daemon, &ui);
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: parent });
+
+    assert!(
+        !drain(&ui)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { pane } if *pane == child)),
+        "the user may be working in it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "the parent went, the child stayed");
+    assert!(daemon.pane_size_for_test(child).is_some());
 }

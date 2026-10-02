@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use dispatch_config::{Choices, DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
+use dispatch_core::Handoff;
 use dispatch_core::{
     PaneId, PaneStatus, Placement, Project, ProjectId, ProjectSource, ProjectTabs, RequestId,
     TabError, TabId,
@@ -26,11 +27,44 @@ use crate::pane::DaemonPane;
 use crate::sizing::Sizes;
 use crate::task_file::{Leftovers, TaskFile};
 
+/// The largest report passed on, in bytes.
+///
+/// Far past anything an agent should write for another to read, and far
+/// short of the protocol's 64 MiB frame limit.
+const MAX_REPORT_BYTES: usize = 1024 * 1024;
+
+/// `report`, cut at [`MAX_REPORT_BYTES`] on a character boundary, with a
+/// line saying so.
+fn cut_report(mut report: String) -> String {
+    if report.len() <= MAX_REPORT_BYTES {
+        return report;
+    }
+    let mut end = MAX_REPORT_BYTES;
+    while !report.is_char_boundary(end) {
+        end -= 1;
+    }
+    report.truncate(end);
+    report.push_str("\n[dispatch] the report was cut at 1 MiB\n");
+    report
+}
+
 /// How much of a subagent's output its caller is given.
 ///
 /// Enough for an agent to act on, far short of a session: the pane keeps the
 /// rest, and a person can open it.
 const TAIL_BYTES: usize = 8 * 1024;
+
+/// The output a subagent's caller is handed when its pane ends.
+///
+/// An interactive pane has none: a full-screen interface's bytes are drawing
+/// commands, not output a caller could read.
+fn caller_tail(pane: &DaemonPane) -> Vec<u8> {
+    if pane.interactive {
+        return Vec::new();
+    }
+    let start = pane.history.len().saturating_sub(TAIL_BYTES);
+    pane.history[start..].to_vec()
+}
 
 /// How long the loop waits for an event before checking panes again.
 ///
@@ -726,6 +760,14 @@ impl Daemon {
                     }
                 }
 
+                // A reported pane waiting on the user's decision is marked in
+                // every window, a late one included; one the user chose to
+                // keep is not, or the question would come back on every
+                // reconnect.
+                for pane in self.panes.values().filter(|p| p.awaiting_decision) {
+                    existing.push(ServerMessage::SubagentReported { pane: pane.id });
+                }
+
                 // Every project's tabs, empty ones included: a client that
                 // hears none from a daemon takes it for one too old to keep
                 // them. After the panes, so every pane a snapshot names is one
@@ -836,9 +878,14 @@ impl Daemon {
             ClientMessage::DelegateRequest {
                 parent,
                 harness,
-                task,
+                task: _,
                 size,
-            } => self.delegate_request(id, parent, harness, task, size),
+                handoff,
+                interactive,
+            } => self.delegate_request(id, parent, harness, handoff, interactive, size),
+
+            ClientMessage::DelegateReport { pane, report } => self.report(id, pane, report),
+            ClientMessage::KeepReported { pane } => self.keep_reported(id, pane),
 
             ClientMessage::DelegateDecision {
                 request,
@@ -863,7 +910,8 @@ impl Daemon {
                     waiting.id,
                     waiting.parent,
                     &waiting.harness,
-                    &waiting.task,
+                    &waiting.handoff,
+                    waiting.interactive,
                     waiting.size,
                     waiting.caller,
                     blanket,
@@ -1148,6 +1196,9 @@ impl Daemon {
             exited_at: None,
             task_file: None,
             branch: None,
+            interactive: false,
+            reported: false,
+            awaiting_decision: false,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -1371,13 +1422,19 @@ impl Daemon {
         env
     }
 
-    /// The one-shot run of `task` under `harness`, with the environment pane
+    /// The one-shot run of `brief` under `harness`, with the environment pane
     /// `pane` would start with, or `None` when the harness has no one-shot
-    /// form for this platform.
+    /// (or, when `interactive`, no interactive) form for this platform.
     ///
     /// One place builds it, so what is judged before a run starts is what
     /// starts.
-    fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
+    fn task_run(
+        &self,
+        harness: &str,
+        brief: &str,
+        pane: PaneId,
+        interactive: bool,
+    ) -> Option<TaskRun> {
         let def = self.harnesses.get(harness)?;
         // No client chose anything for a subagent: it gets what the user
         // saved, then the file's defaults. Nothing chosen is nothing to
@@ -1385,7 +1442,16 @@ impl Daemon {
         let values = def
             .resolve(&Choices::new(), &self.saved_settings(harness))
             .unwrap_or_default();
-        let mut run = def.task_launch_with(std::env::consts::OS, task, &values)?;
+        let mut run = if interactive {
+            // An interactive agent takes its brief as an argument: its
+            // standard input is its terminal.
+            TaskRun {
+                launch: def.interactive_launch_with(std::env::consts::OS, brief, &values)?,
+                input: TaskInput::Argument,
+            }
+        } else {
+            def.task_launch_with(std::env::consts::OS, brief, &values)?
+        };
         add_missing(&mut run.launch.env, self.pane_env(pane));
         if run.input == TaskInput::Argument {
             // Its task is in its arguments, so a task file named in its
@@ -1404,10 +1470,13 @@ impl Daemon {
 
     /// Why `run` must not start, if the form it came from puts the task where
     /// a shell parses it.
-    fn unsafe_task_form(&self, harness: &str, run: &TaskRun) -> Option<String> {
-        self.harnesses
-            .get(harness)?
-            .task_refusal_as(std::env::consts::OS, &run.launch)
+    fn unsafe_task_form(&self, harness: &str, run: &TaskRun, interactive: bool) -> Option<String> {
+        let def = self.harnesses.get(harness)?;
+        if interactive {
+            def.interactive_refusal_as(std::env::consts::OS, &run.launch)
+        } else {
+            def.task_refusal_as(std::env::consts::OS, &run.launch)
+        }
     }
 
     /// Refuses, approves, or asks about a request to delegate.
@@ -1416,7 +1485,8 @@ impl Daemon {
         caller: ClientId,
         parent: PaneId,
         harness: String,
-        task: String,
+        handoff: Option<Handoff>,
+        interactive: bool,
         size: (u16, u16),
     ) {
         // One id for the whole call: a refusal answers with the same id a
@@ -1443,16 +1513,44 @@ impl Daemon {
             harness
         };
 
+        // Checked again here, whatever the caller checked: anything that can
+        // reach the socket can send a request, and the parse is what the
+        // brief is built from.
+        let handoff = match handoff.map(|sent| Handoff::parse(&sent.text)) {
+            None => {
+                self.resolve(
+                    request,
+                    caller,
+                    DelegateOutcome::Refused {
+                        reason: crate::delegation::NO_HANDOFF.into(),
+                    },
+                );
+                return;
+            }
+            Some(Err(error)) => {
+                self.resolve(
+                    request,
+                    caller,
+                    DelegateOutcome::Refused {
+                        reason: error.to_string(),
+                    },
+                );
+                return;
+            }
+            Some(Ok(handoff)) => handoff,
+        };
+        let brief = handoff.brief(parent);
+
         // Built as `approve` will build it, environment and all: which file a
         // bare command names depends on `PATH`. The pane id is a stand-in,
         // since nothing is judged by it.
-        let run = self.task_run(&harness, &task, PaneId::new());
+        let run = self.task_run(&harness, &brief, PaneId::new(), interactive);
 
         // A form that would put the task on cmd.exe's command line is refused
         // whatever the caps say: approving it would not make it safe.
         if let Some(reason) = run
             .as_ref()
-            .and_then(|run| self.unsafe_task_form(&harness, run))
+            .and_then(|run| self.unsafe_task_form(&harness, run, interactive))
         {
             tracing::info!(%parent, %harness, %reason, "refused an unsafe task form");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
@@ -1467,9 +1565,14 @@ impl Daemon {
         // worse than refusing up front.
         let has_task_form = run.is_some();
 
-        if let Some(reason) =
-            crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
-        {
+        if let Some(reason) = crate::delegation::refusal(
+            depth,
+            live,
+            self.limits,
+            has_task_form,
+            &harness,
+            interactive,
+        ) {
             tracing::info!(%parent, %harness, %reason, "refused a delegation");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
@@ -1478,7 +1581,16 @@ impl Daemon {
         // A pane the user has already approved for everything does not ask
         // again, for as long as this daemon runs.
         if self.blanket.contains(&parent) {
-            self.approve(request, parent, &harness, &task, size, caller, true);
+            self.approve(
+                request,
+                parent,
+                &harness,
+                &handoff,
+                interactive,
+                size,
+                caller,
+                true,
+            );
             return;
         }
 
@@ -1487,8 +1599,10 @@ impl Daemon {
             parent,
             project,
             harness: harness.clone(),
-            task: task.clone(),
+            task: handoff.text.clone(),
             depth,
+            handoff: Some(handoff.clone()),
+            interactive,
         };
 
         self.pending.insert(
@@ -1497,7 +1611,8 @@ impl Daemon {
                 id: request,
                 parent,
                 harness,
-                task,
+                handoff,
+                interactive,
                 size,
                 caller,
                 asked: Instant::now(),
@@ -1521,13 +1636,119 @@ impl Daemon {
         depth
     }
 
-    /// How many of a pane's subagents are still running.
+    /// How many of a pane's subagents are still working for it: their
+    /// request is open. Counted by request rather than by process, since an
+    /// interactive pane that has reported may stay open, at the user's
+    /// choice, for as long as they like.
     fn live_children(&self, parent: PaneId) -> usize {
         self.panes
             .values()
-            .filter(|p| p.parent == Some(parent))
-            .filter(|p| matches!(p.session.state(), RunState::Running))
+            .filter(|p| p.parent == Some(parent) && p.request.is_some())
             .count()
+    }
+
+    /// Delivers a subagent's report to the caller waiting on it.
+    ///
+    /// The caller is answered at once: the report is the work, and the
+    /// process may go on for a moment after sending it. The pane's request
+    /// and caller are both cleared, so neither its exit nor its caller
+    /// leaving does anything more to it: a one-shot pane stays to be read,
+    /// as one that exited does.
+    fn report(&mut self, client: ClientId, pane: PaneId, report: String) {
+        use dispatch_proto::ReportOutcome;
+
+        let answer = |outcome| ServerMessage::ReportAnswered { outcome };
+
+        let Some(target) = self.panes.get_mut(&pane) else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+
+        if target.parent.is_none() {
+            let reason = format!(
+                "pane {pane} is not a subagent: only a pane started by `dispatch delegate` \
+                 has anyone to report to"
+            );
+            self.send(client, answer(ReportOutcome::Refused { reason }));
+            return;
+        }
+        if target.reported {
+            let reason = format!("pane {pane} has already reported");
+            self.send(client, answer(ReportOutcome::Refused { reason }));
+            return;
+        }
+        let (Some(request), Some(caller)) = (target.request, target.caller) else {
+            let reason = "the agent that asked is no longer waiting".to_string();
+            self.send(client, answer(ReportOutcome::NotWaiting { reason }));
+            return;
+        };
+        // A caller whose connection failed a send is forgotten at once, but
+        // what it asked for is only let go once its detach is handled. A
+        // report in between would be delivered to nobody and then close the
+        // pane, so it is told nobody is waiting and the pane is left as it
+        // was, for the detach to settle.
+        if !self.clients.contains_key(&caller) {
+            let reason = "the agent that asked is no longer waiting".to_string();
+            self.send(client, answer(ReportOutcome::NotWaiting { reason }));
+            return;
+        }
+
+        target.request = None;
+        target.caller = None;
+        target.reported = true;
+        let interactive = target.interactive;
+        let ask = interactive && self.limits.interactive_on_done == dispatch_config::OnDone::Ask;
+        target.awaiting_decision = ask;
+
+        self.send(
+            caller,
+            ServerMessage::DelegateFinished {
+                request,
+                exit: 0,
+                tail: Vec::new(),
+                report: Some(cut_report(report)),
+            },
+        );
+        self.send(client, answer(ReportOutcome::Delivered));
+
+        if interactive {
+            match self.limits.interactive_on_done {
+                // After the answer, never before: closing first would answer
+                // the caller as if the pane had been killed.
+                dispatch_config::OnDone::Close => self.end_pane(pane),
+                dispatch_config::OnDone::Ask => {
+                    self.broadcast(ServerMessage::SubagentReported { pane });
+                }
+            }
+        }
+    }
+
+    /// Records that the user chose to keep a reported subagent, and tells
+    /// every window so the mark clears everywhere and stays cleared for a
+    /// window that attaches later.
+    ///
+    /// A pane not waiting on that choice is ignored rather than refused: two
+    /// windows answering the same question at once is not a mistake.
+    fn keep_reported(&mut self, client: ClientId, pane: PaneId) {
+        let Some(target) = self.panes.get_mut(&pane) else {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                },
+            );
+            return;
+        };
+        if !target.awaiting_decision {
+            return;
+        }
+        target.awaiting_decision = false;
+        self.broadcast(ServerMessage::SubagentKept { pane });
     }
 
     /// Starts an approved subagent and tells everyone.
@@ -1537,7 +1758,8 @@ impl Daemon {
         request: RequestId,
         parent: PaneId,
         harness: &str,
-        task: &str,
+        handoff: &Handoff,
+        interactive: bool,
         size: (u16, u16),
         caller: ClientId,
         durable: bool,
@@ -1593,14 +1815,15 @@ impl Daemon {
         };
 
         let id = PaneId::new();
-        let run = self.task_run(harness, task, id);
+        let brief = handoff.brief(parent);
+        let run = self.task_run(harness, &brief, id, interactive);
 
         // Judged again on the run that is about to start, as the request
         // was when it arrived: which file a bare command names is decided
         // by the filesystem now, not then.
         if let Some(reason) = run
             .as_ref()
-            .and_then(|run| self.unsafe_task_form(harness, run))
+            .and_then(|run| self.unsafe_task_form(harness, run, interactive))
         {
             tracing::info!(%parent, %harness, %reason, "refused an unsafe task form on approval");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
@@ -1614,9 +1837,14 @@ impl Daemon {
         // request was first judged by, so the two can never disagree.
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
-        if let Some(reason) =
-            crate::delegation::refusal(depth, live, self.limits, run.is_some(), harness)
-        {
+        if let Some(reason) = crate::delegation::refusal(
+            depth,
+            live,
+            self.limits,
+            run.is_some(),
+            harness,
+            interactive,
+        ) {
             tracing::info!(%parent, %harness, %reason, "refused an approved delegation");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
@@ -1638,7 +1866,7 @@ impl Daemon {
         let task_file = match run.input {
             TaskInput::Argument => None,
             TaskInput::File => {
-                match TaskFile::write(&self.task_dir, request, task, &self.leftovers) {
+                match TaskFile::write(&self.task_dir, request, &brief, &self.leftovers) {
                     Ok(file) => {
                         // Last, and in place of any spelling of it the
                         // harness set: the file Dispatch wrote is the one
@@ -1682,6 +1910,11 @@ impl Daemon {
             }
         };
 
+        // An interactive subagent is one the user may be watching or typing
+        // into: like a blanket-approved one, it is never ended because the
+        // call that asked for it went away.
+        let durable = durable || interactive;
+
         self.panes.insert(
             id,
             DaemonPane {
@@ -1698,6 +1931,9 @@ impl Daemon {
                 exited_at: None,
                 task_file,
                 branch: None,
+                interactive,
+                reported: false,
+                awaiting_decision: false,
             },
         );
 
@@ -1750,8 +1986,7 @@ impl Daemon {
             return;
         };
 
-        let start = pane.history.len().saturating_sub(TAIL_BYTES);
-        let tail = pane.history[start..].to_vec();
+        let tail = caller_tail(pane);
 
         self.send(
             caller,
@@ -1759,6 +1994,7 @@ impl Daemon {
                 request,
                 exit: -1,
                 tail,
+                report: None,
             },
         );
     }
@@ -1840,6 +2076,15 @@ impl Daemon {
 
         let mut orphaned = Vec::new();
         for pane in self.panes.values_mut() {
+            // An interactive subagent stays, as a pane the user can go on
+            // using. It is detached from the caller that left, so a report
+            // it sends later is told nobody is waiting and nothing closes it.
+            if pane.interactive && pane.caller == Some(caller) {
+                pane.caller = None;
+                pane.request = None;
+                continue;
+            }
+
             if pane.caller != Some(caller) || pane.durable {
                 continue;
             }
@@ -2018,13 +2263,14 @@ impl Daemon {
             }
 
             if let (Some(request), Some(caller)) = (pane.request.take(), pane.caller) {
-                let start = pane.history.len().saturating_sub(TAIL_BYTES);
+                let tail = caller_tail(pane);
                 answers.push((
                     caller,
                     ServerMessage::DelegateFinished {
                         request,
                         exit: code,
-                        tail: pane.history[start..].to_vec(),
+                        tail,
+                        report: None,
                     },
                 ));
             }

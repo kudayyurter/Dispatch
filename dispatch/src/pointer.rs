@@ -75,6 +75,15 @@ pub mod buttons {
         ]
     }
 
+    /// The question once an interactive subagent has reported.
+    #[must_use]
+    pub fn keep_close() -> Vec<Button> {
+        vec![
+            button(ButtonId::Keep, "Keep", false),
+            button(ButtonId::Close, "Close", false),
+        ]
+    }
+
     /// The question before a tab is closed.
     #[must_use]
     pub fn close_cancel() -> Vec<Button> {
@@ -128,6 +137,8 @@ pub enum FooterHit {
     Attention,
     /// The count of delegation requests waiting.
     Delegations,
+    /// The count of interactive subagents that have reported.
+    Reported,
     /// The message, which an error lets the user dismiss.
     Message,
     /// The `[ Activity ]` button.

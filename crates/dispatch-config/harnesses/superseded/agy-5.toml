@@ -51,20 +51,6 @@ options = [
 ]
 args = ["--effort", "{value}"]
 
-# agy's own default mode works through a task, asking before anything
-# critical; Plan only maps the workspace and proposes, and Accept edits
-# applies changes where its sandbox allows. Unset passes no --mode, which is
-# the default.
-[[settings]]
-key = "mode"
-label = "Mode"
-kind = "choice"
-options = [
-  { value = "accept-edits", label = "Accept edits" },
-  { value = "plan", label = "Plan" },
-]
-args = ["--mode", "{value}"]
-
 [[settings]]
 key = "bypass"
 label = "Skip prompts"

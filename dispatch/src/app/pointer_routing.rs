@@ -352,7 +352,8 @@ impl App {
             Some(
                 Overlay::OpenOn { prompt, .. }
                 | Overlay::RenameTab { prompt, .. }
-                | Overlay::CloseTab { prompt, .. },
+                | Overlay::CloseTab { prompt, .. }
+                | Overlay::Reported { prompt, .. },
             ) => prompt.set_pressed(pressed),
             Some(Overlay::AddMachine(add)) => add.prompt_mut().set_pressed(pressed),
             Some(Overlay::Approval { .. }) => self.approval_pressed = pressed,
@@ -374,7 +375,8 @@ impl App {
             Overlay::Browse(browser) => Some(browser.layout(area)),
             Overlay::OpenOn { prompt, .. }
             | Overlay::RenameTab { prompt, .. }
-            | Overlay::CloseTab { prompt, .. } => Some(prompt.layout(area)),
+            | Overlay::CloseTab { prompt, .. }
+            | Overlay::Reported { prompt, .. } => Some(prompt.layout(area)),
             Overlay::AddMachine(add) => Some(add.prompt().layout(area)),
             Overlay::Approval { scroll } => Some(self.approval_widget(*scroll)?.layout(area)),
             Overlay::Menu(_) | Overlay::Preferences(_) => None,
@@ -413,6 +415,14 @@ impl App {
                 self.handle_add_machine_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             }
             (Overlay::CloseTab { .. }, ButtonId::Close) => self.confirm_close_tab(),
+            (Overlay::Reported { pane, .. }, ButtonId::Close) => {
+                let pane = *pane;
+                self.close_reported(pane);
+            }
+            (Overlay::Reported { pane, .. }, ButtonId::Keep) => {
+                let pane = *pane;
+                self.keep_reported(pane);
+            }
             (overlay, ButtonId::Open | ButtonId::Go) if overlay.picker().is_some() => {
                 self.choose_selected(area)?;
             }

@@ -49,6 +49,17 @@ pub struct DaemonPane {
     /// The branch last reported to clients, so a look that finds the same
     /// one says nothing.
     pub branch: Option<String>,
+    /// Whether it runs its harness's own interface rather than its one-shot
+    /// form. Such a pane never exits by itself, and is never ended because
+    /// its caller went away: the user may be watching it.
+    pub interactive: bool,
+    /// Whether it has sent its report. A second one is refused.
+    pub reported: bool,
+    /// Whether it has reported under `interactive_on_done = "ask"` and the
+    /// user has not yet answered. Kept apart from `reported`, which never
+    /// clears: keeping the pane answers the question, but a second report is
+    /// still refused.
+    pub awaiting_decision: bool,
 }
 
 impl DaemonPane {

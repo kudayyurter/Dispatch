@@ -19,7 +19,9 @@ pub struct Pending {
     /// Which harness would run.
     pub harness: String,
     /// What it would be asked to do.
-    pub task: String,
+    pub handoff: dispatch_core::Handoff,
+    /// Whether it would run in its harness's own interface.
+    pub interactive: bool,
     /// Size to start the subagent at.
     pub size: (u16, u16),
     /// Which client is waiting for the answer.
@@ -31,11 +33,17 @@ pub struct Pending {
     pub announcement: ServerMessage,
 }
 
+/// Why a request with no handoff is refused.
+pub const NO_HANDOFF: &str = "a bare task is not enough to delegate with: write a handoff \
+    (`dispatch delegate --template` prints one) and pass it with `--handoff FILE`, or \
+    `--handoff -` for standard input";
+
 /// Why a request cannot be asked about, if it cannot.
 ///
 /// `depth` is how many parents the asking pane already has, `live` how many of
-/// its children are running, and `has_task_form` whether the harness has a
-/// non-interactive shape to run at all.
+/// its children are still working for it (their requests are open), and `has_task_form` whether the harness has a
+/// non-interactive shape to run at all (or, for an interactive request, an
+/// interactive one).
 #[must_use]
 pub fn refusal(
     depth: u8,
@@ -43,12 +51,20 @@ pub fn refusal(
     limits: DelegationLimits,
     has_task_form: bool,
     harness: &str,
+    interactive: bool,
 ) -> Option<String> {
     if !has_task_form {
-        return Some(format!(
-            "harness {harness:?} has no [task] form, so it cannot be run on one task; \
-             add one or delegate to a harness that has one"
-        ));
+        return Some(if interactive {
+            format!(
+                "harness {harness:?} has no [task.interactive] form, so it cannot run as an \
+                 interactive subagent; add one or delegate without --interactive"
+            )
+        } else {
+            format!(
+                "harness {harness:?} has no [task] form, so it cannot be run on one task; \
+                 add one or delegate to a harness that has one"
+            )
+        });
     }
 
     if depth >= limits.max_depth {
@@ -60,7 +76,7 @@ pub fn refusal(
 
     if live >= limits.max_live_per_parent {
         return Some(format!(
-            "this pane already has {live} subagents running, and the cap is {}",
+            "this pane already has {live} subagents working for it, and the cap is {}",
             limits.max_live_per_parent
         ));
     }

@@ -73,11 +73,3 @@ options = [
 ]
 default = "bypassPermissions"
 args = ["--permission-mode", "{value}"]
-
-# The full turn-by-turn output, as `"verbose": true` in settings.json gives.
-[[settings]]
-key = "verbose"
-label = "Verbose"
-kind = "bool"
-default = true
-args = ["--verbose"]

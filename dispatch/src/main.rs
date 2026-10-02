@@ -8,6 +8,7 @@ mod delegate;
 mod frame_stats;
 mod machine;
 mod pointer;
+mod report;
 mod tabs;
 mod terminal;
 
@@ -78,12 +79,16 @@ struct Args {
 enum Command {
     /// Ask Dispatch to run one task in a second agent, and wait for it.
     ///
-    /// Runs inside a Dispatch pane. Prints the subagent's output on stdout and
-    /// progress on stderr, and exits with the subagent's own status: 69 when no
-    /// daemon is listening, 75 when the request timed out or the connection
-    /// dropped or the daemon does not know the asking pane or its subagent was
-    /// killed before it could exit, 77 when it was denied, 78 when it was
-    /// refused.
+    /// Runs inside a Dispatch pane. Write a handoff first: `dispatch
+    /// delegate --template` prints one with its five sections. Prints the
+    /// subagent's report on stdout (or, if it sent none, the tail of its
+    /// output) and progress on stderr. Exits 0 when it reported, otherwise
+    /// with the subagent's own status; 64 when the handoff is missing or
+    /// incomplete, 66 when it cannot be read, 69 when no daemon is
+    /// listening, 75 when the request timed out, the connection dropped, the
+    /// daemon does not know the asking pane, the subagent was stopped, or an
+    /// interactive subagent finished without a report, 77 when it was
+    /// denied, 78 when it was refused.
     Delegate {
         /// Which harness to run. Defaults to this pane's own.
         #[arg(long)]
@@ -93,8 +98,34 @@ enum Command {
         #[arg(long, default_value = "80x24", value_parser = parse_size)]
         size: (u16, u16),
 
-        /// What the subagent should do.
-        task: String,
+        /// The handoff file, or `-` to read it from standard input.
+        #[arg(long, value_name = "FILE")]
+        handoff: Option<String>,
+
+        /// Print an empty handoff and exit.
+        #[arg(long, conflicts_with_all = ["handoff", "task"])]
+        template: bool,
+
+        /// Run the subagent in its harness's own interface, where it can be
+        /// watched and typed into, rather than invisibly.
+        #[arg(long)]
+        interactive: bool,
+
+        /// No longer accepted: write a handoff instead. Kept so a bare task
+        /// is answered with the template rather than a usage error.
+        #[arg(hide = true)]
+        task: Option<String>,
+    },
+
+    /// Send this subagent's report to the agent that delegated to it.
+    ///
+    /// Runs inside a subagent's pane. Exits 0 when delivered, 64 when the
+    /// report is empty, 66 when the file cannot be read, 69 when no daemon is
+    /// listening, 75 when nobody is waiting for it any more, 78 when this pane
+    /// is not a subagent or has already reported.
+    Report {
+        /// The report file, or `-` to read it from standard input.
+        file: String,
     },
 
     /// Register, list or remove the machines Dispatch reaches over ssh.
@@ -124,8 +155,21 @@ fn main() -> Result<ExitCode> {
         Some(Command::Delegate {
             harness,
             size,
+            handoff,
+            template,
+            interactive,
             task,
-        }) => return delegate::run(harness, size, &task),
+        }) => {
+            return delegate::run(delegate::Args {
+                harness,
+                size,
+                task,
+                handoff,
+                template,
+                interactive,
+            });
+        }
+        Some(Command::Report { file }) => return report::run(&file),
         Some(Command::Machine { action }) => return machine::run(action),
         None => {}
     }

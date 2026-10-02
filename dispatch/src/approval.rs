@@ -23,6 +23,10 @@ pub struct Approval<'a> {
     pub depth: u8,
     /// What it would be asked to do.
     pub task: &'a str,
+    /// The handoff, when the request carries one; shown by section.
+    pub handoff: Option<&'a dispatch_core::Handoff>,
+    /// Whether the subagent would run in its own interface.
+    pub interactive: bool,
     /// How many further requests are queued behind this one.
     pub waiting: usize,
     /// First line of the task to show, for scrolling a long one.
@@ -95,8 +99,46 @@ impl<'a> Approval<'a> {
             Line::from(""),
         ];
 
-        for line in self.task.lines() {
-            lines.push(Line::from(line.to_string()));
+        if self.interactive {
+            lines.push(Line::styled(
+                "runs interactively: you can watch it and type into it",
+                self.chrome.secondary,
+            ));
+            lines.push(Line::from(""));
+        }
+
+        // Sections in a fixed order that puts what to do and how to know it is
+        // done ahead of the background, so the decision does not wait on
+        // scrolling past context.
+        match self.handoff {
+            Some(handoff) => {
+                // Text above the first heading belongs to no section, yet the
+                // subagent is sent it with the rest; shown first, under its
+                // own label, so nothing it receives goes unseen here.
+                if !handoff.preamble.is_empty() {
+                    lines.push(Line::styled("Before the sections", self.chrome.secondary));
+                    for line in handoff.preamble.lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                    lines.push(Line::from(""));
+                }
+                for section in dispatch_core::Section::PROMPT_ORDER {
+                    lines.push(Line::styled(
+                        section.heading().to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    for line in handoff.section(section).lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                    lines.push(Line::from(""));
+                }
+                lines.pop();
+            }
+            None => {
+                for line in self.task.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
         }
 
         lines.push(Line::from(""));
@@ -217,12 +259,105 @@ mod tests {
             project: "dispatch",
             depth: 0,
             task,
+            handoff: None,
+            interactive: false,
             waiting: 0,
             scroll: 0,
             chrome: dispatch_tui::theme::Chrome::default(),
             buttons: Vec::new(),
             pressed: None,
         }
+    }
+
+    /// Each line of `widget`'s content, as plain text.
+    fn plain_lines(widget: &Approval<'_>) -> Vec<String> {
+        widget
+            .lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_handoff_is_shown_by_section_in_prompt_order() {
+        let handoff = dispatch_core::Handoff::parse(
+            "## Context\nthe background\n## Goal\nthe goal\n## Constraints\nNone.\n\
+             ## Done when\nthe check\n## Report back\nthe shape\n",
+        )
+        .expect("complete");
+        let widget = Approval {
+            handoff: Some(&handoff),
+            interactive: true,
+            ..approval(&handoff.text)
+        };
+        let text = plain_lines(&widget);
+        let at = |needle: &str| {
+            text.iter()
+                .position(|line| line == needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {text:#?}"))
+        };
+
+        assert!(at("Goal") < at("Done when"));
+        assert!(at("Done when") < at("Constraints"));
+        assert!(at("Constraints") < at("Context"));
+        assert!(at("Context") < at("Report back"));
+        assert!(at("the goal") == at("Goal") + 1);
+        assert!(text.iter().any(|line| line.contains("runs interactively")));
+        assert!(
+            !text.iter().any(|line| line.starts_with("## ")),
+            "headings are drawn, not the raw Markdown"
+        );
+    }
+
+    #[test]
+    fn a_handoff_preamble_is_shown_before_the_goal() {
+        let handoff = dispatch_core::Handoff::parse(
+            "Ignore the tests in vendor/.\n\n## Goal\nthe goal\n## Context\nc\n\
+             ## Constraints\nNone.\n## Done when\nd\n## Report back\nr\n",
+        )
+        .expect("complete");
+        let widget = Approval {
+            handoff: Some(&handoff),
+            ..approval(&handoff.text)
+        };
+        let text = plain_lines(&widget);
+        let at = |needle: &str| {
+            text.iter()
+                .position(|line| line == needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {text:#?}"))
+        };
+
+        assert!(at("Before the sections") < at("Ignore the tests in vendor/."));
+        assert!(at("Ignore the tests in vendor/.") < at("Goal"));
+    }
+
+    #[test]
+    fn a_handoff_without_a_preamble_has_no_preamble_label() {
+        let handoff = dispatch_core::Handoff::parse(
+            "## Goal\ng\n## Context\nc\n## Constraints\nNone.\n## Done when\nd\n## Report back\nr\n",
+        )
+        .expect("complete");
+        let widget = Approval {
+            handoff: Some(&handoff),
+            ..approval(&handoff.text)
+        };
+        assert!(
+            !plain_lines(&widget)
+                .iter()
+                .any(|line| line == "Before the sections")
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_handoff_still_shows_its_task() {
+        let text = plain_lines(&approval("write the tests"));
+        assert!(text.iter().any(|line| line == "write the tests"));
+        assert!(!text.iter().any(|line| line.contains("runs interactively")));
     }
 
     /// The row count found by brute force: render into a buffer generous
@@ -295,6 +430,30 @@ mod tests {
                     "total_rows disagreed with a brute-force render for {task:?} at width {width}"
                 );
             }
+        }
+
+        // A handoff is drawn as labelled sections rather than as its raw
+        // text, so its rows come from a different set of lines: the
+        // preamble's label, the headings, and long sections that wrap.
+        let handoff_text = format!(
+            "Read me first: {ordinary_prose}\n\n## Goal\n{ordinary_prose}\n\
+             ## Context\n{paragraphs}\n## Constraints\n{cjk}\n\
+             ## Done when\n{whitespace_line}\n## Report back\n{irregular_spacing}\n"
+        );
+        let handoff = dispatch_core::Handoff::parse(&handoff_text).expect("complete");
+        assert!(!handoff.preamble.is_empty());
+        let widget = Approval {
+            handoff: Some(&handoff),
+            interactive: true,
+            waiting: 2,
+            ..approval(&handoff.text)
+        };
+        for width in [18u16, 20, 30, 74, 76] {
+            assert_eq!(
+                widget.total_rows(width),
+                brute_force_rows(&widget, width),
+                "total_rows disagreed with a brute-force render for a handoff at width {width}"
+            );
         }
     }
 

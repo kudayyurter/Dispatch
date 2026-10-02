@@ -311,6 +311,33 @@ pub struct TaskLaunch {
     /// and a one-shot run reaches it the same way.
     #[serde(default)]
     pub platform: BTreeMap<String, TaskArgs>,
+    /// The interactive form, `[task.interactive]`, for `dispatch delegate
+    /// --interactive`.
+    #[serde(default)]
+    pub interactive: Option<InteractiveLaunch>,
+}
+
+/// How to start a harness's own interface on a delegated task.
+///
+/// The handoff becomes the agent's first prompt, and the agent stays open:
+/// the user can watch it and type into it. It never exits by itself, so the
+/// daemon knows it is finished when it runs `dispatch report`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InteractiveLaunch {
+    /// Arguments, with `{task}` standing for the brief.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Per-platform overrides, keyed by `std::env::consts::OS`.
+    #[serde(default)]
+    pub platform: BTreeMap<String, InteractiveArgs>,
+}
+
+/// One platform's interactive form.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InteractiveArgs {
+    /// Arguments, with `{task}` standing for the brief.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// The mark drawn beside a harness that names none of its own.
@@ -515,6 +542,53 @@ impl HarnessDef {
              and put \"<%{TASK_FILE_ENV}%\" where \"{{task}}\" was: args = [..., \
              \"<%{TASK_FILE_ENV}%\"]. For a harness Dispatch ships, deleting {id}.toml \
              brings back the current one instead. Then restart the daemon",
+            id = self.id
+        ))
+    }
+
+    /// The launch for running this harness's own interface on `task`, on a
+    /// named platform.
+    ///
+    /// `None` when it has no interactive form there, or one that never names
+    /// `{task}`: the brief has no other way in, since the agent's standard
+    /// input is its terminal.
+    #[must_use]
+    pub fn interactive_launch_for(&self, os: &str, task: &str) -> Option<Launch> {
+        let form = self.task.as_ref()?.interactive.as_ref()?;
+        let args = form.platform.get(os).map_or(&form.args, |over| &over.args);
+        if !args.iter().any(|arg| arg.contains("{task}")) {
+            return None;
+        }
+
+        let mut launch = self.launch_for(os);
+        launch.args = args.iter().map(|arg| arg.replace("{task}", task)).collect();
+        Some(launch)
+    }
+
+    /// Why this harness's interactive form must not start as `launch` on
+    /// `os`, if it must not.
+    ///
+    /// The one-shot form escapes `cmd.exe` by reading its task from a file
+    /// on standard input. An interactive agent cannot: its standard input is
+    /// the terminal. So on Windows any interactive form reached through
+    /// `cmd.exe` is refused outright, rather than letting a handoff's `&`
+    /// and `%VAR%` run as commands.
+    #[must_use]
+    pub fn interactive_refusal_as(&self, os: &str, launch: &Launch) -> Option<String> {
+        if os != "windows" {
+            return None;
+        }
+        if !runs_through_cmd(&launch.command)
+            && !runs_through_cmd(&found_as(launch).to_string_lossy())
+        {
+            return None;
+        }
+
+        Some(format!(
+            "harness {id:?} would put the handoff on cmd.exe's command line, where characters \
+             like & and % run as commands, and an interactive agent cannot read it from a file \
+             instead. Interactive delegation is not available for {id} on Windows; delegate \
+             without --interactive",
             id = self.id
         ))
     }

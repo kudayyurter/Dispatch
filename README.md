@@ -53,7 +53,7 @@ Open the directory you are in as a project:
 
 | Command | Does |
 |---|---|
-| `dispatch delegate "…"` | an agent hands a task to a second one ([more](docs/delegation.md)) |
+| `dispatch delegate --handoff h.md` | an agent hands a task, with its context, to a second one ([more](docs/delegation.md)) |
 | `dispatch machine add me@tower` | add a machine's agents over ssh ([more](docs/daemon.md)) |
 
 Every other key goes to the focused pane. All modes, tabs, the sidebar's glyphs and key rebinding are in [docs/usage.md](docs/usage.md).
