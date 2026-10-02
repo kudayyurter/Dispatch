@@ -92,6 +92,18 @@ pub enum ScrollTo {
     Delta(isize),
 }
 
+/// What an answering terminal's callbacks write to while it is fed.
+///
+/// Boxed, so its address stays put for as long as libghostty-vt holds it as
+/// userdata, however the `VtTerminal` that owns it moves.
+#[derive(Debug)]
+struct Answers {
+    /// Replies not yet taken.
+    replies: Vec<u8>,
+    /// The size to report, kept in step with every resize.
+    size: Size,
+}
+
 /// The terminal state behind one pane.
 ///
 /// Feed it bytes from a pseudoterminal; read a screen back out.
@@ -102,6 +114,13 @@ pub enum ScrollTo {
 pub struct VtTerminal {
     /// Owned handle. Freed exactly once, in `Drop`.
     handle: sys::Terminal,
+    /// The userdata the handle's callbacks point at, when this terminal
+    /// answers.
+    ///
+    /// Declared after `handle` and freed after it: `Drop::drop` frees the
+    /// handle before any field drops, so the library never holds a dangling
+    /// userdata pointer.
+    answers: Option<Box<Answers>>,
 }
 
 // SAFETY: the handle is owned exclusively by this value and libghostty-vt
@@ -122,7 +141,81 @@ impl VtTerminal {
         VtError::check("ghostty_terminal_new", code)?;
 
         debug_assert!(!handle.is_null(), "success must yield a handle");
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            answers: None,
+        })
+    }
+
+    /// Creates a terminal that answers the questions programs ask it:
+    /// device attributes, cursor position, size, mode reports.
+    ///
+    /// Only one emulator per pane may answer, or a program would get every
+    /// answer twice. A window drawing a pane it does not own uses
+    /// [`VtTerminal::new`], which answers nothing.
+    pub fn answering(size: Size) -> Result<Self, VtError> {
+        let mut terminal = Self::new(size)?;
+        let mut answers = Box::new(Answers {
+            replies: Vec::new(),
+            size,
+        });
+        let userdata: *mut Answers = &raw mut *answers;
+
+        // SAFETY: the handle is live; userdata points into a Box this
+        // terminal owns and frees only after the handle (see `Drop`); the
+        // callbacks match the C signatures in `terminal.h`, and a callback
+        // option takes the function pointer itself as its value.
+        unsafe {
+            VtError::check(
+                "ghostty_terminal_set(USERDATA)",
+                sys::ghostty_terminal_set(terminal.handle, sys::OPT_USERDATA, userdata.cast()),
+            )?;
+            VtError::check(
+                "ghostty_terminal_set(WRITE_PTY)",
+                sys::ghostty_terminal_set(
+                    terminal.handle,
+                    sys::OPT_WRITE_PTY,
+                    write_pty as sys::WritePtyFn as *const c_void,
+                ),
+            )?;
+            VtError::check(
+                "ghostty_terminal_set(SIZE)",
+                sys::ghostty_terminal_set(
+                    terminal.handle,
+                    sys::OPT_SIZE,
+                    report_size as sys::SizeFn as *const c_void,
+                ),
+            )?;
+        }
+
+        terminal.answers = Some(answers);
+        Ok(terminal)
+    }
+
+    /// The replies produced since the last call, to be written to the
+    /// program's input. Always empty for a terminal made with
+    /// [`VtTerminal::new`].
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        self.answers
+            .as_mut()
+            .map(|answers| std::mem::take(&mut answers.replies))
+            .unwrap_or_default()
+    }
+
+    /// Keeps no scrollback: for a terminal that only answers, which needs the
+    /// screen's cursor and modes but never its history.
+    pub fn disable_scrollback(&mut self) -> Result<(), VtError> {
+        let zero: usize = 0;
+        // SAFETY: the handle is live, and this option takes a `const size_t*`,
+        // which `zero` outlives for the call.
+        let code = unsafe {
+            sys::ghostty_terminal_set(
+                self.handle,
+                sys::OPT_SCROLLBACK_MAX_BYTES,
+                (&raw const zero).cast(),
+            )
+        };
+        VtError::check("ghostty_terminal_set(SCROLLBACK_MAX_BYTES)", code)
     }
 
     /// The raw handle, for other modules in this crate that call the library.
@@ -156,7 +249,13 @@ impl VtTerminal {
         // SAFETY: the handle is live and the size is non-zero in both
         // dimensions by construction.
         let code = unsafe { sys::ghostty_terminal_resize(self.handle, size.cols, size.rows, 0, 0) };
-        VtError::check("ghostty_terminal_resize", code)
+        VtError::check("ghostty_terminal_resize", code)?;
+
+        // The size callback reads this, so it must follow the terminal.
+        if let Some(answers) = self.answers.as_mut() {
+            answers.size = size;
+        }
+        Ok(())
     }
 
     /// Reads one `uint16_t`-valued field.
@@ -335,6 +434,53 @@ impl Drop for VtTerminal {
         // once here, and is not used afterwards.
         unsafe { sys::ghostty_terminal_free(self.handle) };
     }
+}
+
+/// Collects a reply the terminal writes back to the program.
+///
+/// Called synchronously from inside `ghostty_terminal_vt_write`: it only
+/// copies bytes, and must never touch the terminal itself.
+unsafe extern "C" fn write_pty(
+    _terminal: sys::Terminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: userdata is the `Answers` box installed by `answering`, alive
+    // for as long as the handle; nothing else borrows it during a feed. The
+    // library guarantees `data` is valid for `len` bytes during the call.
+    let (answers, bytes) = unsafe {
+        (
+            &mut *userdata.cast::<Answers>(),
+            std::slice::from_raw_parts(data, len),
+        )
+    };
+    answers.replies.extend_from_slice(bytes);
+}
+
+/// Reports the size in cells; zero pixels, since nothing here renders glyphs.
+unsafe extern "C" fn report_size(
+    _terminal: sys::Terminal,
+    userdata: *mut c_void,
+    out: *mut sys::SizeReportSize,
+) -> bool {
+    if userdata.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: as in `write_pty`; `out` is a valid out-pointer for the call.
+    unsafe {
+        let answers = &*userdata.cast::<Answers>();
+        *out = sys::SizeReportSize {
+            rows: answers.size.rows,
+            columns: answers.size.cols,
+            cell_width: 0,
+            cell_height: 0,
+        };
+    }
+    true
 }
 
 /// Encodes pasted text for writing to a child.
@@ -694,5 +840,91 @@ mod scroll_tests {
 
         terminal.scroll(ScrollTo::Delta(-3));
         assert_eq!(terminal.scrollbar().expect("a scrollbar").above_live(), 3);
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+
+    fn answering() -> VtTerminal {
+        VtTerminal::answering(Size::new(80, 24)).expect("a terminal")
+    }
+
+    #[test]
+    fn primary_device_attributes_are_answered() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[c");
+        assert_eq!(terminal.take_replies(), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn a_drawing_terminal_answers_nothing() {
+        let mut terminal = VtTerminal::new(Size::new(80, 24)).expect("a terminal");
+        terminal.feed(b"\x1b[c\x1b[6n\x1b[18t");
+        assert!(terminal.take_replies().is_empty());
+    }
+
+    #[test]
+    fn replies_are_taken_once() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[c");
+        assert!(!terminal.take_replies().is_empty());
+        assert!(terminal.take_replies().is_empty());
+    }
+
+    #[test]
+    fn the_cursor_position_is_reported_where_the_cursor_is() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[5;10H\x1b[6n");
+        assert_eq!(terminal.take_replies(), b"\x1b[5;10R");
+    }
+
+    #[test]
+    fn the_alternate_screen_reports_its_own_cursor() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[10;10H\x1b[?1049h\x1b[3;4H\x1b[6n");
+        assert_eq!(terminal.take_replies(), b"\x1b[3;4R");
+    }
+
+    #[test]
+    fn the_size_is_reported_in_cells() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[18t");
+        assert_eq!(terminal.take_replies(), b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn a_resize_changes_the_reported_size() {
+        let mut terminal = answering();
+        terminal.resize(Size::new(100, 30)).expect("resizes");
+        terminal.feed(b"\x1b[18t");
+        assert_eq!(terminal.take_replies(), b"\x1b[8;30;100t");
+    }
+
+    #[test]
+    fn a_query_split_across_two_feeds_is_answered() {
+        let mut terminal = answering();
+        terminal.feed(b"hello \x1b");
+        terminal.feed(b"[c");
+        assert_eq!(terminal.take_replies(), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn a_mode_query_is_answered() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[?2004h\x1b[?2004$p");
+        assert_eq!(terminal.take_replies(), b"\x1b[?2004;1$y");
+    }
+
+    #[test]
+    fn an_answerer_without_scrollback_still_answers() {
+        let mut terminal = answering();
+        terminal.disable_scrollback().expect("sets");
+        for _ in 0..200 {
+            terminal.feed(b"a line of output\r\n");
+        }
+        terminal.feed(b"\x1b[c");
+        assert_eq!(terminal.take_replies(), b"\x1b[?62;22c");
     }
 }

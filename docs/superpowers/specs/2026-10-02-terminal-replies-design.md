@@ -59,10 +59,10 @@ With it on:
 - `GHOSTTY_TERMINAL_OPT_WRITE_PTY` collects every reply into a buffer owned by
   the `VtTerminal`, taken after each `feed`. Callbacks only copy bytes: they
   must not block and must not write to the terminal (no reentrancy).
-- `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES` answers DA1, DA2 and DA3 with the
-  library's own defaults (`device_attributes.zig`): without this callback the
-  library ignores the query even with `WRITE_PTY` set, and DA1 is the one fish
-  waits on, and the one most programs use as the end of a batch of queries.
+- Device attributes (DA1, DA2, DA3) need no callback of their own: the
+  library's C wrapper answers them with its defaults (`ESC [ ? 62 ; 22 c` for
+  DA1: VT220, ANSI colour) as soon as `WRITE_PTY` is set. DA1 is the one fish
+  waits on, and the one most programs send last in a batch of queries.
 - `GHOSTTY_TERMINAL_OPT_SIZE` answers XTWINOPS size queries and mode 2048 with
   the size in cells, and zero for pixels: the daemon renders no glyphs, so it
   does not know them, and zero is what a terminal that does not know says.
