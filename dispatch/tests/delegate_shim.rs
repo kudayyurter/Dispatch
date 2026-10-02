@@ -670,13 +670,17 @@ fn the_subagents_report_reaches_the_callers_stdout() {
     let (ui, mut ui_writer) = attach(&config);
     let parent = spawn_parent_pane(&ui, &mut ui_writer);
 
-    // The report holds a byte that is not UTF-8: it is still delivered.
+    // The report holds a byte that is not UTF-8: it is still delivered. On
+    // Windows it comes from a file, since PowerShell pipes a byte array to a
+    // program as one line of decimal digits per byte.
     let goal = if cfg!(windows) {
-        "[byte[]](0x66,0x6f,0x75,0x6e,0x64,0xff) | dispatch report -"
+        let report = config.dir.join("report.bin");
+        std::fs::write(&report, b"found\xff").expect("temp dir is writable");
+        format!("dispatch report '{}'", report.display())
     } else {
-        "printf 'found\\377' | dispatch report -"
+        "printf 'found\\377' | dispatch report -".to_string()
     };
-    let child = start_delegate_shim(&config, parent, "", &handoff_for(goal), &[]);
+    let child = start_delegate_shim(&config, parent, "", &handoff_for(&goal), &[]);
 
     let asked = wait_for(&ui, "the prompt", |m| {
         m.iter()

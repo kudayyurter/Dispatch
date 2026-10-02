@@ -127,11 +127,13 @@ impl Fixture {
         // harness files is what makes "new pane" choose it over the others.
         let runner = harnesses.join("run-goal.sh");
         std::fs::write(&runner, RUN_GOAL).expect("temp dir is writable");
+        // Forward slashes: the path goes into a TOML string, where a Windows
+        // path's backslashes would be read as escapes, and `sh` takes
+        // `C:/Users/…` as readily as `C:\Users\…`.
+        let runner = runner.display().to_string().replace('\\', "/");
         std::fs::write(
             harnesses.join("aaashell.toml"),
-            SHELL_HARNESS
-                .trim()
-                .replace("{runner}", &runner.display().to_string()),
+            SHELL_HARNESS.trim().replace("{runner}", &runner),
         )
         .expect("temp dir is writable");
 
