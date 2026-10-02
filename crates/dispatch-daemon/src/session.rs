@@ -2718,6 +2718,14 @@ impl Daemon {
         self.panes.get(&pane).map(|target| target.session.size())
     }
 
+    /// What a pane has printed so far, as a client attaching now would be
+    /// replayed it, for tests of what happens with no window watching.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_history_for_test(&self, pane: PaneId) -> Option<Vec<u8>> {
+        self.panes.get(&pane).map(|target| target.history.clone())
+    }
+
     /// How much of a pane's output has been read and not yet sent, for tests
     /// of what a resize does with it.
     #[doc(hidden)]

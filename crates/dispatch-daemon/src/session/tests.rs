@@ -125,6 +125,14 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
         )
         .expect("temp dir is writable");
 
+        // Asks as `asker` does, but only after a second: a test can have every
+        // window gone before the question is printed.
+        std::fs::write(
+            dir.join("late-asker.toml"),
+            "id = \"late-asker\"\ndisplay_name = \"Late asker\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; sleep 1; printf '\\\\033[c'; head -c 9 | tr '\\\\033' E; stty min 0 time 5; extra=$(head -c 64 | wc -c); printf '\\\\r\\\\nEXTRA:%s\\\\r\\\\n' $extra; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+
         // Waits for one byte of input before asking for its size, so a test
         // can resize the pane first.
         std::fs::write(
@@ -142,8 +150,8 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
 
         // Turns on in-band size reports, then shows what it is sent over the
         // next three seconds, so the report a resize causes can be seen
-        // arriving. A pipe to `head` rather than `cat`, because `tr` holds
-        // back output that does not end a line until it ends.
+        // arriving. `tr` buffers its output until its input ends, and `head`
+        // reading under `VTIME` is what ends it.
         std::fs::write(
             dir.join("reporter.toml"),
             "id = \"reporter\"\ndisplay_name = \"Reporter\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; printf '\\\\033[?2048h'; stty min 0 time 30; head -c 64 | tr '\\\\033' E; sleep 30\"]\n",
@@ -6905,11 +6913,23 @@ fn a_program_is_answered_with_no_window_watching() {
     let ui = daemon.attach_for_test(1);
     daemon.request_for_test(1, hello());
     daemon.request_for_test(1, ClientMessage::Subscribe);
-    let pane = spawn_harness(&mut daemon, &ui, project, "asker");
+    let pane = spawn_harness(&mut daemon, &ui, project, "late-asker");
 
+    // Every window gone before the question is printed.
     daemon.detach_for_test(1);
-    for _ in 0..200 {
+    let deadline = Instant::now() + WAIT_FOR_DEADLINE;
+    loop {
         daemon.tick();
+        let history = daemon
+            .pane_history_for_test(pane)
+            .expect("the pane is still there");
+        if String::from_utf8_lossy(&history).contains("EXTRA:") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never finished printing"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -6983,10 +7003,9 @@ fn a_resize_report_the_answerer_produces_reaches_the_program() {
             size: (100, 30),
         },
     );
-    let seen = wait_for(&mut daemon, &ui, |m| {
+    wait_for(&mut daemon, &ui, |m| {
         output_of(m, pane).contains("E[48;30;100;0;0t")
     });
-    assert!(output_of(&seen, pane).contains("E[48;30;100;0;0t"));
 }
 
 #[cfg(unix)]
