@@ -5,6 +5,7 @@
 //! libghostty-vt escapes a call.
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 
 use crate::sys;
 
@@ -115,17 +116,21 @@ pub struct VtTerminal {
     /// Owned handle. Freed exactly once, in `Drop`.
     handle: sys::Terminal,
     /// The userdata the handle's callbacks point at, when this terminal
-    /// answers.
+    /// answers; from `Box::leak`, reclaimed in `Drop`.
     ///
-    /// Declared after `handle` and freed after it: `Drop::drop` frees the
-    /// handle before any field drops, so the library never holds a dangling
-    /// userdata pointer.
-    answers: Option<Box<Answers>>,
+    /// A raw pointer rather than a `Box` on purpose: the library holds a copy
+    /// of it, and touching a live `Box` through its own unique tag would
+    /// invalidate that copy. Every Rust-side access goes through this pointer
+    /// too, so the library's copy and ours stay in one provenance chain.
+    answers: Option<NonNull<Answers>>,
 }
 
 // SAFETY: the handle is owned exclusively by this value and libghostty-vt
-// does not use thread-local state for it. `&mut self` on every mutating
-// method keeps the library's no-reentrancy requirement for vt_write.
+// does not use thread-local state for it. The handle also holds a pointer to
+// the heap `Answers` this value owns, which moves with it and is touched only
+// through `&mut self` (or from callbacks that run inside such a call).
+// `&mut self` on every mutating method keeps the library's no-reentrancy
+// requirement for vt_write.
 unsafe impl Send for VtTerminal {}
 
 impl VtTerminal {
@@ -155,20 +160,28 @@ impl VtTerminal {
     /// [`VtTerminal::new`], which answers nothing.
     pub fn answering(size: Size) -> Result<Self, VtError> {
         let mut terminal = Self::new(size)?;
-        let mut answers = Box::new(Answers {
+        let answers = NonNull::from(Box::leak(Box::new(Answers {
             replies: Vec::new(),
             size,
-        });
-        let userdata: *mut Answers = &raw mut *answers;
+        })));
 
-        // SAFETY: the handle is live; userdata points into a Box this
-        // terminal owns and frees only after the handle (see `Drop`); the
-        // callbacks match the C signatures in `terminal.h`, and a callback
-        // option takes the function pointer itself as its value.
+        // Installed before the library is told about it, so that `Drop`
+        // frees it in the right order on every path, including a `set`
+        // failing after the userdata is in place.
+        terminal.answers = Some(answers);
+
+        // SAFETY: the handle is live; userdata is the leaked box, which this
+        // terminal frees only after the handle (see `Drop`); the callbacks
+        // match the C signatures in `terminal.h`, and a callback option takes
+        // the function pointer itself as its value.
         unsafe {
             VtError::check(
                 "ghostty_terminal_set(USERDATA)",
-                sys::ghostty_terminal_set(terminal.handle, sys::OPT_USERDATA, userdata.cast()),
+                sys::ghostty_terminal_set(
+                    terminal.handle,
+                    sys::OPT_USERDATA,
+                    answers.as_ptr().cast(),
+                ),
             )?;
             VtError::check(
                 "ghostty_terminal_set(WRITE_PTY)",
@@ -188,7 +201,6 @@ impl VtTerminal {
             )?;
         }
 
-        terminal.answers = Some(answers);
         Ok(terminal)
     }
 
@@ -196,10 +208,13 @@ impl VtTerminal {
     /// program's input. Always empty for a terminal made with
     /// [`VtTerminal::new`].
     pub fn take_replies(&mut self) -> Vec<u8> {
-        self.answers
-            .as_mut()
-            .map(|answers| std::mem::take(&mut answers.replies))
-            .unwrap_or_default()
+        let Some(answers) = self.answers else {
+            return Vec::new();
+        };
+        // SAFETY: the pointer is the live allocation `answering` made; `&mut
+        // self` means no feed or resize is running, so no callback holds a
+        // reference to it.
+        std::mem::take(unsafe { &mut (*answers.as_ptr()).replies })
     }
 
     /// Keeps no scrollback: for a terminal that only answers, which needs the
@@ -245,17 +260,30 @@ impl VtTerminal {
     /// Pixel dimensions are reported to programs that ask for them; zero means
     /// unknown, which is what a terminal that does not render glyphs itself
     /// should say.
+    ///
+    /// With in-band size reports (mode 2048) on, the library answers a resize
+    /// from inside this very call, so the size the callback reports is
+    /// updated first and put back if the resize fails.
     pub fn resize(&mut self, size: Size) -> Result<(), VtError> {
-        // SAFETY: the handle is live and the size is non-zero in both
-        // dimensions by construction.
-        let code = unsafe { sys::ghostty_terminal_resize(self.handle, size.cols, size.rows, 0, 0) };
-        VtError::check("ghostty_terminal_resize", code)?;
+        let previous = self.answers.map(|answers| {
+            // SAFETY: the live allocation from `answering`; `&mut self`
+            // means no callback is running, and no reference outlives this
+            // statement.
+            unsafe { std::mem::replace(&mut (*answers.as_ptr()).size, size) }
+        });
 
-        // The size callback reads this, so it must follow the terminal.
-        if let Some(answers) = self.answers.as_mut() {
-            answers.size = size;
+        // SAFETY: the handle is live and the size is non-zero in both
+        // dimensions by construction. Callbacks may run inside this call;
+        // they only touch `Answers` through the pointer, and nothing here
+        // holds a reference to it.
+        let code = unsafe { sys::ghostty_terminal_resize(self.handle, size.cols, size.rows, 0, 0) };
+        if let (Some(answers), Some(previous), true) =
+            (self.answers, previous, code != sys::SUCCESS)
+        {
+            // SAFETY: as above; the call has returned.
+            unsafe { (*answers.as_ptr()).size = previous };
         }
-        Ok(())
+        VtError::check("ghostty_terminal_resize", code)
     }
 
     /// Reads one `uint16_t`-valued field.
@@ -433,13 +461,26 @@ impl Drop for VtTerminal {
         // SAFETY: the handle came from ghostty_terminal_new, is freed exactly
         // once here, and is not used afterwards.
         unsafe { sys::ghostty_terminal_free(self.handle) };
+
+        // Strictly after the handle: it is the only thing that could still
+        // call back into this allocation. Field declaration order does not
+        // matter; this order does.
+        if let Some(answers) = self.answers.take() {
+            // SAFETY: from `Box::leak` in
+            // `answering`, reclaimed exactly once, and the handle that held
+            // it is gone.
+            drop(unsafe { Box::from_raw(answers.as_ptr()) });
+        }
     }
 }
 
 /// Collects a reply the terminal writes back to the program.
 ///
-/// Called synchronously from inside `ghostty_terminal_vt_write`: it only
-/// copies bytes, and must never touch the terminal itself.
+/// Called synchronously from inside `ghostty_terminal_vt_write`, and also from
+/// inside `ghostty_terminal_resize` (with mode 2048 on, a resize writes its
+/// report directly). Both run under `&mut VtTerminal`, which holds no
+/// reference to the `Answers` meanwhile, so the callback is the only accessor.
+/// It only copies bytes, and must never touch the terminal itself.
 unsafe extern "C" fn write_pty(
     _terminal: sys::Terminal,
     userdata: *mut c_void,
@@ -449,8 +490,9 @@ unsafe extern "C" fn write_pty(
     if userdata.is_null() || data.is_null() || len == 0 {
         return;
     }
-    // SAFETY: userdata is the `Answers` box installed by `answering`, alive
-    // for as long as the handle; nothing else borrows it during a feed. The
+    // SAFETY: userdata is the `Answers` allocation installed by `answering`,
+    // alive for as long as the handle; nothing else borrows it during a feed
+    // or a resize. The
     // library guarantees `data` is valid for `len` bytes during the call.
     let (answers, bytes) = unsafe {
         (
@@ -915,6 +957,22 @@ mod answer_tests {
         let mut terminal = answering();
         terminal.feed(b"\x1b[?2004h\x1b[?2004$p");
         assert_eq!(terminal.take_replies(), b"\x1b[?2004;1$y");
+    }
+
+    #[test]
+    fn a_resize_reports_in_band_with_zero_pixels() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[?2048h");
+        let _ = terminal.take_replies();
+        terminal.resize(Size::new(100, 30)).expect("resizes");
+        assert_eq!(terminal.take_replies(), b"\x1b[48;30;100;0;0t");
+    }
+
+    #[test]
+    fn the_text_area_in_pixels_is_reported_as_unknown() {
+        let mut terminal = answering();
+        terminal.feed(b"\x1b[14t");
+        assert_eq!(terminal.take_replies(), b"\x1b[4;0;0t");
     }
 
     #[test]
