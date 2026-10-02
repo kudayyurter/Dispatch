@@ -15,6 +15,10 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+// Built for tests everywhere, since it is plain `Read` logic; used only by
+// the Windows spawn, to drop ConPTY's leading cursor query.
+#[cfg(any(windows, test))]
+mod skip_leading;
 #[cfg(windows)]
 mod windows;
 

@@ -144,6 +144,30 @@ fn escape_sequences_are_interpreted_rather_than_printed() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_program_that_asks_its_terminal_gets_an_answer() {
+    // Raw mode so the reply is read as it arrives, not held for a newline;
+    // the escape is shown as `E` so the screen can be matched as text.
+    let mut session = PtySession::spawn(
+        &shell("stty raw -echo; printf '\\033[c'; head -c 9 | tr '\\033' E; printf '\\r\\nDONE'"),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("spawns");
+
+    let started = std::time::Instant::now();
+    session.drain_until_exit(Duration::from_secs(5));
+
+    let screen = visible(&session).join("\n");
+    assert!(screen.contains("E[?62;22c"), "{screen}");
+    assert!(screen.contains("DONE"), "{screen}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "answered at once, not after a timeout"
+    );
+}
+
 #[test]
 fn input_written_to_a_pane_reaches_the_child() {
     let mut session = PtySession::spawn(&interactive_shell(), &cwd(), Size::new(80, 24))

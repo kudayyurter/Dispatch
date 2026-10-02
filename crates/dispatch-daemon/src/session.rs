@@ -1015,6 +1015,14 @@ impl Daemon {
             tracing::warn!(%error, "failed to resize a pane");
             return;
         }
+        // Its answers follow the pane's size. With in-band size reports on,
+        // resizing says something too, which the program is owed.
+        if let Some(answerer) = target.answerer.as_mut() {
+            if let Err(error) = answerer.resize(size) {
+                tracing::debug!(%error, "failed to resize an answerer");
+            }
+            target.write_replies();
+        }
         self.broadcast(ServerMessage::PaneResized {
             pane,
             size: (size.cols, size.rows),
@@ -1199,6 +1207,7 @@ impl Daemon {
             interactive: false,
             reported: false,
             awaiting_decision: false,
+            answerer: answerer_for(size),
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -1934,6 +1943,7 @@ impl Daemon {
                 interactive,
                 reported: false,
                 awaiting_decision: false,
+                answerer: answerer_for(Size::new(size.0, size.1)),
             },
         );
 
@@ -2530,8 +2540,25 @@ fn drain_pane_output(pane: &mut DaemonPane) -> Vec<u8> {
     let output = pane.session.drain();
     if !output.is_empty() {
         pane.remember(&output);
+        pane.answer(&output);
     }
     output
+}
+
+/// An emulator that only answers a pane's terminal queries, sized to match
+/// it. Keeps no scrollback, since answers need the screen, not its history.
+fn answerer_for(size: Size) -> Option<dispatch_pty::VtTerminal> {
+    let made = dispatch_pty::VtTerminal::answering(size).and_then(|mut answerer| {
+        answerer.disable_scrollback()?;
+        Ok(answerer)
+    });
+    match made {
+        Ok(answerer) => Some(answerer),
+        Err(error) => {
+            tracing::warn!(%error, "no answering emulator; this pane's terminal queries go unanswered");
+            None
+        }
+    }
 }
 
 /// The directory holding the `dispatch` client binary, when it sits beside this
@@ -2689,6 +2716,14 @@ impl Daemon {
     #[must_use]
     pub fn pane_size_for_test(&self, pane: PaneId) -> Option<Size> {
         self.panes.get(&pane).map(|target| target.session.size())
+    }
+
+    /// What a pane has printed so far, as a client attaching now would be
+    /// replayed it, for tests of what happens with no window watching.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_history_for_test(&self, pane: PaneId) -> Option<Vec<u8>> {
+        self.panes.get(&pane).map(|target| target.history.clone())
     }
 
     /// How much of a pane's output has been read and not yet sent, for tests

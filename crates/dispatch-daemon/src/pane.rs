@@ -13,9 +13,10 @@ pub const HISTORY_BYTES: usize = 256 * 1024;
 
 /// One agent owned by the daemon.
 ///
-/// The daemon holds no emulator: clients run their own, because they are the
-/// ones drawing. One here would parse every byte a second time and hold a screen
-/// nothing ever reads.
+/// The daemon holds no *drawing* emulator: clients run their own, because they
+/// are the ones drawing. It runs one only to answer: whoever owns a program's
+/// pseudoterminal must answer the program's questions, and exactly once, which
+/// no window can promise when several are attached or none is.
 pub struct DaemonPane {
     /// Stable identifier.
     pub id: PaneId,
@@ -60,9 +61,41 @@ pub struct DaemonPane {
     /// clears: keeping the pane answers the question, but a second report is
     /// still refused.
     pub awaiting_decision: bool,
+    /// Answers the questions the pane's program asks its terminal. `None`
+    /// only if one could not be created, in which case the program goes
+    /// unanswered, as it did before Dispatch answered at all.
+    pub answerer: Option<dispatch_pty::VtTerminal>,
 }
 
 impl DaemonPane {
+    /// Feeds `output` to the answerer and writes its replies back to the
+    /// program.
+    pub fn answer(&mut self, output: &[u8]) {
+        let Some(answerer) = self.answerer.as_mut() else {
+            return;
+        };
+        answerer.feed(output);
+        self.write_replies();
+    }
+
+    /// Writes whatever the answerer has to say to the program. Shared by
+    /// feeding it output and resizing it, since a resize can produce a reply
+    /// of its own (an in-band size report).
+    pub fn write_replies(&mut self) {
+        let Some(answerer) = self.answerer.as_mut() else {
+            return;
+        };
+        let replies = answerer.take_replies();
+        if replies.is_empty() {
+            return;
+        }
+        if let Err(error) = self.session.write(&replies) {
+            // Not reading its input: the reply has nowhere to go, and
+            // waiting on it would stall every other pane.
+            tracing::debug!(pane = %self.id, %error, "dropped a terminal reply");
+        }
+    }
+
     /// Records output for a client attaching later.
     ///
     /// The oldest bytes go first once the limit is reached. That can cut an

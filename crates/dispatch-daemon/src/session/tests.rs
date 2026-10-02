@@ -115,6 +115,53 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     };
     std::fs::write(dir.join("tree.toml"), tree).expect("temp dir is writable");
 
+    // Asks its terminal who it is, shows the answer with the escape as `E`,
+    // then shows whatever else arrives within half a second: a second
+    // answer would be there.
+    if !cfg!(windows) {
+        std::fs::write(
+            dir.join("asker.toml"),
+            "id = \"asker\"\ndisplay_name = \"Asker\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; printf '\\\\033[c'; head -c 9 | tr '\\\\033' E; stty min 0 time 5; extra=$(head -c 64 | wc -c); printf '\\\\r\\\\nEXTRA:%s\\\\r\\\\n' $extra; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+
+        // Asks as `asker` does, but only after a second: a test can have every
+        // window gone before the question is printed.
+        std::fs::write(
+            dir.join("late-asker.toml"),
+            "id = \"late-asker\"\ndisplay_name = \"Late asker\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; sleep 1; printf '\\\\033[c'; head -c 9 | tr '\\\\033' E; stty min 0 time 5; extra=$(head -c 64 | wc -c); printf '\\\\r\\\\nEXTRA:%s\\\\r\\\\n' $extra; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+
+        // Waits for one byte of input before asking for its size, so a test
+        // can resize the pane first.
+        std::fs::write(
+            dir.join("sizer.toml"),
+            "id = \"sizer\"\ndisplay_name = \"Sizer\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; head -c 1 >/dev/null; printf '\\\\033[18t'; head -c 11 | tr '\\\\033' E; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+
+        // Writes 100,000 queries and never reads its input.
+        std::fs::write(
+            dir.join("flooder.toml"),
+            "id = \"flooder\"\ndisplay_name = \"Flooder\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; i=0; while [ $i -lt 100000 ]; do printf '\\\\033[c'; i=$((i+1)); done; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+
+        // Waits for one byte of input, turns on in-band size reports, then
+        // shows what it is sent over the next three seconds, so the report a
+        // resize causes can be seen arriving. The wait is so a test sees the
+        // mode go on: output printed at once can land in the batch that
+        // carries `PaneSpawned`, which `spawn_harness` discards. `tr` buffers
+        // its output until its input ends, and `head` reading under `VTIME`
+        // is what ends it.
+        std::fs::write(
+            dir.join("reporter.toml"),
+            "id = \"reporter\"\ndisplay_name = \"Reporter\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; head -c 1 >/dev/null; printf '\\\\033[?2048h'; stty min 0 time 30; head -c 64 | tr '\\\\033' E; sleep 30\"]\n",
+        )
+        .expect("temp dir is writable");
+    }
+
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
 
@@ -6814,4 +6861,188 @@ fn an_interactive_subagent_outlives_its_parents_pane() {
     );
     assert_eq!(daemon.pane_count(), 1, "the parent went, the child stayed");
     assert!(daemon.pane_size_for_test(child).is_some());
+}
+
+/// Spawns a pane of `harness` for client 1 and returns its id.
+fn spawn_harness(daemon: &mut Daemon, inbox: &Inbox, project: ProjectId, harness: &str) -> PaneId {
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: harness.into(),
+            size: (80, 24),
+            place: Placement::Auto,
+            settings: Default::default(),
+        },
+    );
+    let seen = wait_for(daemon, inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    seen.iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("a pane was spawned")
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_that_asks_its_terminal_gets_exactly_one_answer() {
+    let (mut daemon, project, _dir) = daemon("answer-once");
+    let first = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let second = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let pane = spawn_harness(&mut daemon, &first, project, "asker");
+    let seen = wait_for(&mut daemon, &first, |m| {
+        output_of(m, pane).contains("EXTRA:")
+    });
+    let _ = drain(&second);
+
+    let output = output_of(&seen, pane);
+    assert!(output.contains("E[?62;22c"), "{output:?}");
+    assert!(
+        output.contains("EXTRA:0"),
+        "one answer, not one per window: {output:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_is_answered_with_no_window_watching() {
+    let (mut daemon, project, _dir) = daemon("answer-unwatched");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let pane = spawn_harness(&mut daemon, &ui, project, "late-asker");
+
+    // Every window gone before the question is printed.
+    daemon.detach_for_test(1);
+    let deadline = Instant::now() + WAIT_FOR_DEADLINE;
+    loop {
+        daemon.tick();
+        let history = daemon
+            .pane_history_for_test(pane)
+            .expect("the pane is still there");
+        if String::from_utf8_lossy(&history).contains("EXTRA:") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never finished printing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A window arriving now is replayed what the pane printed.
+    let late = daemon.attach_for_test(3);
+    daemon.request_for_test(3, hello());
+    daemon.request_for_test(3, ClientMessage::Subscribe);
+    let output = output_of(&drain(&late), pane);
+    assert!(output.contains("E[?62;22c"), "{output:?}");
+    assert!(
+        output.contains("EXTRA:0"),
+        "replay causes no second answer: {output:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_answered_size_follows_a_resize() {
+    let (mut daemon, project, _dir) = daemon("answer-resize");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let pane = spawn_harness(&mut daemon, &ui, project, "sizer");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::ResizePane {
+            pane,
+            size: (100, 30),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::PaneResized {
+                    size: (100, 30),
+                    ..
+                }
+            )
+        })
+    });
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"x".to_vec(),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &ui, |m| output_of(m, pane).contains("E[8;"));
+    let output = output_of(&seen, pane);
+    assert!(output.contains("E[8;30;100t"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_resize_report_the_answerer_produces_reaches_the_program() {
+    let (mut daemon, project, _dir) = daemon("answer-resize-report");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let pane = spawn_harness(&mut daemon, &ui, project, "reporter");
+    // The byte it waits for, so the mode goes on after the spawn's batch.
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"x".to_vec(),
+        },
+    );
+    // The mode has to be on, and seen to be, before the resize.
+    wait_for(&mut daemon, &ui, |m| output_of(m, pane).contains("[?2048h"));
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::ResizePane {
+            pane,
+            size: (100, 30),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        output_of(m, pane).contains("E[48;30;100;0;0t")
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_that_floods_queries_and_never_reads_does_not_stall_the_daemon() {
+    let (mut daemon, project, _dir) = daemon("answer-flood");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _pane = spawn_harness(&mut daemon, &ui, project, "flooder");
+
+    let started = Instant::now();
+    for _ in 0..300 {
+        daemon.tick();
+    }
+    daemon.request_for_test(1, ClientMessage::Ping { token: 7 });
+    let seen = wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::Pong { token: 7 }))
+    });
+    assert!(!seen.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the loop kept turning"
+    );
 }
