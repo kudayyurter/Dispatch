@@ -6864,6 +6864,10 @@ fn an_interactive_subagent_outlives_its_parents_pane() {
 }
 
 /// Spawns a pane of `harness` for client 1 and returns its id.
+///
+/// Used only by the terminal-query tests below, which are `#[cfg(unix)]`:
+/// without the same gate here, a Windows build has nothing left that calls it.
+#[cfg(unix)]
 fn spawn_harness(daemon: &mut Daemon, inbox: &Inbox, project: ProjectId, harness: &str) -> PaneId {
     daemon.request_for_test(
         1,
